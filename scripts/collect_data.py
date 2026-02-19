@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.database.db import SessionLocal
 from backend.database.models import Snapshot, PriceData
-from backend.services.data_collection.tradingview_client import TradingViewClient
+from backend.services.data_collection.tradingview_client import PolygonClient
 from backend.services.data_collection.screenshot_capture import ScreenshotCapture
 from backend.config.settings import settings
 
@@ -20,7 +20,7 @@ def collect_snapshots():
     timezone = pytz.timezone(settings.TIMEZONE)
     session_date = datetime.now(timezone).strftime("%Y-%m-%d")
     
-    tradingview_client = TradingViewClient()
+    polygon_client = PolygonClient()
     screenshot_capture = ScreenshotCapture()
     
     try:
@@ -62,7 +62,7 @@ def collect_snapshots():
                 db.flush()
                 
                 # Fetch price data
-                price_data_dict = tradingview_client.get_price_data(symbol, now)
+                price_data_dict = polygon_client.get_price_data(symbol, now)
                 if price_data_dict:
                     price_data = PriceData(
                         snapshot_id=snapshot.id,

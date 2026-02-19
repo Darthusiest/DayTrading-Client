@@ -26,13 +26,18 @@ class Settings(BaseSettings):
     PROCESSED_DATA_DIR: Path = DATA_DIR / "processed"
     MODELS_DIR: Path = DATA_DIR / "models"
     
-    # TradingView Configuration
-    TRADINGVIEW_USERNAME: Optional[str] = os.getenv("TRADINGVIEW_USERNAME")
-    TRADINGVIEW_PASSWORD: Optional[str] = os.getenv("TRADINGVIEW_PASSWORD")
-    TRADINGVIEW_SESSION_ID: Optional[str] = os.getenv("TRADINGVIEW_SESSION_ID")
+    # Polygon.io Configuration
+    POLYGON_API_KEY: str = os.getenv("POLYGON_API_KEY", "")
     
     # Market Data
-    SYMBOLS: list[str] = ["NQ1!", "ES1!"]  # Nasdaq and S&P 500 futures
+    # Polygon.io uses different symbol formats for futures
+    # NQ = Nasdaq E-mini, ES = S&P 500 E-mini
+    # Format: C:NQ1 (for continuous futures) or NQ1 (for specific contract)
+    SYMBOLS: list[str] = ["NQ1!", "ES1!"]  # User-facing symbols
+    POLYGON_SYMBOL_MAP: dict[str, str] = {
+        "NQ1!": "C:NQ1",  # Nasdaq E-mini continuous contract
+        "ES1!": "C:ES1"   # S&P 500 E-mini continuous contract
+    }
     BEFORE_SNAPSHOT_TIME: str = "06:30"  # PST
     AFTER_SNAPSHOT_TIME: str = "08:00"  # PST
     TIMEZONE: str = "America/Los_Angeles"

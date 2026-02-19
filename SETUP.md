@@ -11,10 +11,14 @@ pip install -r requirements.txt
 Create a `.env` file:
 ```env
 DATABASE_URL=postgresql://user:password@localhost:5432/daytrade
-TRADINGVIEW_USERNAME=your_username
-TRADINGVIEW_PASSWORD=your_password
+POLYGON_API_KEY=your_polygon_api_key
 DEBUG=True
 ```
+
+**Get your Polygon.io API key:**
+1. Sign up at https://polygon.io/
+2. Navigate to your dashboard and create an API key
+3. Copy the key and add it to your `.env` file
 
 3. **Initialize Database**
 ```bash

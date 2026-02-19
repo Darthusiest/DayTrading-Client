@@ -4,7 +4,7 @@ A backend system for a day trading AI agent that learns from NY AM (6:30 AM - 8:
 
 ## Features
 
-- **Data Collection**: TradingView integration for capturing chart screenshots and market data
+- **Data Collection**: Polygon.io integration for market data and TradingView for chart screenshots
 - **ML Model**: Hybrid CNN + Time Series model for price prediction from chart images
 - **Learning Evaluation**: Comprehensive metrics tracking and learning progress monitoring
 - **REST API**: FastAPI-based API for predictions, training, and notes management
@@ -109,14 +109,15 @@ The system is designed to capture chart screenshots at:
 - **Before snapshot**: 6:30 AM PST
 - **After snapshot**: 8:00 AM PST
 
-### TradingView Integration
+### Polygon.io Integration
 
-The TradingView client (`backend/services/data_collection/tradingview_client.py`) provides:
-- Price data fetching (OHLCV)
+The Polygon.io client (`backend/services/data_collection/tradingview_client.py`) provides:
+- Real-time and historical price data fetching (OHLCV)
 - Market status checking
 - Session date management
+- Support for futures contracts (Nasdaq E-mini, S&P 500 E-mini)
 
-**Note**: Full TradingView API integration requires implementation based on TradingView's API documentation or WebSocket protocol.
+**Note**: Requires a Polygon.io API key. Set `POLYGON_API_KEY` in your `.env` file.
 
 ### Screenshot Capture
 
@@ -201,8 +202,8 @@ pytest tests/
 
 ## Next Steps
 
-1. **TradingView Integration**: Implement full TradingView API/WebSocket integration
-2. **Data Collection Automation**: Set up scheduled tasks for automatic screenshot capture
+1. **Data Collection Automation**: Set up scheduled tasks for automatic screenshot capture and data collection
+2. **Polygon.io WebSocket**: Implement real-time streaming data via Polygon.io WebSocket API for live updates
 3. **Model Improvements**: Experiment with different architectures and hyperparameters
 4. **Frontend**: Build frontend interface for chat, screenshot upload, and notes
 5. **Real-time Updates**: Add WebSocket support for real-time predictions

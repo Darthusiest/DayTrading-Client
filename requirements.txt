@@ -2,19 +2,19 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
-pydantic==2.5.0
-pydantic-settings==2.1.0
+pydantic>=2.9.0  # Updated for Python 3.13 compatibility
+pydantic-settings>=2.5.0
 
 # Database
 sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
+psycopg[binary]>=3.2.2  # Updated for Python 3.13 compatibility
 alembic==1.12.1
 
 # Machine Learning
-torch==2.1.0
-torchvision==0.16.0
-numpy==1.24.3
-Pillow==10.1.0
+torch>=2.6.0  # Updated for Python 3.13 compatibility
+torchvision>=0.21.0
+numpy>=1.26.0  # Updated for Python 3.13 compatibility
+Pillow>=10.4.0  # Updated for Python 3.13 compatibility
 opencv-python==4.8.1.78
 
 # Data processing

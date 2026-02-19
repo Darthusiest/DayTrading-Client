@@ -1,0 +1,138 @@
+"""Training API endpoints."""
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.orm import Session
+from typing import Optional
+from pathlib import Path
+from backend.database.db import get_db
+from backend.database.models import TrainingSample, ModelCheckpoint
+from backend.services.ml.training.trainer import Trainer, PriceDataset
+from backend.services.ml.models.price_predictor import PricePredictor
+from backend.services.data_processing.image_preprocessor import ImagePreprocessor
+from backend.config.settings import settings
+from torch.utils.data import DataLoader
+import logging
+
+router = APIRouter(prefix="/train", tags=["training"])
+logger = logging.getLogger(__name__)
+
+
+def train_model_task(db: Session):
+    """Background task for training the model."""
+    try:
+        # Get training samples
+        samples = db.query(TrainingSample).filter(
+            TrainingSample.is_used_for_training == False,
+            TrainingSample.actual_price.isnot(None)
+        ).all()
+        
+        if len(samples) < 10:
+            logger.warning(f"Insufficient training samples: {len(samples)}")
+            return
+        
+        # Split into train/val (time-based split)
+        split_idx = int(len(samples) * (1 - settings.VALIDATION_SPLIT))
+        train_samples = samples[:split_idx]
+        val_samples = samples[split_idx:]
+        
+        # Create datasets
+        image_preprocessor = ImagePreprocessor()
+        train_dataset = PriceDataset(train_samples, image_preprocessor)
+        val_dataset = PriceDataset(val_samples, image_preprocessor)
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=settings.BATCH_SIZE,
+            shuffle=True,
+            num_workers=0  # Set to 0 for compatibility
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=settings.BATCH_SIZE,
+            shuffle=False,
+            num_workers=0
+        )
+        
+        # Initialize model and trainer
+        model = PricePredictor()
+        trainer = Trainer(model)
+        
+        # Train
+        save_dir = settings.MODELS_DIR / settings.MODEL_NAME
+        history = trainer.train(
+            train_loader,
+            val_loader,
+            settings.NUM_EPOCHS,
+            db,
+            save_dir
+        )
+        
+        # Mark samples as used
+        for sample in samples:
+            sample.is_used_for_training = True
+        db.commit()
+        
+        logger.info(f"Training completed. Best val loss: {history['best_val_loss']}")
+        
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        db.rollback()
+
+
+@router.post("")
+def trigger_training(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """Trigger model training on available data."""
+    # Check if there's enough data
+    sample_count = db.query(TrainingSample).filter(
+        TrainingSample.is_used_for_training == False,
+        TrainingSample.actual_price.isnot(None)
+    ).count()
+    
+    if sample_count < 10:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient training data: {sample_count} samples (minimum 10 required)"
+        )
+    
+    # Start training in background
+    background_tasks.add_task(train_model_task, db)
+    
+    return {
+        "status": "training_started",
+        "message": "Model training started in background",
+        "training_samples": sample_count
+    }
+
+
+@router.get("/status")
+def get_training_status(db: Session = Depends(get_db)):
+    """Get training status and available data."""
+    total_samples = db.query(TrainingSample).count()
+    unused_samples = db.query(TrainingSample).filter(
+        TrainingSample.is_used_for_training == False,
+        TrainingSample.actual_price.isnot(None)
+    ).count()
+    
+    latest_checkpoint = db.query(ModelCheckpoint).order_by(
+        ModelCheckpoint.created_at.desc()
+    ).first()
+    
+    status = {
+        "total_samples": total_samples,
+        "unused_samples": unused_samples,
+        "can_train": unused_samples >= 10
+    }
+    
+    if latest_checkpoint:
+        status["latest_model"] = {
+            "version": latest_checkpoint.version,
+            "epoch": latest_checkpoint.epoch,
+            "val_loss": latest_checkpoint.val_loss,
+            "val_accuracy": latest_checkpoint.val_accuracy,
+            "created_at": latest_checkpoint.created_at.isoformat()
+        }
+    
+    return status

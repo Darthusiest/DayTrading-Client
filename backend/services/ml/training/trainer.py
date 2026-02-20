@@ -9,6 +9,9 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import json
 from sqlalchemy.orm import Session
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend for server; use default for scripts
+import matplotlib.pyplot as plt
 from backend.services.ml.models.price_predictor import PricePredictor
 from backend.database.models import TrainingSample, ModelCheckpoint, LearningMetric
 from backend.config.settings import settings
@@ -118,50 +121,62 @@ class Trainer:
         total_loss = 0.0
         total_price_loss = 0.0
         total_prob_loss = 0.0
-        
+        correct_direction = 0
+        total_samples = 0
+
         for batch_idx, batch in enumerate(dataloader):
             # Move to device
             images = batch["image"].to(self.device)
             features = batch["features"].to(self.device)
             actual_prices = batch["actual_price"].to(self.device)
             target_hits = batch["target_hit"].to(self.device)
-            
+
             # Forward pass
             outputs = self.model(images, features)
             predicted_prices = outputs["predicted_price"]
             probabilities = outputs["probability"]
-            
+
             # Calculate losses
             price_loss = self.criterion_price(predicted_prices, actual_prices)
             prob_loss = self.criterion_prob(probabilities, target_hits)
-            
+
             # Combined loss (weighted)
             loss = price_loss + 0.5 * prob_loss
-            
+
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-            
+
             total_loss += loss.item()
             total_price_loss += price_loss.item()
             total_prob_loss += prob_loss.item()
-        
-        avg_loss = total_loss / len(dataloader)
-        avg_price_loss = total_price_loss / len(dataloader)
-        avg_prob_loss = total_prob_loss / len(dataloader)
-        
+
+            # Train direction accuracy (same definition as validate)
+            batch_mean = actual_prices.mean()
+            actual_up = (actual_prices > batch_mean).float()
+            pred_up = (predicted_prices > actual_prices).float()
+            correct_direction += (pred_up == actual_up).sum().item()
+            total_samples += len(actual_prices)
+
+        n = len(dataloader)
+        avg_loss = total_loss / n
+        avg_price_loss = total_price_loss / n
+        avg_prob_loss = total_prob_loss / n
+        direction_accuracy = correct_direction / total_samples if total_samples > 0 else 0.0
+
         return {
             "loss": avg_loss,
             "price_loss": avg_price_loss,
-            "prob_loss": avg_prob_loss
+            "prob_loss": avg_prob_loss,
+            "direction_accuracy": direction_accuracy
         }
     
     def validate(
         self,
         dataloader: DataLoader
     ) -> Dict[str, float]:
-        """Validate the model."""
+        """Validate or test the model."""
         self.model.eval()
         total_loss = 0.0
         total_price_loss = 0.0
@@ -189,15 +204,18 @@ class Trainer:
                 total_price_loss += price_loss.item()
                 total_prob_loss += prob_loss.item()
                 
-                # Calculate direction accuracy
-                pred_direction = (predicted_prices > actual_prices).float()
-                actual_direction = torch.ones_like(actual_prices)  # Simplified
-                correct_direction += (pred_direction == actual_direction).sum().item()
+                # Direction accuracy: did we predict up when actual moved up (actual > 0 from baseline)?
+                # Use predicted vs actual: correct if (pred > actual) matches (actual > batch mean) for direction
+                batch_mean = actual_prices.mean()
+                actual_up = (actual_prices > batch_mean).float()
+                pred_up = (predicted_prices > actual_prices).float()  # pred above actual = "up" relative
+                correct_direction += (pred_up == actual_up).sum().item()
                 total_samples += len(actual_prices)
         
-        avg_loss = total_loss / len(dataloader)
-        avg_price_loss = total_price_loss / len(dataloader)
-        avg_prob_loss = total_prob_loss / len(dataloader)
+        n = len(dataloader)
+        avg_loss = total_loss / n if n else 0.0
+        avg_price_loss = total_price_loss / n if n else 0.0
+        avg_prob_loss = total_prob_loss / n if n else 0.0
         direction_accuracy = correct_direction / total_samples if total_samples > 0 else 0.0
         
         return {
@@ -207,46 +225,90 @@ class Trainer:
             "direction_accuracy": direction_accuracy
         }
     
+    def plot_validation_curves(
+        self,
+        history: List[Dict[str, Any]],
+        save_path: Path,
+        show: bool = True
+    ) -> None:
+        """Plot validation loss and accuracy and optionally show the figure."""
+        if not history:
+            return
+        epochs = [h["epoch"] + 1 for h in history]
+        train_loss = [h["train"]["loss"] for h in history]
+        val_loss = [h["val"]["loss"] for h in history]
+        val_accuracy = [h["val"].get("direction_accuracy", 0.0) for h in history]
+        train_accuracy = [h["train"].get("direction_accuracy", 0.0) for h in history]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+        ax1.plot(epochs, train_loss, label="Train loss", color="C0")
+        ax1.plot(epochs, val_loss, label="Validation loss", color="C1")
+        ax1.set_ylabel("Loss")
+        ax1.legend(loc="upper right")
+        ax1.set_title("Training and validation loss")
+        ax1.grid(True, alpha=0.3)
+
+        ax2.plot(epochs, train_accuracy, label="Train accuracy", color="C0")
+        ax2.plot(epochs, val_accuracy, label="Validation accuracy", color="C1")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Accuracy")
+        ax2.legend(loc="lower right")
+        ax2.set_title("Training and validation accuracy (direction)")
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+        logger.info(f"Saved validation curves to {save_path}")
+        if show:
+            try:
+                plt.show()
+            except Exception as e:
+                logger.debug(f"Could not show plot (e.g. no display): {e}")
+        plt.close(fig)
+
     def train(
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
         num_epochs: int,
         db: Session,
-        save_dir: Path
+        save_dir: Path,
+        test_loader: Optional[DataLoader] = None,
+        plot_show: bool = True
     ) -> Dict[str, Any]:
-        """Full training loop."""
+        """Full training loop with optional test set and validation curves plot."""
         save_dir.mkdir(parents=True, exist_ok=True)
         best_val_loss = float("inf")
         training_history = []
-        
+
         for epoch in range(num_epochs):
             logger.info(f"Epoch {epoch + 1}/{num_epochs}")
-            
+
             # Train
             train_metrics = self.train_epoch(train_loader, epoch)
-            
+
             # Validate
             val_metrics = self.validate(val_loader)
-            
+
             # Update learning rate
             self.scheduler.step(val_metrics["loss"])
-            
+
             # Log metrics
             logger.info(
                 f"Train Loss: {train_metrics['loss']:.4f}, "
                 f"Val Loss: {val_metrics['loss']:.4f}, "
                 f"Val Accuracy: {val_metrics['direction_accuracy']:.4f}"
             )
-            
+
             # Save metrics to database
             self._save_metrics(db, epoch, train_metrics, val_metrics)
-            
+
             # Save checkpoint
             is_best = val_metrics["loss"] < best_val_loss
             if is_best:
                 best_val_loss = val_metrics["loss"]
-            
+
             checkpoint_path = self._save_checkpoint(
                 db,
                 epoch,
@@ -255,16 +317,31 @@ class Trainer:
                 save_dir,
                 is_best
             )
-            
+
             training_history.append({
                 "epoch": epoch,
                 "train": train_metrics,
                 "val": val_metrics
             })
-        
+
+        # Final test set evaluation (optional)
+        test_metrics = None
+        if test_loader is not None:
+            test_metrics = self.validate(test_loader)
+            logger.info(
+                f"Test Loss: {test_metrics['loss']:.4f}, "
+                f"Test Accuracy: {test_metrics['direction_accuracy']:.4f}"
+            )
+
+        # Plot validation loss and accuracy and save / show
+        plot_path = save_dir / "validation_curves.png"
+        self.plot_validation_curves(training_history, plot_path, show=plot_show)
+
         return {
             "history": training_history,
-            "best_val_loss": best_val_loss
+            "best_val_loss": best_val_loss,
+            "test_metrics": test_metrics,
+            "plot_path": str(plot_path)
         }
     
     def _save_metrics(

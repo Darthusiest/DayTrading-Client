@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     LEARNING_RATE: float = 1e-4
     NUM_EPOCHS: int = 100
     IMAGE_SIZE: tuple[int, int] = (224, 224)
-    VALIDATION_SPLIT: float = 0.2
+    VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
+    TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)
     
     # API Configuration
     API_V1_PREFIX: str = "/api/v1"

@@ -19,32 +19,46 @@ logger = logging.getLogger(__name__)
 def train_model_task(db: Session):
     """Background task for training the model."""
     try:
-        # Get training samples
+        # Get training samples (time-ordered)
         samples = db.query(TrainingSample).filter(
             TrainingSample.is_used_for_training == False,
             TrainingSample.actual_price.isnot(None)
-        ).all()
-        
+        ).order_by(TrainingSample.session_date, TrainingSample.id).all()
+
         if len(samples) < 10:
             logger.warning(f"Insufficient training samples: {len(samples)}")
             return
-        
-        # Split into train/val (time-based split)
-        split_idx = int(len(samples) * (1 - settings.VALIDATION_SPLIT))
-        train_samples = samples[:split_idx]
-        val_samples = samples[split_idx:]
-        
+
+        # Time-based split: train / validation / test
+        n = len(samples)
+        test_ratio = getattr(settings, "TEST_SPLIT", 0.1)
+        val_ratio = settings.VALIDATION_SPLIT
+        train_ratio = 1.0 - val_ratio - test_ratio
+        n_train = max(1, int(n * train_ratio))
+        n_val = max(1, int(n * val_ratio))
+        n_test = n - n_train - n_val
+        if n_test < 0:
+            n_test = 0
+            n_val = n - n_train
+
+        train_samples = samples[:n_train]
+        val_samples = samples[n_train : n_train + n_val]
+        test_samples = samples[n_train + n_val :] if n_test > 0 else []
+
+        logger.info(f"Split: train={len(train_samples)}, val={len(val_samples)}, test={len(test_samples)}")
+
         # Create datasets
         image_preprocessor = ImagePreprocessor()
         train_dataset = PriceDataset(train_samples, image_preprocessor)
         val_dataset = PriceDataset(val_samples, image_preprocessor)
-        
+        test_dataset = PriceDataset(test_samples, image_preprocessor) if test_samples else None
+
         # Create data loaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=settings.BATCH_SIZE,
             shuffle=True,
-            num_workers=0  # Set to 0 for compatibility
+            num_workers=0
         )
         val_loader = DataLoader(
             val_dataset,
@@ -52,28 +66,38 @@ def train_model_task(db: Session):
             shuffle=False,
             num_workers=0
         )
-        
+        test_loader = None
+        if test_dataset is not None and len(test_samples) > 0:
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=settings.BATCH_SIZE,
+                shuffle=False,
+                num_workers=0
+            )
+
         # Initialize model and trainer
         model = PricePredictor()
         trainer = Trainer(model)
-        
-        # Train
+
+        # Train (plot_show=False in background to avoid requiring a display)
         save_dir = settings.MODELS_DIR / settings.MODEL_NAME
         history = trainer.train(
             train_loader,
             val_loader,
             settings.NUM_EPOCHS,
             db,
-            save_dir
+            save_dir,
+            test_loader=test_loader,
+            plot_show=False
         )
-        
+
         # Mark samples as used
         for sample in samples:
             sample.is_used_for_training = True
         db.commit()
-        
-        logger.info(f"Training completed. Best val loss: {history['best_val_loss']}")
-        
+
+        logger.info(f"Training completed. Best val loss: {history['best_val_loss']}. Plot: {history.get('plot_path')}")
+
     except Exception as e:
         logger.error(f"Training failed: {e}")
         db.rollback()

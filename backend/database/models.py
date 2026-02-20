@@ -94,7 +94,7 @@ class Prediction(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), nullable=False, index=True)
-    user_expected_price = Column(Float, nullable=False)
+    user_expected_price = Column(Float, nullable=True)  # Optional when user only wants price estimate
     model_predicted_price = Column(Float, nullable=False)
     probability_hit = Column(Float, nullable=False)  # Probability of expected price being hit
     screenshot_path = Column(String(500), nullable=True)

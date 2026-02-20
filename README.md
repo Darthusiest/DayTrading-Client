@@ -78,7 +78,7 @@ The API will be available at `http://localhost:8000`
 ### API Endpoints
 
 #### Predictions
-- `POST /api/v1/predict` - Submit screenshot and expected price, get prediction
+- `POST /api/v1/predict` - Submit a screenshot (ideally before/at 6:30 AM PST) and optionally an expected price. Returns the model's **estimated price the market will hit** by 8:00 AM PST, plus probability and learning metrics. Omit `expected_price` to get only the estimate.
 - `GET /api/v1/predict/history` - Get prediction history
 
 #### Training
@@ -89,6 +89,11 @@ The API will be available at `http://localhost:8000`
 - `GET /api/v1/evaluation/learning-status` - Get learning performance metrics
 - `GET /api/v1/evaluation/learning-curve` - Get learning curve data
 - `GET /api/v1/evaluation/best-model` - Get best model information
+
+#### Data collection (scheduled and manual)
+- **Scheduled**: When the API server runs, data collection is scheduled for **6:30 AM** and **8:00 AM** (PST). Set `ENABLE_SCHEDULED_COLLECTION=false` in `.env` to disable.
+- `POST /api/v1/collection/run` - Run collection once now (optional `capture_screenshots=false` to fetch only Polygon price data).
+- `GET /api/v1/collection/schedule` - Scheduler status and next run times.
 
 #### Notes
 - `POST /api/v1/notes` - Create a note
@@ -102,6 +107,10 @@ The API will be available at `http://localhost:8000`
 Interactive API documentation is available at:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+## Screenshot to Price Estimate
+
+Upload a screenshot of the market **before or at 6:30 AM PST** to get the model's estimate of the price the market will hit by 8:00 AM PST. Call `POST /api/v1/predict` with `file` and `symbol`; `expected_price` is optional. If you omit it, the response gives `model_predicted_price` (the estimate) and the model's confidence. If you provide an expected price, you also get the probability that level is hit.
 
 ## Data Collection
 
@@ -171,7 +180,7 @@ The system tracks:
 ## Configuration
 
 Key settings in `backend/config/settings.py`:
-- `SYMBOLS`: Trading symbols (default: ["NQ1!", "ES1!"])
+- `SYMBOLS`: Trading symbols (default: ["MNQ1!", "MES1!"] — MNQ & MES micro futures only)
 - `BEFORE_SNAPSHOT_TIME`: Before snapshot time (default: "06:30")
 - `AFTER_SNAPSHOT_TIME`: After snapshot time (default: "08:00")
 - `BATCH_SIZE`: Training batch size (default: 32)

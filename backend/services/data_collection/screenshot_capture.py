@@ -49,7 +49,7 @@ class ScreenshotCapture:
         Capture a screenshot of TradingView chart.
         
         Args:
-            symbol: Trading symbol (e.g., 'NQ1!', 'ES1!')
+            symbol: Trading symbol (MNQ1! or MES1!)
             snapshot_type: 'before' or 'after'
             session_date: Session date in YYYY-MM-DD format
         

@@ -34,7 +34,7 @@ async def predict_price(
         expected_price: Optional. User's expected price; if provided, probability_hit
             is the probability that this level is hit. If omitted, probability_hit
             is the model's base confidence in its predicted level.
-        symbol: Trading symbol (e.g., 'NQ1!', 'ES1!').
+        symbol: Trading symbol (MNQ1! or MES1!).
 
     Returns:
         prediction_id, symbol, user_expected_price (null if not provided),

@@ -21,8 +21,8 @@ The Day Trading AI Agent backend uses Polygon.io for fetching real-time and hist
 
 The system maps user-facing symbols to Polygon.io format:
 
-- `NQ1!` → `C:NQ1` (Nasdaq E-mini continuous contract)
-- `ES1!` → `C:ES1` (S&P 500 E-mini continuous contract)
+- `MNQ1!` → `C:MNQ1` (Micro E-mini Nasdaq continuous)
+- `MES1!` → `C:MES1` (Micro E-mini S&P 500 continuous)
 
 The `C:` prefix indicates continuous contracts, which automatically roll to the front month.
 
@@ -39,7 +39,7 @@ client = PolygonClient()
 
 # Get price data for a specific timestamp
 timestamp = datetime.now(pytz.timezone("America/Los_Angeles"))
-price_data = client.get_price_data("NQ1!", timestamp, timeframe="1")
+price_data = client.get_price_data("MNQ1!", timestamp, timeframe="1")
 
 if price_data:
     print(f"Open: {price_data['open']}")
@@ -52,7 +52,7 @@ if price_data:
 ### Get Current Price
 
 ```python
-current_price = client.get_current_price("NQ1!")
+current_price = client.get_current_price("MNQ1!")
 print(f"Current price: {current_price}")
 ```
 
@@ -67,7 +67,7 @@ start_date = datetime.now(timezone) - timedelta(days=7)
 end_date = datetime.now(timezone)
 
 historical_data = client.get_historical_data(
-    symbol="NQ1!",
+    symbol="MNQ1!",
     start_date=start_date,
     end_date=end_date,
     multiplier=1,      # 1 minute bars
@@ -85,7 +85,7 @@ for bar in historical_data:
 Fetches OHLCV data for a specific timestamp.
 
 **Parameters:**
-- `symbol`: Trading symbol (e.g., "NQ1!", "ES1!")
+- `symbol`: Trading symbol ("MNQ1!" or "MES1!")
 - `timestamp`: Datetime object (timezone-aware)
 - `timeframe`: Timeframe in minutes (default: "1")
 

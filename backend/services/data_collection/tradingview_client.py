@@ -34,7 +34,7 @@ class PolygonClient:
         Fetch OHLCV price data for a symbol at a specific timestamp.
         
         Args:
-            symbol: Trading symbol (e.g., 'NQ1!', 'ES1!')
+            symbol: Trading symbol (MNQ1! or MES1!)
             timestamp: Datetime to fetch data for
             timeframe: Timeframe in minutes (default: 1 minute)
         

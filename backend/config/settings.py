@@ -29,18 +29,21 @@ class Settings(BaseSettings):
     # Polygon.io Configuration
     POLYGON_API_KEY: str = os.getenv("POLYGON_API_KEY", "")
     
-    # Market Data
-    # Polygon.io uses different symbol formats for futures
-    # NQ = Nasdaq E-mini, ES = S&P 500 E-mini
-    # Format: C:NQ1 (for continuous futures) or NQ1 (for specific contract)
-    SYMBOLS: list[str] = ["NQ1!", "ES1!"]  # User-facing symbols
+    # Market Data — focused on MNQ & MES only so the model gets really good at these
+    # MNQ = Micro E-mini Nasdaq, MES = Micro E-mini S&P 500
+    # Collecting only these two avoids dilution from other symbols
+    SYMBOLS: list[str] = ["MNQ1!", "MES1!"]
     POLYGON_SYMBOL_MAP: dict[str, str] = {
-        "NQ1!": "C:NQ1",  # Nasdaq E-mini continuous contract
-        "ES1!": "C:ES1"   # S&P 500 E-mini continuous contract
+        "MNQ1!": "C:MNQ1",  # Micro E-mini Nasdaq continuous
+        "MES1!": "C:MES1",  # Micro E-mini S&P 500 continuous
     }
     BEFORE_SNAPSHOT_TIME: str = "06:30"  # PST
     AFTER_SNAPSHOT_TIME: str = "08:00"  # PST
     TIMEZONE: str = "America/Los_Angeles"
+
+    # Scheduled data collection (APScheduler)
+    ENABLE_SCHEDULED_COLLECTION: bool = os.getenv("ENABLE_SCHEDULED_COLLECTION", "True").lower() == "true"
+    COLLECTION_CAPTURE_SCREENSHOTS: bool = os.getenv("COLLECTION_CAPTURE_SCREENSHOTS", "True").lower() == "true"
     
     # ML Model Configuration
     MODEL_NAME: str = "price_predictor"

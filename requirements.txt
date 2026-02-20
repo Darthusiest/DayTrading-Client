@@ -1,3 +1,6 @@
+# Build/install (pin setuptools<82 for pkg_resources; polygon-api-client depends on it)
+setuptools>=60,<82
+
 # FastAPI and web server
 fastapi==0.104.1
 uvicorn[standard]==0.24.0

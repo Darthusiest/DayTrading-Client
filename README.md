@@ -93,6 +93,7 @@ The API will be available at `http://localhost:8000`
 #### Data collection (scheduled and manual)
 - **Scheduled**: When the API server runs, data collection is scheduled for **6:30 AM** and **8:00 AM** (PST). Set `ENABLE_SCHEDULED_COLLECTION=false` in `.env` to disable.
 - `POST /api/v1/collection/run` - Run collection once now (optional `capture_screenshots=false` to fetch only Polygon price data).
+- `POST /api/v1/collection/capture-now` - Log in to TradingView, take a screenshot of the current MNQ (or other symbol) chart, save to disk and database. Optional query: `?symbol=MES1!`.
 - `GET /api/v1/collection/schedule` - Scheduler status and next run times.
 
 #### Live data (Polygon WebSocket)
@@ -135,9 +136,14 @@ The Polygon.io client (`backend/services/data_collection/tradingview_client.py`)
 ### Screenshot Capture
 
 The screenshot capture service (`backend/services/data_collection/screenshot_capture.py`) uses Selenium to:
+- Log in to TradingView when `TRADINGVIEW_USERNAME` and `TRADINGVIEW_PASSWORD` are set
 - Navigate to TradingView charts
 - Capture screenshots at specified times
 - Save images to the data directory
+
+**Where screenshots are saved:**
+- **Database**: Table **`snapshots`**. Each capture creates one row with: `id`, `symbol`, `snapshot_type` (e.g. `"before"`, `"after"`, or `"manual"`), `timestamp`, `image_path` (path to the file), `session_date`, `created_at`. Optional current price from Polygon is stored in table **`price_data`** linked by `snapshot_id`.
+- **Filesystem**: Image files are stored under **`data/raw/`** with names like `MNQ1!_manual_2025-02-19_143022.png` (symbol, type, date, time).
 
 ## ML Model
 

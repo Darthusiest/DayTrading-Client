@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from backend.database.db import get_db
 from backend.config.settings import settings
-from backend.services.data_collection.collector import run_collection
+from backend.services.data_collection.collector import run_collection, capture_snapshot_now
 from backend.services.data_collection.scheduler import get_scheduler
 from backend.services.data_processing.training_data_pipeline import process_training_data_from_snapshots
 
@@ -27,6 +27,28 @@ def run_collection_now(
         capture_screenshots=capture_screenshots,
     )
     return result
+
+
+@router.post("/capture-now")
+def capture_chart_now(
+    symbol: str = "MNQ1!",
+    db: Session = Depends(get_db),
+):
+    """
+    Log in to TradingView (if credentials are set), take a screenshot of the current
+    chart for the given symbol (default MNQ1!), save the image to disk, and store
+    a row in the database.
+
+    **Where it is saved:**
+    - **Database**: Table `snapshots`. One row per capture with: id, symbol,
+      snapshot_type (\"manual\"), timestamp, image_path, session_date, created_at.
+      Current price data (if available from Polygon) is stored in `price_data` linked
+      by snapshot_id.
+    - **Filesystem**: The image file is saved under the project's data directory at
+      `data/raw/<symbol>_manual_<session_date>_<time>.png` (e.g.
+      `data/raw/MNQ1!_manual_2025-02-19_143022.png`).
+    """
+    return capture_snapshot_now(db, symbol=symbol)
 
 
 @router.post("/process-training-data")

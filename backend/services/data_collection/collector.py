@@ -202,3 +202,82 @@ def run_collection(
         "snapshot_type": snapshot_type,
         "errors": errors,
     }
+
+
+def capture_snapshot_now(
+    db: Session,
+    symbol: str = "MNQ1!",
+) -> dict:
+    """
+    Log in to TradingView (if credentials set), capture a screenshot of the current
+    chart for the given symbol, save the image to disk, and store a Snapshot row in
+    the database. Optionally attach Polygon price data for the current time.
+
+    Returns:
+        Dict with snapshot_id, image_path, symbol, session_date, and success (bool),
+        or error message on failure.
+    """
+    if symbol not in settings.SYMBOLS:
+        return {
+            "success": False,
+            "error": f"Symbol {symbol} not in configured SYMBOLS ({settings.SYMBOLS})",
+        }
+    tz = pytz.timezone(settings.TIMEZONE)
+    now = datetime.now(tz)
+    session_date = now.strftime("%Y-%m-%d")
+    screenshot_capture = ScreenshotCapture()
+    try:
+        image_path = screenshot_capture.capture_chart_screenshot(
+            symbol=symbol,
+            snapshot_type="manual",
+            session_date=session_date,
+        )
+        if image_path is None:
+            return {
+                "success": False,
+                "error": f"Failed to capture screenshot for {symbol}",
+            }
+        path_str = str(image_path)
+        snapshot = Snapshot(
+            symbol=symbol,
+            snapshot_type="manual",
+            timestamp=now,
+            image_path=path_str,
+            session_date=session_date,
+        )
+        db.add(snapshot)
+        db.flush()
+        polygon_client = PolygonClient()
+        price_data_dict = polygon_client.get_price_data(symbol, now)
+        if price_data_dict:
+            db.add(
+                PriceData(
+                    snapshot_id=snapshot.id,
+                    symbol=symbol,
+                    timestamp=now,
+                    open_price=price_data_dict.get("open", 0.0),
+                    high_price=price_data_dict.get("high", 0.0),
+                    low_price=price_data_dict.get("low", 0.0),
+                    close_price=price_data_dict.get("close", 0.0),
+                    volume=price_data_dict.get("volume", 0),
+                )
+            )
+        db.commit()
+        db.refresh(snapshot)
+        return {
+            "success": True,
+            "snapshot_id": snapshot.id,
+            "image_path": path_str,
+            "symbol": symbol,
+            "session_date": session_date,
+            "timestamp": now.isoformat(),
+        }
+    except Exception as e:
+        logger.exception("capture_snapshot_now failed: %s", e)
+        db.rollback()
+        return {
+            "success": False,
+            "error": str(e),
+        }
+    finally:
+        screenshot_capture.close()

@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     AFTER_SNAPSHOT_TIME: str = "08:00"  # PST
     TIMEZONE: str = "America/Los_Angeles"
 
+    # TradingView (optional — for chart screenshot capture; login gives full chart access)
+    TRADINGVIEW_USERNAME: str = os.getenv("TRADINGVIEW_USERNAME", "")
+    TRADINGVIEW_PASSWORD: str = os.getenv("TRADINGVIEW_PASSWORD", "")
+
     # Scheduled data collection (APScheduler)
     ENABLE_SCHEDULED_COLLECTION: bool = os.getenv("ENABLE_SCHEDULED_COLLECTION", "True").lower() == "true"
     COLLECTION_CAPTURE_SCREENSHOTS: bool = os.getenv("COLLECTION_CAPTURE_SCREENSHOTS", "True").lower() == "true"

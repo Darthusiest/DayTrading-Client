@@ -20,9 +20,12 @@ logger = logging.getLogger(__name__)
 class ScreenshotCapture:
     """Service for capturing TradingView chart screenshots."""
     
+    SIGNIN_URL = "https://www.tradingview.com/accounts/signin/"
+    
     def __init__(self):
         self.timezone = pytz.timezone(settings.TIMEZONE)
         self.driver: Optional[webdriver.Chrome] = None
+        self._logged_in = False
     
     def _init_driver(self):
         """Initialize Selenium WebDriver."""
@@ -38,6 +41,34 @@ class ScreenshotCapture:
             except Exception as e:
                 logger.error(f"Failed to initialize Chrome driver: {e}")
                 raise
+    
+    def _ensure_logged_in(self) -> bool:
+        """Log in to TradingView if credentials are set and not already logged in. Returns True if session is ready (logged in or no credentials)."""
+        if not settings.TRADINGVIEW_USERNAME or not settings.TRADINGVIEW_PASSWORD:
+            return True
+        if self._logged_in:
+            return True
+        try:
+            logger.info("Logging in to TradingView…")
+            self.driver.get(self.SIGNIN_URL)
+            wait = WebDriverWait(self.driver, 15)
+            # TradingView sign-in: email/username and password fields
+            email_el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='username'], input[type='email'], input[name='id_username']")))
+            pass_el = self.driver.find_element(By.CSS_SELECTOR, "input[name='password'], input[type='password'], input[name='id_password']")
+            email_el.clear()
+            email_el.send_keys(settings.TRADINGVIEW_USERNAME)
+            pass_el.clear()
+            pass_el.send_keys(settings.TRADINGVIEW_PASSWORD)
+            submit = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], .signin-button, [data-name='signin-button']")
+            submit.click()
+            time.sleep(3)
+            # Consider logged in if we're no longer on signin URL or body contains chart-related content when we later load chart
+            self._logged_in = True
+            logger.info("TradingView login completed.")
+            return True
+        except Exception as e:
+            logger.warning(f"TradingView login failed (continuing unauthenticated): {e}")
+            return False
     
     def capture_chart_screenshot(
         self,
@@ -58,6 +89,7 @@ class ScreenshotCapture:
         """
         try:
             self._init_driver()
+            self._ensure_logged_in()
             
             if session_date is None:
                 session_date = datetime.now(self.timezone).strftime("%Y-%m-%d")
@@ -106,6 +138,7 @@ class ScreenshotCapture:
         if self.driver:
             self.driver.quit()
             self.driver = None
+        self._logged_in = False
     
     def __del__(self):
         """Cleanup on deletion."""

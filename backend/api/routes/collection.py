@@ -1,6 +1,6 @@
 """Data collection API: manual trigger, scheduler status, and training data processing."""
 import logging
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from backend.database.db import get_db
 from backend.config.settings import settings
@@ -32,23 +32,31 @@ def run_collection_now(
 @router.post("/capture-now")
 def capture_chart_now(
     symbol: str = "MNQ1!",
+    interval: int = 15,
     db: Session = Depends(get_db),
 ):
     """
-    Log in to TradingView (if credentials are set), take a screenshot of the current
-    chart for the given symbol (default MNQ1!), save the image to disk, and store
-    a row in the database.
+    Fetch a screenshot of the current TradingView chart for the selected symbol and
+    timeframe. The backend logs in (if credentials are set), opens the chart at the
+    requested interval, and saves the image so the AI model can use the same chart
+    the user is looking at.
+
+    **Query parameters:**
+    - **symbol**: `MNQ1!` (Micro E-mini Nasdaq) or `MES1!` (Micro E-mini S&P 500). Default: MNQ1!.
+    - **interval**: Chart timeframe in minutes. Allowed: 1, 5, 15, 60, 240, 1440 (1m, 5m, 15m, 1h, 4h, 1D). Default: 15.
+
+    **Example (frontend button):** `POST /api/v1/collection/capture-now?symbol=MNQ1!&interval=15`
 
     **Where it is saved:**
-    - **Database**: Table `snapshots`. One row per capture with: id, symbol,
-      snapshot_type (\"manual\"), timestamp, image_path, session_date, created_at.
-      Current price data (if available from Polygon) is stored in `price_data` linked
-      by snapshot_id.
-    - **Filesystem**: The image file is saved under the project's data directory at
-      `data/raw/<symbol>_manual_<session_date>_<time>.png` (e.g.
-      `data/raw/MNQ1!_manual_2025-02-19_143022.png`).
+    - **Database**: Table `snapshots`. One row per capture (symbol, snapshot_type \"manual\", image_path, session_date, etc.). Price data in `price_data` when available.
+    - **Filesystem**: `data/raw/<symbol>_manual_<session_date>_<time>.png`
     """
-    return capture_snapshot_now(db, symbol=symbol)
+    if interval not in (1, 5, 15, 60, 240, 1440):
+        raise HTTPException(
+            status_code=400,
+            detail="interval must be one of: 1, 5, 15, 60, 240, 1440 (minutes)",
+        )
+    return capture_snapshot_now(db, symbol=symbol, interval_minutes=interval)
 
 
 @router.post("/process-training-data")

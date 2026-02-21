@@ -74,15 +74,17 @@ class ScreenshotCapture:
         self,
         symbol: str,
         snapshot_type: str,
-        session_date: Optional[str] = None
+        session_date: Optional[str] = None,
+        interval_minutes: Optional[int] = None,
     ) -> Optional[Path]:
         """
         Capture a screenshot of TradingView chart.
         
         Args:
             symbol: Trading symbol (MNQ1! or MES1!)
-            snapshot_type: 'before' or 'after'
+            snapshot_type: 'before', 'after', or 'manual'
             session_date: Session date in YYYY-MM-DD format
+            interval_minutes: Chart timeframe in minutes (1, 5, 15, 60, 240, 1440). If None, uses settings.CHART_INTERVAL_MINUTES.
         
         Returns:
             Path to saved screenshot or None if failed
@@ -94,10 +96,9 @@ class ScreenshotCapture:
             if session_date is None:
                 session_date = datetime.now(self.timezone).strftime("%Y-%m-%d")
             
-            # Construct TradingView URL
-            # Note: This assumes TradingView chart URL structure
-            # You may need to adjust based on actual TradingView URL format
-            chart_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
+            # Construct TradingView URL with interval (timeframe in minutes: 1, 5, 15, 60, 240, 1440)
+            interval = interval_minutes if interval_minutes is not None else getattr(settings, "CHART_INTERVAL_MINUTES", 15)
+            chart_url = f"https://www.tradingview.com/chart/?symbol={symbol}&interval={interval}"
             
             logger.info(f"Navigating to {chart_url}")
             self.driver.get(chart_url)

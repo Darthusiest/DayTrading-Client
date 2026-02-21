@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     # TradingView (optional — for chart screenshot capture; login gives full chart access)
     TRADINGVIEW_USERNAME: str = os.getenv("TRADINGVIEW_USERNAME", "")
     TRADINGVIEW_PASSWORD: str = os.getenv("TRADINGVIEW_PASSWORD", "")
+    CHART_INTERVAL_MINUTES: int = int(os.getenv("CHART_INTERVAL_MINUTES", "15"))  # Chart timeframe (1, 5, 15, 60, etc.)
 
     # Scheduled data collection (APScheduler)
     ENABLE_SCHEDULED_COLLECTION: bool = os.getenv("ENABLE_SCHEDULED_COLLECTION", "True").lower() == "true"

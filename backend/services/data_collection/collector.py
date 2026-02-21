@@ -207,14 +207,20 @@ def run_collection(
 def capture_snapshot_now(
     db: Session,
     symbol: str = "MNQ1!",
+    interval_minutes: Optional[int] = None,
 ) -> dict:
     """
     Log in to TradingView (if credentials set), capture a screenshot of the current
-    chart for the given symbol, save the image to disk, and store a Snapshot row in
-    the database. Optionally attach Polygon price data for the current time.
+    chart for the given symbol at the given timeframe, save the image to disk, and
+    store a Snapshot row in the database. Optionally attach Polygon price data.
+
+    Args:
+        db: Database session.
+        symbol: MNQ1! or MES1!.
+        interval_minutes: Chart timeframe in minutes (1, 5, 15, 60, 240, 1440). If None, uses settings default.
 
     Returns:
-        Dict with snapshot_id, image_path, symbol, session_date, and success (bool),
+        Dict with snapshot_id, image_path, symbol, session_date, interval_minutes, and success (bool),
         or error message on failure.
     """
     if symbol not in settings.SYMBOLS:
@@ -225,12 +231,14 @@ def capture_snapshot_now(
     tz = pytz.timezone(settings.TIMEZONE)
     now = datetime.now(tz)
     session_date = now.strftime("%Y-%m-%d")
+    interval = interval_minutes if interval_minutes is not None else getattr(settings, "CHART_INTERVAL_MINUTES", 15)
     screenshot_capture = ScreenshotCapture()
     try:
         image_path = screenshot_capture.capture_chart_screenshot(
             symbol=symbol,
             snapshot_type="manual",
             session_date=session_date,
+            interval_minutes=interval_minutes,
         )
         if image_path is None:
             return {
@@ -270,6 +278,7 @@ def capture_snapshot_now(
             "image_path": path_str,
             "symbol": symbol,
             "session_date": session_date,
+            "interval_minutes": interval,
             "timestamp": now.isoformat(),
         }
     except Exception as e:

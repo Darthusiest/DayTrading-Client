@@ -61,6 +61,18 @@ class ScreenshotCapture:
             self.driver.get(self.SIGNIN_URL)
             time.sleep(3)  # Let the page and any modals/iframes render
             wait = WebDriverWait(self.driver, 25)
+            # TradingView shows "Continue with Google" by default; click "Show more options" to reveal email/password
+            try:
+                show_more = self.driver.find_element(
+                    By.XPATH,
+                    "//*[contains(translate(., 'SHOW MORE OPTIONS', 'show more options'), 'show more options')]"
+                )
+                if show_more and show_more.is_displayed():
+                    show_more.click()
+                    time.sleep(1.5)
+                    logger.debug("Clicked 'Show more options' to reveal email/password form")
+            except Exception:
+                pass
 
             def find_email_and_password(driver):
                 """Find email and password inputs in current context (default content or iframe)."""

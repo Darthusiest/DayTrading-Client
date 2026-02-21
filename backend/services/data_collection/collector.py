@@ -7,11 +7,67 @@ import pytz
 from sqlalchemy.orm import Session
 
 from backend.config.settings import settings
-from backend.database.models import Snapshot, PriceData
+from backend.database.models import Snapshot, PriceData, SessionMinuteBar
 from backend.services.data_collection.tradingview_client import PolygonClient
 from backend.services.data_collection.screenshot_capture import ScreenshotCapture
 
 logger = logging.getLogger(__name__)
+
+
+def _collect_session_minute_bars(
+    db: Session,
+    polygon_client: PolygonClient,
+    session_date: str,
+    tz: pytz.BaseTzInfo,
+) -> int:
+    """
+    Fetch and store minute bars for 6:30–8:00 on session_date (exact numeric path).
+    Idempotent: replaces any existing bars for that session_date per symbol.
+    Returns number of bars stored.
+    """
+    total = 0
+    for symbol in settings.SYMBOLS:
+        try:
+            start_dt = tz.localize(datetime.strptime(f"{session_date} 06:30", "%Y-%m-%d %H:%M"))
+            end_dt = tz.localize(datetime.strptime(f"{session_date} 08:00", "%Y-%m-%d %H:%M"))
+            bars = polygon_client.get_historical_data(
+                symbol, start_dt, end_dt, multiplier=1, timespan="minute"
+            )
+            if not bars:
+                logger.warning("No minute bars returned for %s on %s", symbol, session_date)
+                continue
+            db.query(SessionMinuteBar).filter(
+                SessionMinuteBar.session_date == session_date,
+                SessionMinuteBar.symbol == symbol,
+            ).delete()
+            for b in bars:
+                ts = b["timestamp"]
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts.tzinfo and ts.tzinfo != tz:
+                    ts = ts.astimezone(tz)
+                if ts.tzinfo is not None:
+                    ts = ts.replace(tzinfo=None)  # store naive in DB for consistency
+                db.add(
+                    SessionMinuteBar(
+                        session_date=session_date,
+                        symbol=symbol,
+                        bar_time=ts,
+                        open_price=float(b.get("open", 0)),
+                        high_price=float(b.get("high", 0)),
+                        low_price=float(b.get("low", 0)),
+                        close_price=float(b.get("close", 0)),
+                        volume=int(b.get("volume", 0) or 0),
+                    )
+                )
+                total += 1
+            logger.info("Stored %s minute bars for %s on %s", len(bars), symbol, session_date)
+        except Exception as e:
+            logger.exception("Error storing minute bars for %s on %s: %s", symbol, session_date, e)
+            db.rollback()
+            raise
+    db.commit()
+    return total
 
 
 def run_collection(
@@ -119,6 +175,15 @@ def run_collection(
                 db.rollback()
                 failed += 1
                 errors.append(f"{symbol}: {e}")
+
+        # After 8:00 snapshot, fetch and store 6:30–8:00 minute bars (exact price path)
+        if snapshot_type == "after":
+            try:
+                bars_stored = _collect_session_minute_bars(db, polygon_client, session_date, tz)
+                logger.info("Session minute bars stored: %s for %s", bars_stored, session_date)
+            except Exception as e:
+                logger.exception("Failed to collect session minute bars: %s", e)
+                errors.append(f"Session minute bars: {e}")
     finally:
         if screenshot_capture:
             screenshot_capture.close()

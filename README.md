@@ -54,7 +54,7 @@ pip install -r requirements.txt
 4. Set up environment variables:
 Create a `.env` file in the project root:
 ```env
-DATABASE_URL=postgresql://user:password@localhost:5432/daytrade
+DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/daytrade
 TRADINGVIEW_USERNAME=your_username
 TRADINGVIEW_PASSWORD=your_password
 DEBUG=True

@@ -22,6 +22,22 @@ class Snapshot(Base):
     training_samples = relationship("TrainingSample", back_populates="snapshot")
 
 
+class SessionMinuteBar(Base):
+    """Minute OHLCV bars for the 6:30–8:00 session (exact price path)."""
+    __tablename__ = "session_minute_bars"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_date = Column(String(10), nullable=False, index=True)  # YYYY-MM-DD
+    symbol = Column(String(20), nullable=False, index=True)
+    bar_time = Column(DateTime, nullable=False, index=True)  # Start of minute bar
+    open_price = Column(Float, nullable=False)
+    high_price = Column(Float, nullable=False)
+    low_price = Column(Float, nullable=False)
+    close_price = Column(Float, nullable=False)
+    volume = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class PriceData(Base):
     """Market data (OHLCV) for labeling."""
     __tablename__ = "price_data"
@@ -122,8 +138,8 @@ class LearningMetric(Base):
     metric_value = Column(Float, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
     
-    # Additional context
-    metadata = Column(JSON, nullable=True)
+    # Additional context (Python attr 'extra_metadata' avoids reserved 'metadata'; DB column stays 'metadata')
+    extra_metadata = Column("metadata", JSON, nullable=True)
 
 
 class UserNote(Base):

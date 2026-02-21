@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql://user:password@localhost:5432/daytrade"
+        "postgresql+psycopg://user:password@localhost:5432/daytrade"
     )
     
     # File Storage

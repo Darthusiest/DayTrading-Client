@@ -31,7 +31,10 @@ class ScreenshotCapture:
         """Initialize Selenium WebDriver."""
         if self.driver is None:
             chrome_options = Options()
-            chrome_options.add_argument("--headless")
+            if getattr(settings, "TRADINGVIEW_HEADLESS", True):
+                chrome_options.add_argument("--headless")
+            else:
+                logger.info("TradingView browser running in visible mode (TRADINGVIEW_HEADLESS=false)")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--window-size=1920,1080")
@@ -45,6 +48,10 @@ class ScreenshotCapture:
     def _ensure_logged_in(self) -> bool:
         """Log in to TradingView if credentials are set and not already logged in. Returns True if session is ready (logged in or no credentials)."""
         if not settings.TRADINGVIEW_USERNAME or not settings.TRADINGVIEW_PASSWORD:
+            logger.info(
+                "TradingView login skipped: TRADINGVIEW_USERNAME or TRADINGVIEW_PASSWORD not set. "
+                "Add them to .env in the project root and restart the server to log in before capturing."
+            )
             return True
         if self._logged_in:
             return True

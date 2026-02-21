@@ -9,6 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 from backend.config.settings import settings
 from backend.database.db import SessionLocal
 from backend.services.data_collection.collector import run_collection
+from backend.services.data_processing.training_data_pipeline import process_training_data_from_snapshots
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,27 @@ def _scheduled_collection_job(snapshot_type: Optional[str] = None) -> None:
                 logger.warning("Collection error: %s", err)
     except Exception as e:
         logger.exception("Scheduled collection failed: %s", e)
+    finally:
+        db.close()
+
+
+def _scheduled_process_training_data_job() -> None:
+    """Job run by APScheduler: create training samples from new before/after pairs."""
+    logger.info("Scheduled process training data started")
+    db = SessionLocal()
+    try:
+        result = process_training_data_from_snapshots(db)
+        logger.info(
+            "Process training data finished: created=%s skipped=%s errors=%s",
+            result["created"],
+            result["skipped"],
+            len(result["errors"]),
+        )
+        if result["errors"]:
+            for err in result["errors"]:
+                logger.warning("Process training data error: %s", err)
+    except Exception as e:
+        logger.exception("Scheduled process training data failed: %s", e)
     finally:
         db.close()
 
@@ -83,10 +105,18 @@ def start_scheduler() -> Optional[BackgroundScheduler]:
         kwargs={"snapshot_type": "after"},
         replace_existing=True,
     )
+    # 8:05 AM local: process new snapshot pairs into training samples
+    _scheduler.add_job(
+        _scheduled_process_training_data_job,
+        trigger=CronTrigger(hour=8, minute=5, timezone=_tz),
+        id="process_training_data",
+        name="Process training data (8:05)",
+        replace_existing=True,
+    )
 
     _scheduler.start()
     logger.info(
-        "Scheduled data collection started: 6:30 AM and 8:00 AM %s",
+        "Scheduled data collection started: 6:30, 8:00, and 8:05 AM %s",
         settings.TIMEZONE,
     )
     return _scheduler

@@ -10,6 +10,7 @@ from backend.config.settings import settings
 from backend.database.models import Snapshot, PriceData, SessionMinuteBar
 from backend.services.data_collection.tradingview_client import PolygonClient
 from backend.services.data_collection.screenshot_capture import ScreenshotCapture
+from backend.services.evaluation.outcome_feedback import update_predictions_with_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,7 @@ def run_collection(
                 failed += 1
                 errors.append(f"{symbol}: {e}")
 
-        # After 8:00 snapshot, fetch and store 6:30–8:00 minute bars (exact price path)
+        # After 8:00 snapshot, fetch and store 6:30–8:00 minute bars and update prediction outcomes
         if snapshot_type == "after":
             try:
                 bars_stored = _collect_session_minute_bars(db, polygon_client, session_date, tz)
@@ -184,6 +185,13 @@ def run_collection(
             except Exception as e:
                 logger.exception("Failed to collect session minute bars: %s", e)
                 errors.append(f"Session minute bars: {e}")
+            try:
+                n = update_predictions_with_outcomes(db, session_date)
+                if n:
+                    logger.info("Outcome feedback: updated %s predictions for %s", n, session_date)
+            except Exception as e:
+                logger.exception("Outcome feedback failed: %s", e)
+                errors.append(f"Outcome feedback: {e}")
     finally:
         if screenshot_capture:
             screenshot_capture.close()

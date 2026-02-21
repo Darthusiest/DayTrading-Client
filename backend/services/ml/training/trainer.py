@@ -65,8 +65,7 @@ class PriceDataset(Dataset):
         }
     
     def _extract_feature_vector(self, features: Dict[str, Any]) -> List[float]:
-        """Extract numeric features from features dict."""
-        # Extract relevant numeric features
+        """Extract numeric features from features dict (includes SessionMinuteBar summary)."""
         feature_list = []
         
         # Time features
@@ -78,8 +77,21 @@ class PriceDataset(Dataset):
         feature_list.append(features.get("price_change_pct", 0.0))
         feature_list.append(features.get("price_range_pct", 0.0))
         
-        # Pad or truncate to fixed size
-        target_size = 10
+        # Session bar features (6:30–8:00 path)
+        feature_list.append(features.get("session_return_pct", 0.0) / 100.0)
+        feature_list.append(features.get("session_range_pct", 0.0) / 100.0)
+        feature_list.append(min(1.0, features.get("session_volatility", 0.0)))
+        feature_list.append(min(1.0, features.get("session_num_bars", 0) / 100.0))
+        
+        # Chart pattern features
+        trend = features.get("trend_direction", "unknown")
+        trend_val = 0.0 if trend == "down" else (0.5 if trend == "sideways" else 1.0)
+        feature_list.append(trend_val)
+        feature_list.append(features.get("volatility_estimate", 0.0))
+        feature_list.append(1.0 if features.get("has_support_level") else 0.0)
+        feature_list.append(1.0 if features.get("has_resistance_level") else 0.0)
+        
+        target_size = settings.NUM_FEATURES
         while len(feature_list) < target_size:
             feature_list.append(0.0)
         return feature_list[:target_size]

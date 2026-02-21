@@ -54,18 +54,18 @@ class Predictor:
                         checkpoint_path = max(checkpoints, key=lambda p: p.stat().st_mtime)
                     else:
                         logger.warning("No checkpoint found, initializing new model")
-                        self.model = PricePredictor()
+                        self.model = PricePredictor(num_features=settings.NUM_FEATURES)
                         self.model_loaded = True
                         return True
             
             if checkpoint_path is None or not checkpoint_path.exists():
                 logger.warning("No checkpoint found, initializing new model")
-                self.model = PricePredictor()
+                self.model = PricePredictor(num_features=settings.NUM_FEATURES)
                 self.model_loaded = True
                 return True
             
             # Initialize model
-            self.model = PricePredictor()
+            self.model = PricePredictor(num_features=settings.NUM_FEATURES)
             
             # Load checkpoint
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -80,7 +80,7 @@ class Predictor:
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             # Initialize new model as fallback
-            self.model = PricePredictor()
+            self.model = PricePredictor(num_features=settings.NUM_FEATURES)
             self.model_loaded = True
             return False
     
@@ -158,7 +158,7 @@ class Predictor:
             }
     
     def _extract_feature_vector(self, features: Dict[str, Any]) -> list[float]:
-        """Extract numeric features from features dict."""
+        """Extract numeric features from features dict (must match trainer and NUM_FEATURES)."""
         feature_list = []
         
         # Time features
@@ -170,8 +170,21 @@ class Predictor:
         feature_list.append(features.get("price_change_pct", 0.0))
         feature_list.append(features.get("price_range_pct", 0.0))
         
-        # Pad to fixed size
-        target_size = 10
+        # Session bar features
+        feature_list.append(features.get("session_return_pct", 0.0) / 100.0)
+        feature_list.append(features.get("session_range_pct", 0.0) / 100.0)
+        feature_list.append(min(1.0, features.get("session_volatility", 0.0)))
+        feature_list.append(min(1.0, features.get("session_num_bars", 0) / 100.0))
+        
+        # Chart pattern features
+        trend = features.get("trend_direction", "unknown")
+        trend_val = 0.0 if trend == "down" else (0.5 if trend == "sideways" else 1.0)
+        feature_list.append(trend_val)
+        feature_list.append(features.get("volatility_estimate", 0.0))
+        feature_list.append(1.0 if features.get("has_support_level") else 0.0)
+        feature_list.append(1.0 if features.get("has_resistance_level") else 0.0)
+        
+        target_size = settings.NUM_FEATURES
         while len(feature_list) < target_size:
             feature_list.append(0.0)
         return feature_list[:target_size]

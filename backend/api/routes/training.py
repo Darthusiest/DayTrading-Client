@@ -76,7 +76,7 @@ def train_model_task(db: Session):
             )
 
         # Initialize model and trainer
-        model = PricePredictor()
+        model = PricePredictor(num_features=settings.NUM_FEATURES)
         trainer = Trainer(model)
 
         # Train (plot_show=False in background to avoid requiring a display)

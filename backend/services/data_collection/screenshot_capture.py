@@ -1,12 +1,12 @@
 """Screenshot capture service for TradingView charts."""
 import logging
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import pytz
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -70,14 +70,19 @@ class ScreenshotCapture:
             logger.info(f"Navigating to {chart_url}")
             self.driver.get(chart_url)
             
-            # Wait for chart to load
-            wait = WebDriverWait(self.driver, 30)
+            wait_seconds = getattr(settings, "COLLECTION_CHART_WAIT_SECONDS", 15)
+            wait = WebDriverWait(self.driver, max(30, wait_seconds))
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            
-            # Additional wait for chart rendering
-            import time
-            time.sleep(5)  # Allow chart to fully render
-            
+
+            # Wait for chart area: try canvas first (TradingView uses canvas for chart)
+            try:
+                WebDriverWait(self.driver, min(wait_seconds, 20)).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "canvas"))
+                )
+            except Exception:
+                pass  # Proceed; chart may use different structure or need more time
+            time.sleep(min(wait_seconds, 10))  # Allow chart to fully render
+
             # Take screenshot
             screenshot_bytes = self.driver.get_screenshot_as_png()
             

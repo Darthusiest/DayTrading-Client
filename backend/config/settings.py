@@ -44,9 +44,11 @@ class Settings(BaseSettings):
     # Scheduled data collection (APScheduler)
     ENABLE_SCHEDULED_COLLECTION: bool = os.getenv("ENABLE_SCHEDULED_COLLECTION", "True").lower() == "true"
     COLLECTION_CAPTURE_SCREENSHOTS: bool = os.getenv("COLLECTION_CAPTURE_SCREENSHOTS", "True").lower() == "true"
+    COLLECTION_CHART_WAIT_SECONDS: int = int(os.getenv("COLLECTION_CHART_WAIT_SECONDS", "15"))
     
     # ML Model Configuration
     MODEL_NAME: str = "price_predictor"
+    NUM_FEATURES: int = 18  # Time + price + session bars + chart patterns (match trainer _extract_feature_vector)
     BATCH_SIZE: int = 32
     LEARNING_RATE: float = 1e-4
     NUM_EPOCHS: int = 100

@@ -1,4 +1,4 @@
-"""Data collection API: manual trigger and scheduler status."""
+"""Data collection API: manual trigger, scheduler status, and training data processing."""
 import logging
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -6,6 +6,7 @@ from backend.database.db import get_db
 from backend.config.settings import settings
 from backend.services.data_collection.collector import run_collection
 from backend.services.data_collection.scheduler import get_scheduler
+from backend.services.data_processing.training_data_pipeline import process_training_data_from_snapshots
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,16 @@ def run_collection_now(
         db,
         capture_screenshots=capture_screenshots,
     )
+    return result
+
+
+@router.post("/process-training-data")
+def process_training_data_now(db: Session = Depends(get_db)):
+    """
+    Process before/after snapshot pairs into training samples (preprocess images,
+    extract features, create labels). Idempotent: skips pairs that already have a sample.
+    """
+    result = process_training_data_from_snapshots(db)
     return result
 
 

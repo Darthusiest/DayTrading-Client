@@ -14,7 +14,7 @@ The Day Trading AI Agent backend uses Polygon.io for fetching real-time and hist
 2. **Add to environment**:
    ```bash
    # In your .env file
-   POLYGON_API_KEY=SiVLxTfY0zk3OFQFbtUZYsW8cygRebyd
+   POLYGON_API_KEY=your_polygon_api_key
    ```
 
 ## Symbol Mapping
@@ -77,6 +77,14 @@ historical_data = client.get_historical_data(
 for bar in historical_data:
     print(f"{bar['timestamp']}: Close = {bar['close']}")
 ```
+
+## WebSocket (real-time stream)
+
+When the API server runs, an optional **Polygon WebSocket** connection streams minute-aggregate bars for the configured symbols (C:MNQ1, C:MES1). This runs in a background thread and keeps the latest bar per symbol in memory.
+
+- **Enable/disable**: Set `ENABLE_POLYGON_WEBSOCKET=False` in `.env` to turn it off (default: true when `POLYGON_API_KEY` is set).
+- **Live prices endpoint**: `GET /api/v1/live/prices` returns the latest minute bar (OHLCV + timestamps) per symbol from the stream. Empty or partial if the stream has not connected or no data has arrived yet.
+- **Subscriptions**: The client subscribes to `AM.C:MNQ1` and `AM.C:MES1` (minute aggregates for the same symbols used by the REST client). Requires a Polygon plan that includes futures WebSocket access.
 
 ## API Methods
 

@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     
     # Polygon.io Configuration
     POLYGON_API_KEY: str = os.getenv("POLYGON_API_KEY", "")
+    ENABLE_POLYGON_WEBSOCKET: bool = os.getenv("ENABLE_POLYGON_WEBSOCKET", "True").lower() == "true"
     
     # Market Data — focused on MNQ & MES only so the model gets really good at these
     # MNQ = Micro E-mini Nasdaq, MES = Micro E-mini S&P 500

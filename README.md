@@ -95,6 +95,10 @@ The API will be available at `http://localhost:8000`
 - `POST /api/v1/collection/run` - Run collection once now (optional `capture_screenshots=false` to fetch only Polygon price data).
 - `GET /api/v1/collection/schedule` - Scheduler status and next run times.
 
+#### Live data (Polygon WebSocket)
+- When enabled, a background WebSocket stream receives real-time minute bars for MNQ and MES. Set `ENABLE_POLYGON_WEBSOCKET=false` in `.env` to disable.
+- `GET /api/v1/live/prices` - Latest minute-aggregate bar per symbol (OHLCV + timestamps) from the stream.
+
 #### Notes
 - `POST /api/v1/notes` - Create a note
 - `GET /api/v1/notes` - Get all notes

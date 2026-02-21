@@ -80,22 +80,14 @@ class ScreenshotCapture:
                 except Exception:
                     continue
 
-            if manual_login:
-                # Wait for user to log in manually (up to 2 minutes); poll for URL leaving signin or chart
-                logger.info("Manual login mode: log in in the browser window. Waiting up to 120 seconds…")
+            if manual_login and not has_creds:
+                logger.info("Manual login (no credentials): log in in the browser. Waiting up to 120 seconds…")
                 for _ in range(120):
                     time.sleep(1)
                     current = (self.driver.current_url or "").lower()
                     if "signin" not in current or "chart" in current:
-                        try:
-                            if self.driver.find_element(By.CSS_SELECTOR, "[data-name='header-user-menu-button'], .tv-header__user-menu, [data-name='user-menu-button']"):
-                                break
-                        except Exception:
-                            pass
-                        if "chart" in current or "signin" not in current:
-                            break
+                        break
                 self._logged_in = True
-                logger.info("Manual login: proceeding to chart.")
                 return True
 
             def find_email_and_password(driver):
@@ -104,6 +96,7 @@ class ScreenshotCapture:
                     "input[name='username']",
                     "input[type='email']",
                     "input[name='id_username']",
+                    "input[placeholder*='Email or Username']",
                     "input[placeholder*='mail' i]",
                     "input[placeholder*='username' i]",
                     "input[autocomplete='username']",
@@ -112,6 +105,7 @@ class ScreenshotCapture:
                     "input[name='password']",
                     "input[type='password']",
                     "input[name='id_password']",
+                    "input[placeholder*='Password']",
                     "input[placeholder*='assword' i]",
                     "input[autocomplete='current-password']",
                 ]
@@ -163,7 +157,27 @@ class ScreenshotCapture:
             email_el.send_keys(settings.TRADINGVIEW_USERNAME)
             pass_el.clear()
             pass_el.send_keys(settings.TRADINGVIEW_PASSWORD)
+            logger.info("Filled TradingView email and password from .env")
             time.sleep(0.5)
+
+            if manual_login:
+                # Wait for user to click Sign in in the browser (up to 2 minutes)
+                logger.info("Manual login: click Sign in in the browser when ready. Waiting up to 120 seconds…")
+                for _ in range(120):
+                    time.sleep(1)
+                    current = (self.driver.current_url or "").lower()
+                    if "signin" not in current or "chart" in current:
+                        try:
+                            if self.driver.find_element(By.CSS_SELECTOR, "[data-name='header-user-menu-button'], .tv-header__user-menu, [data-name='user-menu-button']"):
+                                break
+                        except Exception:
+                            pass
+                        if "chart" in current or "signin" not in current:
+                            break
+                self._logged_in = True
+                logger.info("Manual login: proceeding to chart.")
+                return True
+
             submit_selectors = [
                 "button[type='submit']",
                 "input[type='submit']",

@@ -48,26 +48,133 @@ class ScreenshotCapture:
             return True
         if self._logged_in:
             return True
+        wait_after_submit = getattr(settings, "TRADINGVIEW_LOGIN_WAIT_SECONDS", 10)
         try:
             logger.info("Logging in to TradingView…")
             self.driver.get(self.SIGNIN_URL)
-            wait = WebDriverWait(self.driver, 15)
-            # TradingView sign-in: email/username and password fields
-            email_el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='username'], input[type='email'], input[name='id_username']")))
-            pass_el = self.driver.find_element(By.CSS_SELECTOR, "input[name='password'], input[type='password'], input[name='id_password']")
+            time.sleep(3)  # Let the page and any modals/iframes render
+            wait = WebDriverWait(self.driver, 25)
+
+            def find_email_and_password(driver):
+                """Find email and password inputs in current context (default content or iframe)."""
+                email_selectors = [
+                    "input[name='username']",
+                    "input[type='email']",
+                    "input[name='id_username']",
+                    "input[placeholder*='mail' i]",
+                    "input[placeholder*='username' i]",
+                    "input[autocomplete='username']",
+                ]
+                pass_selectors = [
+                    "input[name='password']",
+                    "input[type='password']",
+                    "input[name='id_password']",
+                    "input[placeholder*='assword' i]",
+                    "input[autocomplete='current-password']",
+                ]
+                email_el = None
+                for sel in email_selectors:
+                    try:
+                        el = driver.find_element(By.CSS_SELECTOR, sel)
+                        if el and el.is_displayed():
+                            email_el = el
+                            break
+                    except Exception:
+                        continue
+                pass_el = None
+                for sel in pass_selectors:
+                    try:
+                        el = driver.find_element(By.CSS_SELECTOR, sel)
+                        if el and el.is_displayed():
+                            pass_el = el
+                            break
+                    except Exception:
+                        continue
+                return email_el, pass_el
+
+            # Try default content first, then switch to iframe if form is inside one
+            email_el, pass_el = find_email_and_password(self.driver)
+            iframe_used = None
+            if (not email_el or not pass_el) and self.driver.find_elements(By.TAG_NAME, "iframe"):
+                for idx, frame in enumerate(self.driver.find_elements(By.TAG_NAME, "iframe")):
+                    try:
+                        self.driver.switch_to.frame(frame)
+                        time.sleep(1)
+                        email_el, pass_el = find_email_and_password(self.driver)
+                        if email_el and pass_el:
+                            iframe_used = idx
+                            break
+                    except Exception:
+                        pass
+                    finally:
+                        self.driver.switch_to.default_content()
+                if iframe_used is not None:
+                    self.driver.switch_to.frame(self.driver.find_elements(By.TAG_NAME, "iframe")[iframe_used])
+
+            if not email_el:
+                raise ValueError("Could not find TradingView username/email input (tried main page and iframes)")
+            if not pass_el:
+                raise ValueError("Could not find TradingView password input (tried main page and iframes)")
+
             email_el.clear()
             email_el.send_keys(settings.TRADINGVIEW_USERNAME)
             pass_el.clear()
             pass_el.send_keys(settings.TRADINGVIEW_PASSWORD)
-            submit = self.driver.find_element(By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], .signin-button, [data-name='signin-button']")
+            time.sleep(0.5)
+            submit_selectors = [
+                "button[type='submit']",
+                "input[type='submit']",
+                "[data-name='signin-button']",
+                ".signin-button",
+                "form button",
+                "form [type='submit']",
+            ]
+            submit = None
+            for sel in submit_selectors:
+                try:
+                    submit = self.driver.find_element(By.CSS_SELECTOR, sel)
+                    if submit and submit.is_displayed():
+                        break
+                except Exception:
+                    continue
+            if not submit:
+                try:
+                    submit = self.driver.find_element(By.XPATH, "//button[contains(translate(., 'SIGN IN', 'sign in'), 'sign in')]")
+                except Exception:
+                    pass
+            if not submit:
+                raise ValueError("Could not find TradingView sign-in submit button")
             submit.click()
-            time.sleep(3)
-            # Consider logged in if we're no longer on signin URL or body contains chart-related content when we later load chart
+            if iframe_used is not None:
+                self.driver.switch_to.default_content()
+            # Wait for redirect away from sign-in; verify we're actually logged in
+            logged_in_verified = False
+            for _ in range(wait_after_submit):
+                time.sleep(1)
+                current = (self.driver.current_url or "").lower()
+                if "signin" not in current or "chart" in current:
+                    logged_in_verified = True
+                    break
+                try:
+                    if self.driver.find_element(By.CSS_SELECTOR, "[data-name='header-user-menu-button'], .tv-header__user-menu, [data-name='user-menu-button']"):
+                        logged_in_verified = True
+                        break
+                except Exception:
+                    pass
+            if not logged_in_verified:
+                current = (self.driver.current_url or "").lower()
+                logger.warning(
+                    "TradingView login may have failed: still on sign-in page after %ss (URL: %s). Screenshot will be unauthenticated.",
+                    wait_after_submit,
+                    current[:80],
+                )
+                self._logged_in = False
+                return False
             self._logged_in = True
             logger.info("TradingView login completed.")
             return True
         except Exception as e:
-            logger.warning(f"TradingView login failed (continuing unauthenticated): {e}")
+            logger.warning("TradingView login failed (screenshot will be unauthenticated): %s", e)
             return False
     
     def capture_chart_screenshot(

@@ -13,10 +13,10 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
     
-    # Database
+    # Database (default SQLite so app runs without PostgreSQL; set DATABASE_URL for Postgres)
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql+psycopg://user:password@localhost:5432/daytrade"
+        "sqlite:///./data/daytrade.db"
     )
     
     # File Storage
@@ -69,6 +69,7 @@ class Settings(BaseSettings):
 
 # Create data directories if they don't exist
 settings = Settings()
+settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.MODELS_DIR.mkdir(parents=True, exist_ok=True)

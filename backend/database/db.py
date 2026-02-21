@@ -4,11 +4,16 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from backend.config.settings import settings
 
-# Create database engine
+# Create database engine (SQLite needs check_same_thread=False for FastAPI)
+_connect_args = {}
+if "sqlite" in settings.DATABASE_URL:
+    _connect_args["check_same_thread"] = False
+
 engine = create_engine(
     settings.DATABASE_URL,
-    pool_pre_ping=True,
-    echo=settings.DEBUG
+    connect_args=_connect_args,
+    pool_pre_ping=("sqlite" not in settings.DATABASE_URL),
+    echo=settings.DEBUG,
 )
 
 # Create session factory

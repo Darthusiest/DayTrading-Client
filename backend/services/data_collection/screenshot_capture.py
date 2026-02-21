@@ -46,8 +46,10 @@ class ScreenshotCapture:
                 raise
     
     def _ensure_logged_in(self) -> bool:
-        """Log in to TradingView if credentials are set and not already logged in. Returns True if session is ready (logged in or no credentials)."""
-        if not settings.TRADINGVIEW_USERNAME or not settings.TRADINGVIEW_PASSWORD:
+        """Log in to TradingView if credentials are set (or manual login mode) and not already logged in. Returns True if session is ready."""
+        manual_login = getattr(settings, "TRADINGVIEW_MANUAL_LOGIN", False)
+        has_creds = bool(settings.TRADINGVIEW_USERNAME and settings.TRADINGVIEW_PASSWORD)
+        if not has_creds and not manual_login:
             logger.info(
                 "TradingView login skipped: TRADINGVIEW_USERNAME or TRADINGVIEW_PASSWORD not set. "
                 "Add them to .env in the project root and restart the server to log in before capturing."
@@ -61,18 +63,40 @@ class ScreenshotCapture:
             self.driver.get(self.SIGNIN_URL)
             time.sleep(3)  # Let the page and any modals/iframes render
             wait = WebDriverWait(self.driver, 25)
-            # TradingView shows "Continue with Google" by default; click "Show more options" to reveal email/password
-            try:
-                show_more = self.driver.find_element(
-                    By.XPATH,
-                    "//*[contains(translate(., 'SHOW MORE OPTIONS', 'show more options'), 'show more options')]"
-                )
-                if show_more and show_more.is_displayed():
-                    show_more.click()
-                    time.sleep(1.5)
-                    logger.debug("Clicked 'Show more options' to reveal email/password form")
-            except Exception:
-                pass
+            # Click "Email" to show the email/password form (fallback: "Show more options")
+            for xpath in [
+                "//button[contains(., 'Email')]",
+                "//a[contains(., 'Email')]",
+                "//*[@role='button' and contains(., 'Email')]",
+                "//*[contains(., 'Show more options')]",
+            ]:
+                try:
+                    el = self.driver.find_element(By.XPATH, xpath)
+                    if el and el.is_displayed():
+                        el.click()
+                        time.sleep(1.5)
+                        logger.debug("Clicked element to reveal email/password form")
+                        break
+                except Exception:
+                    continue
+
+            if manual_login:
+                # Wait for user to log in manually (up to 2 minutes); poll for URL leaving signin or chart
+                logger.info("Manual login mode: log in in the browser window. Waiting up to 120 seconds…")
+                for _ in range(120):
+                    time.sleep(1)
+                    current = (self.driver.current_url or "").lower()
+                    if "signin" not in current or "chart" in current:
+                        try:
+                            if self.driver.find_element(By.CSS_SELECTOR, "[data-name='header-user-menu-button'], .tv-header__user-menu, [data-name='user-menu-button']"):
+                                break
+                        except Exception:
+                            pass
+                        if "chart" in current or "signin" not in current:
+                            break
+                self._logged_in = True
+                logger.info("Manual login: proceeding to chart.")
+                return True
 
             def find_email_and_password(driver):
                 """Find email and password inputs in current context (default content or iframe)."""

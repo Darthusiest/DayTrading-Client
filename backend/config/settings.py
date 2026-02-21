@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     CHART_INTERVAL_MINUTES: int = int(os.getenv("CHART_INTERVAL_MINUTES", "15"))  # Chart timeframe (1, 5, 15, 60, etc.)
     TRADINGVIEW_LOGIN_WAIT_SECONDS: int = int(os.getenv("TRADINGVIEW_LOGIN_WAIT_SECONDS", "15"))  # Seconds to wait after login for redirect
     TRADINGVIEW_HEADLESS: bool = os.getenv("TRADINGVIEW_HEADLESS", "True").lower() == "true"  # False = show browser window (for debugging login)
+    TRADINGVIEW_MANUAL_LOGIN: bool = os.getenv("TRADINGVIEW_MANUAL_LOGIN", "False").lower() == "true"  # True = wait for user to log in manually, then take screenshot
 
     # Scheduled data collection (APScheduler)
     ENABLE_SCHEDULED_COLLECTION: bool = os.getenv("ENABLE_SCHEDULED_COLLECTION", "True").lower() == "true"

@@ -240,33 +240,35 @@ class ScreenshotCapture:
         snapshot_type: str,
         session_date: Optional[str] = None,
         interval_minutes: Optional[int] = None,
+        bar_time: Optional[datetime] = None,
     ) -> Optional[Path]:
         """
         Capture a screenshot of TradingView chart.
-        
+
         Args:
             symbol: Trading symbol (MNQ1! or MES1!)
-            snapshot_type: 'before', 'after', or 'manual'
+            snapshot_type: 'before', 'after', 'manual', or 'session_candle'
             session_date: Session date in YYYY-MM-DD format
             interval_minutes: Chart timeframe in minutes (1, 5, 15, 60, 240, 1440). If None, uses settings.CHART_INTERVAL_MINUTES.
-        
+            bar_time: For session_candle, the candle-close time used in filename (e.g. 6:31).
+
         Returns:
             Path to saved screenshot or None if failed
         """
         try:
             self._init_driver()
             self._ensure_logged_in()
-            
+
             if session_date is None:
                 session_date = datetime.now(self.timezone).strftime("%Y-%m-%d")
-            
+
             # Construct TradingView URL with interval (timeframe in minutes: 1, 5, 15, 60, 240, 1440)
             interval = interval_minutes if interval_minutes is not None else getattr(settings, "CHART_INTERVAL_MINUTES", 15)
             chart_url = f"https://www.tradingview.com/chart/?symbol={symbol}&interval={interval}"
-            
+
             logger.info(f"Navigating to {chart_url}")
             self.driver.get(chart_url)
-            
+
             wait_seconds = getattr(settings, "COLLECTION_CHART_WAIT_SECONDS", 15)
             wait = WebDriverWait(self.driver, max(30, wait_seconds))
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -282,18 +284,22 @@ class ScreenshotCapture:
 
             # Take screenshot
             screenshot_bytes = self.driver.get_screenshot_as_png()
-            
-            # Save screenshot
-            filename = f"{symbol}_{snapshot_type}_{session_date}_{datetime.now().strftime('%H%M%S')}.png"
+
+            # Filename: for session_candle include interval and bar_time (e.g. MNQ1!_session_2026-02-21_1m_0631.png)
+            if snapshot_type == "session_candle" and bar_time is not None and interval_minutes is not None:
+                time_suffix = bar_time.strftime("%H%M")
+                filename = f"{symbol}_session_{session_date}_{interval_minutes}m_{time_suffix}.png"
+            else:
+                filename = f"{symbol}_{snapshot_type}_{session_date}_{datetime.now().strftime('%H%M%S')}.png"
             filepath = settings.RAW_DATA_DIR / filename
-            
+
             # Save image
             image = Image.open(io.BytesIO(screenshot_bytes))
             image.save(filepath)
-            
+
             logger.info(f"Screenshot saved to {filepath}")
             return filepath
-            
+
         except Exception as e:
             logger.error(f"Error capturing screenshot for {symbol}: {e}")
             return None

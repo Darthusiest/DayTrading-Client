@@ -4,9 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from backend.database.db import get_db
 from backend.config.settings import settings
-from backend.services.data_collection.collector import run_collection, capture_snapshot_now
+from backend.services.data_collection.collector import run_collection, capture_snapshot_now, run_session_candle_capture
 from backend.services.data_collection.scheduler import get_scheduler
-from backend.services.data_processing.training_data_pipeline import process_training_data_from_snapshots
+from backend.services.data_processing.training_data_pipeline import (
+    process_training_data_from_snapshots,
+    process_training_data_from_session_candles,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +62,33 @@ def capture_chart_now(
     return capture_snapshot_now(db, symbol=symbol, interval_minutes=interval)
 
 
+@router.post("/run-session-candles")
+def run_session_candles_now(
+    session_date: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Run session candle capture for 6:31–8:00 at 1m, 5m, 15m, 1h for all symbols.
+    Blocks until complete (~90 minutes if run at 6:30). Optional query: session_date=YYYY-MM-DD (default: today).
+    """
+    return run_session_candle_capture(db, session_date=session_date)
+
+
 @router.post("/process-training-data")
 def process_training_data_now(db: Session = Depends(get_db)):
     """
-    Process before/after snapshot pairs into training samples (preprocess images,
-    extract features, create labels). Idempotent: skips pairs that already have a sample.
+    Process before/after snapshot pairs and session_candle (per-interval) pairs into training samples.
+    Idempotent: skips pairs that already have a sample. Session candle labels use SessionMinuteBar (run after 8:00).
     """
-    result = process_training_data_from_snapshots(db)
-    return result
+    result_before_after = process_training_data_from_snapshots(db)
+    result_session = process_training_data_from_session_candles(db)
+    return {
+        "before_after": result_before_after,
+        "session_candles": result_session,
+        "created": result_before_after["created"] + result_session["created"],
+        "skipped": result_before_after["skipped"] + result_session["skipped"],
+        "errors": result_before_after["errors"] + result_session["errors"],
+    }
 
 
 @router.get("/schedule")

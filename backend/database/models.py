@@ -6,15 +6,18 @@ from backend.database.db import Base
 
 
 class Snapshot(Base):
-    """Raw screenshot data before and after NY AM session."""
+    """Raw screenshot data: before/after NY AM session, manual, or session_candle (per-bar)."""
     __tablename__ = "snapshots"
     
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), nullable=False, index=True)
-    snapshot_type = Column(String(20), nullable=False)  # 'before' or 'after'
+    snapshot_type = Column(String(20), nullable=False)  # 'before', 'after', 'manual', or 'session_candle'
     timestamp = Column(DateTime, nullable=False, index=True)
     image_path = Column(String(500), nullable=False)
     session_date = Column(String(10), nullable=False, index=True)  # YYYY-MM-DD
+    # Multi-timeframe session capture: chart interval and candle-close time (null for before/after/manual)
+    interval_minutes = Column(Integer, nullable=True, index=True)  # 1, 5, 15, 60
+    bar_time = Column(DateTime, nullable=True, index=True)  # Candle-close time (session 6:30-8:00)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -65,6 +68,8 @@ class TrainingSample(Base):
     snapshot_id = Column(Integer, ForeignKey("snapshots.id"))
     symbol = Column(String(20), nullable=False, index=True)
     session_date = Column(String(10), nullable=False, index=True)
+    # For session_candle pairs: chart interval (1, 5, 15, 60)
+    interval_minutes = Column(Integer, nullable=True, index=True)
     
     # Features (stored as JSON for flexibility)
     features = Column(JSON, nullable=True)

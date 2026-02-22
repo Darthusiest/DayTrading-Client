@@ -8,7 +8,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from backend.config.settings import settings
 from backend.database.db import SessionLocal
-from backend.services.data_collection.collector import run_collection
+from backend.services.data_collection.collector import run_collection, run_session_candle_capture
 from backend.services.data_processing.training_data_pipeline import process_training_data_from_snapshots
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,27 @@ def _scheduled_collection_job(snapshot_type: Optional[str] = None) -> None:
                 logger.warning("Collection error: %s", err)
     except Exception as e:
         logger.exception("Scheduled collection failed: %s", e)
+    finally:
+        db.close()
+
+
+def _scheduled_session_candle_capture_job() -> None:
+    """Job run by APScheduler at 6:30: capture every candle 6:31–8:00 at 1m, 5m, 15m, 1h (runs ~90 min)."""
+    logger.info("Scheduled session candle capture started (6:30–8:00)")
+    db = SessionLocal()
+    try:
+        result = run_session_candle_capture(db)
+        logger.info(
+            "Session candle capture finished: collected=%s failed=%s",
+            result["collected"],
+            result["failed"],
+        )
+        for err in result.get("errors", [])[:20]:
+            logger.warning("Session candle error: %s", err)
+        if len(result.get("errors", [])) > 20:
+            logger.warning("... and %s more errors", len(result["errors"]) - 20)
+    except Exception as e:
+        logger.exception("Session candle capture failed: %s", e)
     finally:
         db.close()
 
@@ -87,7 +108,15 @@ def start_scheduler() -> Optional[BackgroundScheduler]:
 
     _scheduler = BackgroundScheduler(timezone=_tz)
 
-    # 6:30 AM local (PST/PDT)
+    # 6:30 AM local: capture every candle 6:31–8:00 at 1m, 5m, 15m, 1h (long-running)
+    _scheduler.add_job(
+        _scheduled_session_candle_capture_job,
+        trigger=CronTrigger(hour=6, minute=30, timezone=_tz),
+        id="session_candle_capture",
+        name="Session candle capture (6:30–8:00)",
+        replace_existing=True,
+    )
+    # 6:30 AM local (PST/PDT): before snapshot (legacy single capture)
     _scheduler.add_job(
         _scheduled_collection_job,
         trigger=CronTrigger(hour=6, minute=30, timezone=_tz),

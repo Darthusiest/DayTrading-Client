@@ -1,6 +1,7 @@
 """Shared data collection logic for scheduled and manual runs."""
 import logging
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pytz
@@ -13,6 +14,21 @@ from backend.services.data_collection.screenshot_capture import ScreenshotCaptur
 from backend.services.evaluation.outcome_feedback import update_predictions_with_outcomes
 
 logger = logging.getLogger(__name__)
+
+# Intervals (minutes) and bar-close rules for session candle capture (6:30–8:00)
+SESSION_CANDLE_INTERVALS = (1, 5, 15, 60)
+
+
+def _intervals_closing_at(hour: int, minute: int) -> list[int]:
+    """Return which of (1, 5, 15, 60) close at this (hour, minute)."""
+    out = [1]  # 1m closes every minute
+    if minute % 5 == 0:
+        out.append(5)
+    if minute % 15 == 0:
+        out.append(15)
+    if (hour, minute) in ((7, 0), (8, 0)):
+        out.append(60)
+    return out
 
 
 def _collect_session_minute_bars(
@@ -202,6 +218,100 @@ def run_collection(
         "snapshot_type": snapshot_type,
         "errors": errors,
     }
+
+
+def run_session_candle_capture(
+    db: Session,
+    session_date: Optional[str] = None,
+) -> dict:
+    """
+    Capture every candle between 6:30 and 8:00 at 1m, 5m, 15m, 1h for each configured symbol.
+    Runs from 6:31 to 8:00 (inclusive); at each clock minute captures the timeframe(s) that just closed.
+    One browser session; login once. Saves snapshots with snapshot_type='session_candle', interval_minutes, bar_time.
+
+    Returns:
+        Dict with collected (int), failed (int), errors (list).
+    """
+    tz = pytz.timezone(settings.TIMEZONE)
+    now = datetime.now(tz)
+    if session_date is None:
+        session_date = now.strftime("%Y-%m-%d")
+
+    # Build list of (bar_time, intervals) from 6:31 to 8:00
+    base_date = datetime.strptime(session_date, "%Y-%m-%d").date()
+    bar_schedule: list[tuple[datetime, list[int]]] = []
+    for minute_offset in range(1, 91):  # 6:31 = +1, 8:00 = +90
+        dt = datetime.combine(base_date, datetime.strptime("06:30", "%H:%M").time()) + timedelta(minutes=minute_offset)
+        dt = tz.localize(dt) if dt.tzinfo is None else dt
+        h, m = dt.hour, dt.minute
+        bar_schedule.append((dt, _intervals_closing_at(h, m)))
+
+    screenshot_capture = ScreenshotCapture()
+    collected = 0
+    failed = 0
+    errors = []
+
+    try:
+        screenshot_capture._init_driver()
+        screenshot_capture._ensure_logged_in()
+
+        for bar_time, intervals in bar_schedule:
+            now = datetime.now(tz)
+            if now < bar_time:
+                wait_secs = (bar_time - now).total_seconds()
+                if wait_secs > 0:
+                    logger.debug("Session candle: waiting %.0fs until %s", wait_secs, bar_time.strftime("%H:%M"))
+                    time.sleep(min(wait_secs, 65))  # cap 65s so we don't oversleep past next minute
+
+            bar_time_naive = bar_time.replace(tzinfo=None) if bar_time.tzinfo else bar_time
+
+            for symbol in settings.SYMBOLS:
+                for interval in intervals:
+                    try:
+                        existing = db.query(Snapshot).filter(
+                            Snapshot.symbol == symbol,
+                            Snapshot.session_date == session_date,
+                            Snapshot.snapshot_type == "session_candle",
+                            Snapshot.interval_minutes == interval,
+                            Snapshot.bar_time == bar_time_naive,
+                        ).first()
+                        if existing:
+                            logger.debug("Session candle: skip existing %s %sm at %s", symbol, interval, bar_time_naive.strftime("%H:%M"))
+                            continue
+                        image_path = screenshot_capture.capture_chart_screenshot(
+                            symbol=symbol,
+                            snapshot_type="session_candle",
+                            session_date=session_date,
+                            interval_minutes=interval,
+                            bar_time=bar_time_naive,
+                        )
+                        if image_path is None:
+                            failed += 1
+                            errors.append(f"{symbol} {interval}m at {bar_time_naive}: capture failed")
+                            continue
+                        snapshot = Snapshot(
+                            symbol=symbol,
+                            snapshot_type="session_candle",
+                            timestamp=bar_time_naive,
+                            image_path=str(image_path),
+                            session_date=session_date,
+                            interval_minutes=interval,
+                            bar_time=bar_time_naive,
+                        )
+                        db.add(snapshot)
+                        db.commit()
+                        collected += 1
+                        logger.debug("Session candle: %s %sm at %s", symbol, interval, bar_time_naive.strftime("%H:%M"))
+                    except Exception as e:
+                        logger.exception("Session candle %s %sm at %s: %s", symbol, interval, bar_time_naive, e)
+                        db.rollback()
+                        failed += 1
+                        errors.append(f"{symbol} {interval}m at {bar_time_naive}: {e}")
+
+    finally:
+        screenshot_capture.close()
+
+    return {"collected": collected, "failed": failed, "errors": errors}
 
 
 def capture_snapshot_now(

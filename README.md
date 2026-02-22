@@ -92,8 +92,10 @@ The API will be available at `http://localhost:8000`
 
 #### Data collection (scheduled and manual)
 - **Scheduled**: When the API server runs, data collection is scheduled for **6:30 AM** and **8:00 AM** (PST). Set `ENABLE_SCHEDULED_COLLECTION=false` in `.env` to disable.
+- **Session candle capture (6:30–8:00)**: At 6:30 AM a job starts that captures **every candle** between 6:31 and 8:00 at **1m, 5m, 15m, and 1h** for each symbol (MNQ, MES). One screenshot per candle-close per timeframe (~116 per symbol per session). Stored as `snapshot_type="session_candle"` with `interval_minutes` and `bar_time`. Run manually: `POST /api/v1/collection/run-session-candles` (optional `?session_date=YYYY-MM-DD`; blocks ~90 min if run at 6:30).
 - `POST /api/v1/collection/run` - Run collection once now (optional `capture_screenshots=false` to fetch only Polygon price data).
-- `POST /api/v1/collection/capture-now` - Log in to TradingView, take a screenshot of the current MNQ (or other symbol) chart, save to disk and database. Optional query: `?symbol=MES1!`.
+- `POST /api/v1/collection/capture-now` - Log in to TradingView, take a screenshot of the current MNQ (or other symbol) chart, save to disk and database. Optional query: `?symbol=MES1!&interval=15`.
+- `POST /api/v1/collection/process-training-data` - Build training samples from before/after pairs and from **session_candle** pairs (per-interval first bar vs 8:00). Session candle labels use `SessionMinuteBar` (populated after 8:00 collection).
 - `GET /api/v1/collection/schedule` - Scheduler status and next run times.
 
 #### Live data (Polygon WebSocket)
@@ -119,9 +121,10 @@ Upload a screenshot of the market **before or at 6:30 AM PST** to get the model'
 
 ## Data Collection
 
-The system is designed to capture chart screenshots at:
-- **Before snapshot**: 6:30 AM PST
-- **After snapshot**: 8:00 AM PST
+The system captures chart screenshots in two ways:
+
+- **Before/after snapshots**: Single capture at **6:30 AM** (before) and **8:00 AM** (after) PST per symbol.
+- **Session candle capture (multi-timeframe)**: From 6:31 to 8:00, at each candle-close time, screenshots are taken at **1m, 5m, 15m, and 1h** so the AI can learn from every price move in the session. Scheduled at 6:30 AM (runs ~90 minutes). Files are named like `MNQ1!_session_2026-02-21_1m_0631.png`.
 
 ### Polygon.io Integration
 
@@ -142,8 +145,8 @@ The screenshot capture service (`backend/services/data_collection/screenshot_cap
 - Save images to the data directory
 
 **Where screenshots are saved:**
-- **Database**: Table **`snapshots`**. Each capture creates one row with: `id`, `symbol`, `snapshot_type` (e.g. `"before"`, `"after"`, or `"manual"`), `timestamp`, `image_path` (path to the file), `session_date`, `created_at`. Optional current price from Polygon is stored in table **`price_data`** linked by `snapshot_id`.
-- **Filesystem**: Image files are stored under **`data/raw/`** with names like `MNQ1!_manual_2025-02-19_143022.png` (symbol, type, date, time).
+- **Database**: Table **`snapshots`**. Each capture creates one row with: `id`, `symbol`, `snapshot_type` (`"before"`, `"after"`, `"manual"`, or `"session_candle"`), `timestamp`, `image_path`, `session_date`, `created_at`. For session_candle captures, `interval_minutes` (1, 5, 15, 60) and `bar_time` (candle-close time) are set. Optional current price from Polygon is stored in **`price_data`** linked by `snapshot_id`.
+- **Filesystem**: Under **`data/raw/`**. Manual/before/after: `MNQ1!_manual_2025-02-19_143022.png`. Session candles: `MNQ1!_session_2026-02-21_1m_0631.png` (symbol, session, interval, bar time).
 
 ## ML Model
 
@@ -163,9 +166,8 @@ To train the model:
 3. Trigger training via API: `POST /api/v1/train`
 
 The training pipeline:
-- Loads paired before/after snapshots
-- Preprocesses images
-- Extracts features
+- Builds training samples from **before/after** snapshot pairs and from **session_candle** pairs (per-interval: first bar of session vs 8:00 bar). Session candle labels use **SessionMinuteBar** (minute bars 6:30–8:00, populated after the 8:00 collection).
+- Preprocesses images, extracts features (including `interval_minutes` and `bar_time` for session samples)
 - Trains with validation split
 - Saves checkpoints and metrics
 
@@ -179,9 +181,10 @@ The system tracks:
 
 ## Database Schema
 
-- `snapshots`: Raw screenshot data
-- `price_data`: OHLCV market data
-- `training_samples`: Processed training data with labels
+- `snapshots`: Raw screenshot data. Columns include `snapshot_type`, `interval_minutes`, `bar_time` (for session_candle).
+- `session_minute_bars`: Minute OHLCV bars for 6:30–8:00 session (used for session_candle training labels).
+- `price_data`: OHLCV market data (linked to snapshots).
+- `training_samples`: Processed training data with labels; `interval_minutes` set for session_candle-derived samples.
 - `model_checkpoints`: Saved model versions
 - `predictions`: User predictions and model outputs
 - `learning_metrics`: Training/validation metrics
@@ -221,11 +224,10 @@ pytest tests/
 
 ## Next Steps
 
-1. **Data Collection Automation**: Set up scheduled tasks for automatic screenshot capture and data collection
-2. **Polygon.io WebSocket**: Implement real-time streaming data via Polygon.io WebSocket API for live updates
-3. **Model Improvements**: Experiment with different architectures and hyperparameters
-4. **Frontend**: Build frontend interface for chat, screenshot upload, and notes
-5. **Real-time Updates**: Add WebSocket support for real-time predictions
+1. **Model Improvements**: Experiment with different architectures and hyperparameters (e.g. multi-interval or sequence inputs from session candles)
+2. **Frontend**: Build frontend interface for chat, screenshot upload, and notes
+3. **Real-time Updates**: Add WebSocket support for real-time predictions
+4. **Indicators**: Document or standardize chart indicators used in TradingView for training
 
 ## License
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from backend.database.db import get_db
 from backend.database.models import TrainingSample, ModelCheckpoint
 from backend.services.ml.training.trainer import Trainer, PriceDataset
-from backend.services.ml.models.price_predictor import PricePredictor
+from backend.services.ml.models.price_predictor import PricePredictor, price_predictor_kwargs_from_settings
 from backend.services.data_processing.image_preprocessor import ImagePreprocessor
 from backend.config.settings import settings
 from torch.utils.data import DataLoader
@@ -76,7 +76,7 @@ def train_model_task(db: Session):
             )
 
         # Initialize model and trainer
-        model = PricePredictor(num_features=settings.NUM_FEATURES)
+        model = PricePredictor(**price_predictor_kwargs_from_settings())
         trainer = Trainer(model)
 
         # Train (plot_show=False in background to avoid requiring a display)

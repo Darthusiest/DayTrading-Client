@@ -134,7 +134,7 @@ The Polygon.io client (`backend/services/data_collection/tradingview_client.py`)
 - Session date management
 - Support for futures contracts (Nasdaq E-mini, S&P 500 E-mini)
 
-**Note**: Requires a Polygon.io API key. Set `POLYGON_API_KEY` in your `.env` file.
+**Note**: Requires a Polygon.io API key. Set `POLYGON_API_KEY` in your `.env` file. The free tier is limited (5 calls/min, end-of-day data only; intraday/minute data requires a paid plan). See [docs/polygon_data.md](docs/polygon_data.md) for limits and example response data.
 
 ### Screenshot Capture
 
@@ -196,9 +196,12 @@ Key settings in `backend/config/settings.py`:
 - `SYMBOLS`: Trading symbols (default: ["MNQ1!", "MES1!"] — MNQ & MES micro futures only)
 - `BEFORE_SNAPSHOT_TIME`: Before snapshot time (default: "06:30")
 - `AFTER_SNAPSHOT_TIME`: After snapshot time (default: "08:00")
-- `BATCH_SIZE`: Training batch size (default: 32)
+- `BATCH_SIZE`: Training batch size (default: 64; set in `.env` if needed)
 - `LEARNING_RATE`: Learning rate (default: 1e-4)
-- `NUM_EPOCHS`: Training epochs (default: 100)
+- `NUM_EPOCHS`: Training epochs (default: 200)
+- `NUM_LSTM_LAYERS`, `LSTM_HIDDEN_SIZE`: LSTM depth and width (defaults: 2, 128)
+- `MLP_HIDDENS`: Comma-separated MLP hidden sizes (default: "256,128"); e.g. "256,256,128" for a deeper MLP
+- `CNN_TRAINABLE_PARAM_GROUPS`: Number of CNN parameter tensors to train (default: 10); 0 = unfreeze all. See `.env.example`
 
 ## Development
 

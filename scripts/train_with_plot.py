@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from backend.database.db import SessionLocal
 from backend.database.models import TrainingSample, ModelCheckpoint
 from backend.services.ml.training.trainer import Trainer, PriceDataset
-from backend.services.ml.models.price_predictor import PricePredictor
+from backend.services.ml.models.price_predictor import PricePredictor, price_predictor_kwargs_from_settings
 from backend.services.data_processing.image_preprocessor import ImagePreprocessor
 from backend.config.settings import settings
 from torch.utils.data import DataLoader
@@ -69,7 +69,7 @@ def main():
                 num_workers=0
             )
 
-        model = PricePredictor()
+        model = PricePredictor(**price_predictor_kwargs_from_settings())
         trainer = Trainer(model)
         save_dir = settings.MODELS_DIR / settings.MODEL_NAME
 

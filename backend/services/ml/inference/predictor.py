@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 from PIL import Image
 import numpy as np
 from sqlalchemy.orm import Session
-from backend.services.ml.models.price_predictor import PricePredictor
+from backend.services.ml.models.price_predictor import PricePredictor, price_predictor_kwargs_from_settings
 from backend.services.data_processing.image_preprocessor import ImagePreprocessor
 from backend.database.models import ModelCheckpoint
 from backend.config.settings import settings
@@ -54,18 +54,18 @@ class Predictor:
                         checkpoint_path = max(checkpoints, key=lambda p: p.stat().st_mtime)
                     else:
                         logger.warning("No checkpoint found, initializing new model")
-                        self.model = PricePredictor(num_features=settings.NUM_FEATURES)
+                        self.model = PricePredictor(**price_predictor_kwargs_from_settings())
                         self.model_loaded = True
                         return True
             
             if checkpoint_path is None or not checkpoint_path.exists():
                 logger.warning("No checkpoint found, initializing new model")
-                self.model = PricePredictor(num_features=settings.NUM_FEATURES)
+                self.model = PricePredictor(**price_predictor_kwargs_from_settings())
                 self.model_loaded = True
                 return True
             
-            # Initialize model
-            self.model = PricePredictor(num_features=settings.NUM_FEATURES)
+            # Initialize model (same architecture as training)
+            self.model = PricePredictor(**price_predictor_kwargs_from_settings())
             
             # Load checkpoint
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -80,7 +80,7 @@ class Predictor:
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             # Initialize new model as fallback
-            self.model = PricePredictor(num_features=settings.NUM_FEATURES)
+            self.model = PricePredictor(**price_predictor_kwargs_from_settings())
             self.model_loaded = True
             return False
     

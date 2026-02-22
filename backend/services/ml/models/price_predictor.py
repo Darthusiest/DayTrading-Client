@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -11,14 +11,14 @@ logger = logging.getLogger(__name__)
 class PricePredictor(nn.Module):
     """
     Hybrid CNN + Time Series model for price prediction from chart screenshots.
-    
-    Architecture:
-    1. CNN encoder (ResNet/EfficientNet) for visual feature extraction
-    2. LSTM/Transformer layers for temporal patterns
-    3. Regression head for price prediction
-    4. Classification head for probability estimation
+
+    Architecture (configurable via settings):
+    1. CNN encoder: ResNet18 or EfficientNet-B0; trainable param groups configurable (0 = all trainable).
+    2. MLP: hidden sizes from mlp_hiddens (e.g. [256, 256, 128]).
+    3. LSTM: num_lstm_layers and lstm_hidden_size configurable.
+    4. Regression head and classification head: input = lstm_hidden_size + mlp_output_size.
     """
-    
+
     def __init__(
         self,
         image_size: Tuple[int, int] = (224, 224),
@@ -26,20 +26,23 @@ class PricePredictor(nn.Module):
         lstm_hidden_size: int = 128,
         num_lstm_layers: int = 2,
         dropout: float = 0.3,
-        num_features: int = 0  # Additional non-image features
+        num_features: int = 0,  # Additional non-image features
+        mlp_hiddens: Optional[List[int]] = None,
+        cnn_trainable_param_groups: int = 10,
     ):
         super(PricePredictor, self).__init__()
-        
+        if mlp_hiddens is None:
+            mlp_hiddens = [256, 128]
+
         self.image_size = image_size
         self.cnn_backbone = cnn_backbone
         self.lstm_hidden_size = lstm_hidden_size
         self.num_lstm_layers = num_lstm_layers
         self.num_features = num_features
-        
+
         # CNN Encoder
         if cnn_backbone == "resnet18":
             cnn = models.resnet18(pretrained=True)
-            # Remove final fully connected layer
             self.cnn_features = nn.Sequential(*list(cnn.children())[:-1])
             cnn_output_size = 512
         elif cnn_backbone == "efficientnet_b0":
@@ -48,52 +51,55 @@ class PricePredictor(nn.Module):
             cnn_output_size = 1280
         else:
             raise ValueError(f"Unsupported CNN backbone: {cnn_backbone}")
-        
-        # Freeze early layers (optional - can be fine-tuned)
-        for param in list(self.cnn_features.parameters())[:-10]:
-            param.requires_grad = False
-        
+
+        # Freeze CNN: 0 = train all; else train only last N param tensors
+        cnn_params = list(self.cnn_features.parameters())
+        if cnn_trainable_param_groups > 0 and len(cnn_params) > cnn_trainable_param_groups:
+            for param in cnn_params[:-cnn_trainable_param_groups]:
+                param.requires_grad = False
+
         # Flatten CNN output
         self.cnn_flatten = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Feature combination
         combined_input_size = cnn_output_size + num_features
-        
-        # LSTM for temporal patterns (if using sequence data)
-        # For single image prediction, we can use a simpler approach
+
+        # LSTM
         self.lstm = nn.LSTM(
             input_size=combined_input_size,
             hidden_size=lstm_hidden_size,
             num_layers=num_lstm_layers,
             batch_first=True,
-            dropout=dropout if num_lstm_layers > 1 else 0
+            dropout=dropout if num_lstm_layers > 1 else 0,
         )
-        
-        # Alternative: Use transformer or simple MLP if not using sequences
-        self.mlp = nn.Sequential(
-            nn.Linear(combined_input_size, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
+
+        # MLP from list of hidden sizes
+        mlp_layers: List[nn.Module] = []
+        prev_size = combined_input_size
+        for h in mlp_hiddens:
+            mlp_layers.extend([
+                nn.Linear(prev_size, h),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ])
+            prev_size = h
+        self.mlp = nn.Sequential(*mlp_layers)
+        self.mlp_output_size = mlp_hiddens[-1]
+        head_input_size = lstm_hidden_size + self.mlp_output_size
+
         # Regression head for price prediction
         self.price_head = nn.Sequential(
-            nn.Linear(lstm_hidden_size + 128, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1)  # Single price output
-        )
-        
-        # Classification head for probability estimation
-        self.probability_head = nn.Sequential(
-            nn.Linear(lstm_hidden_size + 128, 64),
+            nn.Linear(head_input_size, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1),
-            nn.Sigmoid()  # Output probability [0, 1]
+        )
+
+        # Classification head for probability estimation
+        self.probability_head = nn.Sequential(
+            nn.Linear(head_input_size, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
         )
     
     def forward(
@@ -193,3 +199,15 @@ class PricePredictor(nn.Module):
                 "probability": hit_probability.cpu().numpy(),
                 "base_confidence": base_probability.cpu().numpy()
             }
+
+
+def price_predictor_kwargs_from_settings() -> Dict[str, Any]:
+    """Build PricePredictor constructor kwargs from backend settings (for training and inference)."""
+    from backend.config.settings import settings
+    return {
+        "num_features": settings.NUM_FEATURES,
+        "num_lstm_layers": settings.NUM_LSTM_LAYERS,
+        "lstm_hidden_size": settings.LSTM_HIDDEN_SIZE,
+        "mlp_hiddens": settings.MLP_HIDDENS,
+        "cnn_trainable_param_groups": settings.CNN_TRAINABLE_PARAM_GROUPS,
+    }

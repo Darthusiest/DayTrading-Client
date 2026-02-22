@@ -51,17 +51,31 @@ class PriceDataset(Dataset):
         # Get labels
         actual_price = sample.actual_price if sample.actual_price else 0.0
         expected_price = sample.expected_price if sample.expected_price else actual_price
-        
+        change_abs = sample.price_change_absolute if sample.price_change_absolute is not None else None
+        change_pct = sample.price_change_percentage if sample.price_change_percentage is not None else None
+        # Before price for difference/ratio targets (actual = before + change)
+        if change_abs is not None and actual_price != 0:
+            before_price = float(actual_price - change_abs)
+        else:
+            before_price = float(actual_price) if actual_price != 0 else 1.0
+        if before_price <= 0:
+            before_price = 1.0
+        target_change = float(change_abs) if change_abs is not None else 0.0
+        target_ratio = float(actual_price / before_price) if before_price > 0 else 1.0
+
         # Features (if available)
         features = sample.features or {}
         feature_vector = self._extract_feature_vector(features)
-        
+
         return {
             "image": image_tensor,
             "features": torch.tensor(feature_vector, dtype=torch.float32),
             "actual_price": torch.tensor(actual_price, dtype=torch.float32),
             "expected_price": torch.tensor(expected_price, dtype=torch.float32),
-            "target_hit": torch.tensor(1.0 if sample.target_hit else 0.0, dtype=torch.float32)
+            "target_hit": torch.tensor(1.0 if sample.target_hit else 0.0, dtype=torch.float32),
+            "before_price": torch.tensor(before_price, dtype=torch.float32),
+            "target_change": torch.tensor(target_change, dtype=torch.float32),
+            "target_ratio": torch.tensor(target_ratio, dtype=torch.float32),
         }
     
     def _extract_feature_vector(self, features: Dict[str, Any]) -> List[float]:
@@ -133,6 +147,8 @@ class Trainer:
         total_loss = 0.0
         total_price_loss = 0.0
         total_prob_loss = 0.0
+        total_change_loss = 0.0
+        total_ratio_loss = 0.0
         correct_direction = 0
         total_samples = 0
 
@@ -142,18 +158,37 @@ class Trainer:
             features = batch["features"].to(self.device)
             actual_prices = batch["actual_price"].to(self.device)
             target_hits = batch["target_hit"].to(self.device)
+            before_prices = batch["before_price"].to(self.device)
+            target_changes = batch["target_change"].to(self.device)
+            target_ratios = batch["target_ratio"].to(self.device)
 
             # Forward pass
             outputs = self.model(images, features)
             predicted_prices = outputs["predicted_price"]
             probabilities = outputs["probability"]
 
-            # Calculate losses
+            # Price loss (level)
             price_loss = self.criterion_price(predicted_prices, actual_prices)
             prob_loss = self.criterion_prob(probabilities, target_hits)
 
-            # Combined loss (weighted)
-            loss = price_loss + 0.5 * prob_loss
+            # Difference loss: predicted change vs target change (actual - before)
+            eps = 1e-6
+            valid = before_prices > eps
+            if valid.any():
+                pred_change = predicted_prices - before_prices
+                change_loss = self.criterion_price(pred_change[valid], target_changes[valid])
+            else:
+                change_loss = torch.tensor(0.0, device=self.device)
+
+            # Ratio loss: predicted price/before vs actual/before
+            if valid.any():
+                pred_ratio = (predicted_prices / before_prices.clamp(min=eps))[valid]
+                ratio_loss = self.criterion_price(pred_ratio, target_ratios[valid])
+            else:
+                ratio_loss = torch.tensor(0.0, device=self.device)
+
+            # Combined loss (weighted): level + probability + difference + ratio
+            loss = price_loss + 0.5 * prob_loss + 0.3 * change_loss + 0.3 * ratio_loss
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -163,6 +198,8 @@ class Trainer:
             total_loss += loss.item()
             total_price_loss += price_loss.item()
             total_prob_loss += prob_loss.item()
+            total_change_loss += change_loss.item()
+            total_ratio_loss += ratio_loss.item()
 
             # Train direction accuracy (same definition as validate)
             batch_mean = actual_prices.mean()
@@ -175,13 +212,17 @@ class Trainer:
         avg_loss = total_loss / n
         avg_price_loss = total_price_loss / n
         avg_prob_loss = total_prob_loss / n
+        avg_change_loss = total_change_loss / n
+        avg_ratio_loss = total_ratio_loss / n
         direction_accuracy = correct_direction / total_samples if total_samples > 0 else 0.0
 
         return {
             "loss": avg_loss,
             "price_loss": avg_price_loss,
             "prob_loss": avg_prob_loss,
-            "direction_accuracy": direction_accuracy
+            "change_loss": avg_change_loss,
+            "ratio_loss": avg_ratio_loss,
+            "direction_accuracy": direction_accuracy,
         }
     
     def validate(
@@ -193,48 +234,66 @@ class Trainer:
         total_loss = 0.0
         total_price_loss = 0.0
         total_prob_loss = 0.0
+        total_change_loss = 0.0
+        total_ratio_loss = 0.0
         correct_direction = 0
         total_samples = 0
-        
+
         with torch.no_grad():
             for batch in dataloader:
                 images = batch["image"].to(self.device)
                 features = batch["features"].to(self.device)
                 actual_prices = batch["actual_price"].to(self.device)
                 target_hits = batch["target_hit"].to(self.device)
-                
+                before_prices = batch["before_price"].to(self.device)
+                target_changes = batch["target_change"].to(self.device)
+                target_ratios = batch["target_ratio"].to(self.device)
+
                 outputs = self.model(images, features)
                 predicted_prices = outputs["predicted_price"]
                 probabilities = outputs["probability"]
-                
-                # Calculate losses
+
                 price_loss = self.criterion_price(predicted_prices, actual_prices)
                 prob_loss = self.criterion_prob(probabilities, target_hits)
-                loss = price_loss + 0.5 * prob_loss
-                
+                eps = 1e-6
+                valid = before_prices > eps
+                if valid.any():
+                    pred_change = predicted_prices - before_prices
+                    change_loss = self.criterion_price(pred_change[valid], target_changes[valid])
+                    pred_ratio = (predicted_prices / before_prices.clamp(min=eps))[valid]
+                    ratio_loss = self.criterion_price(pred_ratio, target_ratios[valid])
+                else:
+                    change_loss = torch.tensor(0.0, device=self.device)
+                    ratio_loss = torch.tensor(0.0, device=self.device)
+                loss = price_loss + 0.5 * prob_loss + 0.3 * change_loss + 0.3 * ratio_loss
+
                 total_loss += loss.item()
                 total_price_loss += price_loss.item()
                 total_prob_loss += prob_loss.item()
-                
-                # Direction accuracy: did we predict up when actual moved up (actual > 0 from baseline)?
-                # Use predicted vs actual: correct if (pred > actual) matches (actual > batch mean) for direction
+                total_change_loss += change_loss.item()
+                total_ratio_loss += ratio_loss.item()
+
                 batch_mean = actual_prices.mean()
                 actual_up = (actual_prices > batch_mean).float()
-                pred_up = (predicted_prices > actual_prices).float()  # pred above actual = "up" relative
+                pred_up = (predicted_prices > actual_prices).float()
                 correct_direction += (pred_up == actual_up).sum().item()
                 total_samples += len(actual_prices)
-        
+
         n = len(dataloader)
         avg_loss = total_loss / n if n else 0.0
         avg_price_loss = total_price_loss / n if n else 0.0
         avg_prob_loss = total_prob_loss / n if n else 0.0
+        avg_change_loss = total_change_loss / n if n else 0.0
+        avg_ratio_loss = total_ratio_loss / n if n else 0.0
         direction_accuracy = correct_direction / total_samples if total_samples > 0 else 0.0
-        
+
         return {
             "loss": avg_loss,
             "price_loss": avg_price_loss,
             "prob_loss": avg_prob_loss,
-            "direction_accuracy": direction_accuracy
+            "change_loss": avg_change_loss,
+            "ratio_loss": avg_ratio_loss,
+            "direction_accuracy": direction_accuracy,
         }
     
     def plot_validation_curves(

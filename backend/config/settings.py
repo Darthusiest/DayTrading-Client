@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     RAW_DATA_DIR: Path = DATA_DIR / "raw"
     PROCESSED_DATA_DIR: Path = DATA_DIR / "processed"
     MODELS_DIR: Path = DATA_DIR / "models"
+    # Databento: raw batch downloads (e.g. glbx-mdp3-YYYYMMDD.ohlcv-1m.dbn.zst); ingest → SessionMinuteBar
+    DATABENTO_RAW_DIR: Path = DATA_DIR / "databento" / "raw"
     
     # Polygon.io Configuration
     POLYGON_API_KEY: str = os.getenv("POLYGON_API_KEY", "")
@@ -104,3 +106,4 @@ settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+settings.DATABENTO_RAW_DIR.mkdir(parents=True, exist_ok=True)

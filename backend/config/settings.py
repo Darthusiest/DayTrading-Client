@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 from typing import Optional
-from pydantic import field_validator
+from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings
 
 
@@ -61,7 +61,8 @@ class Settings(BaseSettings):
     NUM_FEATURES: int = 18  # Time + price + session bars + chart patterns (match trainer _extract_feature_vector)
     NUM_LSTM_LAYERS: int = int(os.getenv("NUM_LSTM_LAYERS", "2"))
     LSTM_HIDDEN_SIZE: int = int(os.getenv("LSTM_HIDDEN_SIZE", "128"))
-    MLP_HIDDENS: list[int] = [256, 128]  # Parsed from env "256,256,128"; default two-layer MLP
+    # Comma-separated in .env (e.g. 256,256,128); parsed to list in MLP_HIDDENS
+    MLP_HIDDENS_STR: str = Field(default="256,128", alias="MLP_HIDDENS")
     CNN_TRAINABLE_PARAM_GROUPS: int = int(os.getenv("CNN_TRAINABLE_PARAM_GROUPS", "10"))  # 0 = unfreeze all CNN
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "64"))  # Larger batches for more stable gradients
     LEARNING_RATE: float = float(os.getenv("LEARNING_RATE", "1e-4"))
@@ -70,15 +71,13 @@ class Settings(BaseSettings):
     VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
     TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)
 
-    @field_validator("MLP_HIDDENS", mode="before")
-    @classmethod
-    def parse_mlp_hiddens(cls, v: object) -> list[int]:
-        if isinstance(v, list):
-            return [int(x) for x in v]
-        if isinstance(v, str):
-            return [int(x.strip()) for x in v.split(",") if x.strip()]
-        return [256, 128]
-    
+    @computed_field
+    @property
+    def MLP_HIDDENS(self) -> list[int]:
+        """Parsed from MLP_HIDDENS_STR (env MLP_HIDDENS=256,256,128)."""
+        parts = [x.strip() for x in self.MLP_HIDDENS_STR.split(",") if x.strip()]
+        return [int(x) for x in parts] if parts else [256, 128]
+
     # API Configuration
     API_V1_PREFIX: str = "/api/v1"
     HOST: str = os.getenv("HOST", "0.0.0.0")

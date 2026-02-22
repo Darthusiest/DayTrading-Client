@@ -1,6 +1,6 @@
 # Day Trading AI Agent Backend
 
-A backend system for a day trading AI agent that learns from NY AM (6:30 AM - 8:00 AM PST) price chart screenshots of Nasdaq and S&P 500 futures. The agent predicts price movements, evaluates learning performance, and provides probability assessments.
+A backend system for a day trading AI agent that learns from US regular trading hours (RTH, e.g. 9:30 AM – 4:00 PM Eastern) price chart screenshots and minute bar data for Nasdaq and S&P 500 futures. The agent predicts price movements, evaluates learning performance, and provides probability assessments.
 
 ## Features
 
@@ -78,7 +78,7 @@ The API will be available at `http://localhost:8000`
 ### API Endpoints
 
 #### Predictions
-- `POST /api/v1/predict` - Submit a screenshot (ideally before/at 6:30 AM PST) and optionally an expected price. Returns the model's **estimated price the market will hit** by 8:00 AM PST, plus probability and learning metrics. Omit `expected_price` to get only the estimate.
+- `POST /api/v1/predict` - Submit a screenshot (ideally at or before market open, 9:30 ET) and optionally an expected price. Returns the model's **estimated price the market will hit** by market close (e.g. 4:00 PM ET), plus probability and learning metrics. Omit `expected_price` to get only the estimate.
 - `GET /api/v1/predict/history` - Get prediction history
 
 #### Training
@@ -91,11 +91,11 @@ The API will be available at `http://localhost:8000`
 - `GET /api/v1/evaluation/best-model` - Get best model information
 
 #### Data collection (scheduled and manual)
-- **Scheduled**: When the API server runs, data collection is scheduled for **6:30 AM** and **8:00 AM** (PST). Set `ENABLE_SCHEDULED_COLLECTION=false` in `.env` to disable.
-- **Session candle capture (6:30–8:00)**: At 6:30 AM a job starts that captures **every candle** between 6:31 and 8:00 at **1m, 5m, 15m, and 1h** for each symbol (MNQ, MES). One screenshot per candle-close per timeframe (~116 per symbol per session). Stored as `snapshot_type="session_candle"` with `interval_minutes` and `bar_time`. Run manually: `POST /api/v1/collection/run-session-candles` (optional `?session_date=YYYY-MM-DD`; blocks ~90 min if run at 6:30).
+- **Scheduled**: When the API server runs, data collection is scheduled at **session open** (e.g. 9:30 AM ET) and **session close** (e.g. 4:00 PM ET). Configure `SESSION_START_TIME`, `SESSION_END_TIME`, `SESSION_TIMEZONE` in `.env`. Set `ENABLE_SCHEDULED_COLLECTION=false` to disable.
+- **Session candle capture**: Optional long-running job from first bar after session start to session end (e.g. 9:31–16:00 ET) at 1m, 5m, 15m, 1h. Disabled by default (`ENABLE_SESSION_CANDLE_CAPTURE=false`). Run manually: `POST /api/v1/collection/run-session-candles` (optional `?session_date=YYYY-MM-DD`).
 - `POST /api/v1/collection/run` - Run collection once now (optional `capture_screenshots=false` to fetch only Polygon price data).
 - `POST /api/v1/collection/capture-now` - Log in to TradingView, take a screenshot of the current MNQ (or other symbol) chart, save to disk and database. Optional query: `?symbol=MES1!&interval=15`.
-- `POST /api/v1/collection/process-training-data` - Build training samples from before/after pairs and from **session_candle** pairs (per-interval first bar vs 8:00). Session candle labels use `SessionMinuteBar` (populated after 8:00 collection).
+- `POST /api/v1/collection/process-training-data` - Build training samples from before/after pairs and from **session_candle** pairs (per-interval first bar vs session end). Session candle labels use `SessionMinuteBar` (populated after session close collection).
 - `GET /api/v1/collection/schedule` - Scheduler status and next run times.
 
 #### Live data (Polygon WebSocket)
@@ -117,14 +117,14 @@ Interactive API documentation is available at:
 
 ## Screenshot to Price Estimate
 
-Upload a screenshot of the market **before or at 6:30 AM PST** to get the model's estimate of the price the market will hit by 8:00 AM PST. Call `POST /api/v1/predict` with `file` and `symbol`; `expected_price` is optional. If you omit it, the response gives `model_predicted_price` (the estimate) and the model's confidence. If you provide an expected price, you also get the probability that level is hit.
+Upload a screenshot of the market **at or before session open (e.g. 9:30 AM ET)** to get the model's estimate of the price the market will hit by **market close (e.g. 4:00 PM ET)**. Call `POST /api/v1/predict` with `file` and `symbol`; `expected_price` is optional. If you omit it, the response gives `model_predicted_price` (the estimate) and the model's confidence. If you provide an expected price, you also get the probability that level is hit.
 
 ## Data Collection
 
 The system captures chart screenshots in two ways:
 
-- **Before/after snapshots**: Single capture at **6:30 AM** (before) and **8:00 AM** (after) PST per symbol.
-- **Session candle capture (multi-timeframe)**: From 6:31 to 8:00, at each candle-close time, screenshots are taken at **1m, 5m, 15m, and 1h** so the AI can learn from every price move in the session. Scheduled at 6:30 AM (runs ~90 minutes). Files are named like `MNQ1!_session_2026-02-21_1m_0631.png`.
+- **Before/after snapshots**: Single capture at **session open** (e.g. 9:30 AM ET) and **session close** (e.g. 4:00 PM ET) per symbol. Minute bars for the full session (9:30–16:00) are fetched and stored in `session_minute_bars` after the close snapshot.
+- **Session candle capture (optional)**: From first bar after session start to session end (e.g. 9:31–16:00 ET), at each candle-close time, screenshots can be taken at 1m, 5m, 15m, 1h. Disabled by default (`ENABLE_SESSION_CANDLE_CAPTURE=false`). Files are named like `MNQ1!_session_2026-02-21_1m_0931.png`.
 
 ### Polygon.io Integration
 
@@ -134,7 +134,7 @@ The Polygon.io client (`backend/services/data_collection/tradingview_client.py`)
 - Session date management
 - Support for futures contracts (Nasdaq E-mini, S&P 500 E-mini)
 
-**Note**: Requires a Polygon.io API key. Set `POLYGON_API_KEY` in your `.env` file. The free tier is limited (5 calls/min, end-of-day data only; intraday/minute data requires a paid plan). See [docs/polygon_data.md](docs/polygon_data.md) for limits and example response data.
+**Note**: Requires a Polygon.io API key. Set `POLYGON_API_KEY` in your `.env` file. The free tier is limited (5 calls/min, end-of-day data only; intraday/minute data requires a paid plan). See [docs/polygon_data.md](docs/polygon_data.md) for limits and example response data. If Polygon doesn’t offer futures API access for your plan, see [docs/futures_data_sources.md](docs/futures_data_sources.md) for alternative futures data providers and the data contract needed to plug one in.
 
 ### Screenshot Capture
 

@@ -1,4 +1,4 @@
-"""Scheduled data collection at 6:30 AM and 8:00 AM PST."""
+"""Scheduled data collection at session open and close (e.g. 9:30 and 16:00 ET)."""
 import logging
 from typing import Optional
 
@@ -9,12 +9,21 @@ from apscheduler.triggers.cron import CronTrigger
 from backend.config.settings import settings
 from backend.database.db import SessionLocal
 from backend.services.data_collection.collector import run_collection, run_session_candle_capture
-from backend.services.data_processing.training_data_pipeline import process_training_data_from_snapshots
+from backend.services.data_processing.training_data_pipeline import (
+    process_training_data_from_snapshots,
+    process_training_data_from_session_candles,
+)
 
 logger = logging.getLogger(__name__)
 
 _scheduler: Optional[BackgroundScheduler] = None
-_tz = pytz.timezone(settings.TIMEZONE)
+
+
+def _parse_session_time(time_str: str) -> tuple[int, int]:
+    """Parse HH:MM to (hour, minute)."""
+    parts = time_str.strip().split(":")
+    h, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    return h, m
 
 
 def _scheduled_collection_job(snapshot_type: Optional[str] = None) -> None:
@@ -45,8 +54,8 @@ def _scheduled_collection_job(snapshot_type: Optional[str] = None) -> None:
 
 
 def _scheduled_session_candle_capture_job() -> None:
-    """Job run by APScheduler at 6:30: capture every candle 6:31–8:00 at 1m, 5m, 15m, 1h (runs ~90 min)."""
-    logger.info("Scheduled session candle capture started (6:30–8:00)")
+    """Job run by APScheduler at session open: capture every candle from first bar to session end (e.g. 9:31–16:00)."""
+    logger.info("Scheduled session candle capture started (session start–end)")
     db = SessionLocal()
     try:
         result = run_session_candle_capture(db)
@@ -66,20 +75,19 @@ def _scheduled_session_candle_capture_job() -> None:
 
 
 def _scheduled_process_training_data_job() -> None:
-    """Job run by APScheduler: create training samples from new before/after pairs."""
+    """Job run by APScheduler: create training samples from before/after pairs and session candles."""
     logger.info("Scheduled process training data started")
     db = SessionLocal()
     try:
-        result = process_training_data_from_snapshots(db)
+        result_before_after = process_training_data_from_snapshots(db)
+        result_session = process_training_data_from_session_candles(db)
         logger.info(
-            "Process training data finished: created=%s skipped=%s errors=%s",
-            result["created"],
-            result["skipped"],
-            len(result["errors"]),
+            "Process training data finished: before/after created=%s, session created=%s",
+            result_before_after["created"],
+            result_session["created"],
         )
-        if result["errors"]:
-            for err in result["errors"]:
-                logger.warning("Process training data error: %s", err)
+        for err in result_before_after.get("errors", []) + result_session.get("errors", []):
+            logger.warning("Process training data error: %s", err)
     except Exception as e:
         logger.exception("Scheduled process training data failed: %s", e)
     finally:
@@ -93,9 +101,8 @@ def get_scheduler() -> Optional[BackgroundScheduler]:
 
 def start_scheduler() -> Optional[BackgroundScheduler]:
     """
-    Start the background scheduler with two cron jobs:
-    - 6:30 AM PST: before snapshot
-    - 8:00 AM PST: after snapshot
+    Start the background scheduler with jobs at session open and close (e.g. 9:30 and 16:00 ET).
+    Uses SESSION_TIMEZONE, SESSION_START_TIME, SESSION_END_TIME from settings.
     """
     global _scheduler
     if not getattr(settings, "ENABLE_SCHEDULED_COLLECTION", True):
@@ -106,47 +113,52 @@ def start_scheduler() -> Optional[BackgroundScheduler]:
         logger.warning("Scheduler already started")
         return _scheduler
 
-    _scheduler = BackgroundScheduler(timezone=_tz)
+    session_tz = pytz.timezone(settings.SESSION_TIMEZONE)
+    start_h, start_m = _parse_session_time(settings.SESSION_START_TIME)
+    end_h, end_m = _parse_session_time(settings.SESSION_END_TIME)
+    # Process training data 5 minutes after session close
+    process_h, process_m = end_h, end_m + 5
+    if process_m >= 60:
+        process_h, process_m = process_h + 1, process_m - 60
 
-    # 6:30 AM local: capture every candle 6:31–8:00 at 1m, 5m, 15m, 1h (long-running)
-    _scheduler.add_job(
-        _scheduled_session_candle_capture_job,
-        trigger=CronTrigger(hour=6, minute=30, timezone=_tz),
-        id="session_candle_capture",
-        name="Session candle capture (6:30–8:00)",
-        replace_existing=True,
-    )
-    # 6:30 AM local (PST/PDT): before snapshot (legacy single capture)
+    _scheduler = BackgroundScheduler(timezone=session_tz)
+
+    if getattr(settings, "ENABLE_SESSION_CANDLE_CAPTURE", False):
+        _scheduler.add_job(
+            _scheduled_session_candle_capture_job,
+            trigger=CronTrigger(hour=start_h, minute=start_m, timezone=session_tz),
+            id="session_candle_capture",
+            name="Session candle capture (session start–end)",
+            replace_existing=True,
+        )
     _scheduler.add_job(
         _scheduled_collection_job,
-        trigger=CronTrigger(hour=6, minute=30, timezone=_tz),
+        trigger=CronTrigger(hour=start_h, minute=start_m, timezone=session_tz),
         id="before_snapshot",
-        name="NY AM before snapshot (6:30)",
+        name="Before snapshot (session open)",
         kwargs={"snapshot_type": "before"},
         replace_existing=True,
     )
-    # 8:00 AM local
     _scheduler.add_job(
         _scheduled_collection_job,
-        trigger=CronTrigger(hour=8, minute=0, timezone=_tz),
+        trigger=CronTrigger(hour=end_h, minute=end_m, timezone=session_tz),
         id="after_snapshot",
-        name="NY AM after snapshot (8:00)",
+        name="After snapshot (session close)",
         kwargs={"snapshot_type": "after"},
         replace_existing=True,
     )
-    # 8:05 AM local: process new snapshot pairs into training samples
     _scheduler.add_job(
         _scheduled_process_training_data_job,
-        trigger=CronTrigger(hour=8, minute=5, timezone=_tz),
+        trigger=CronTrigger(hour=process_h, minute=process_m, timezone=session_tz),
         id="process_training_data",
-        name="Process training data (8:05)",
+        name="Process training data (after close)",
         replace_existing=True,
     )
 
     _scheduler.start()
     logger.info(
-        "Scheduled data collection started: 6:30, 8:00, and 8:05 AM %s",
-        settings.TIMEZONE,
+        "Scheduled data collection started: %s:%02d, %s:%02d %s",
+        start_h, start_m, end_h, end_m, settings.SESSION_TIMEZONE,
     )
     return _scheduler
 

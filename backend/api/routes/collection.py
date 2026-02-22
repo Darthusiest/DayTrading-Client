@@ -68,8 +68,8 @@ def run_session_candles_now(
     db: Session = Depends(get_db),
 ):
     """
-    Run session candle capture for 6:31–8:00 at 1m, 5m, 15m, 1h for all symbols.
-    Blocks until complete (~90 minutes if run at 6:30). Optional query: session_date=YYYY-MM-DD (default: today).
+    Run session candle capture from first bar after session start to session end (e.g. 9:31–16:00 ET) at 1m, 5m, 15m, 1h for all symbols.
+    No-op if ENABLE_SESSION_CANDLE_CAPTURE is False. Optional query: session_date=YYYY-MM-DD (default: today).
     """
     return run_session_candle_capture(db, session_date=session_date)
 
@@ -78,7 +78,7 @@ def run_session_candles_now(
 def process_training_data_now(db: Session = Depends(get_db)):
     """
     Process before/after snapshot pairs and session_candle (per-interval) pairs into training samples.
-    Idempotent: skips pairs that already have a sample. Session candle labels use SessionMinuteBar (run after 8:00).
+    Idempotent: skips pairs that already have a sample. Session candle labels use SessionMinuteBar (run after session close).
     """
     result_before_after = process_training_data_from_snapshots(db)
     result_session = process_training_data_from_session_candles(db)
@@ -106,6 +106,9 @@ def get_schedule_status():
     return {
         "enabled": getattr(settings, "ENABLE_SCHEDULED_COLLECTION", True),
         "timezone": settings.TIMEZONE,
+        "session_timezone": settings.SESSION_TIMEZONE,
+        "session_start": settings.SESSION_START_TIME,
+        "session_end": settings.SESSION_END_TIME,
         "before_time": settings.BEFORE_SNAPSHOT_TIME,
         "after_time": settings.AFTER_SNAPSHOT_TIME,
         "scheduler_running": sched is not None,

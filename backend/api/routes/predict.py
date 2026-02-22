@@ -25,12 +25,12 @@ async def predict_price(
     """
     Submit a screenshot (and optionally an expected price) to get the model's price estimate.
 
-    The screenshot is intended to be the market **before or at 6:30 AM PST** (NY AM start)
+    The screenshot is intended to be the market **at or before session open** (e.g. 9:30 AM ET)
     for best results. The returned **model_predicted_price** is the model's estimate of the
-    price level the market will reach by end of NY AM (8:00 AM PST).
+    price level the market will reach by **market close** (e.g. 4:00 PM ET).
 
     Args:
-        file: Chart screenshot image (ideally before/at 6:30 AM PST).
+        file: Chart screenshot image (ideally at or before market open, 9:30 ET).
         expected_price: Optional. User's expected price; if provided, probability_hit
             is the probability that this level is hit. If omitted, probability_hit
             is the model's base confidence in its predicted level.

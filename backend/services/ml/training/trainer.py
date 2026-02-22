@@ -91,7 +91,7 @@ class PriceDataset(Dataset):
         feature_list.append(features.get("price_change_pct", 0.0))
         feature_list.append(features.get("price_range_pct", 0.0))
         
-        # Session bar features (6:30–8:00 path)
+        # Session bar features (session start–end, e.g. 9:30–16:00 ET)
         feature_list.append(features.get("session_return_pct", 0.0) / 100.0)
         feature_list.append(features.get("session_range_pct", 0.0) / 100.0)
         feature_list.append(min(1.0, features.get("session_volatility", 0.0)))

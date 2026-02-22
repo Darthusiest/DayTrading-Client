@@ -15,18 +15,26 @@ from backend.services.evaluation.outcome_feedback import update_predictions_with
 
 logger = logging.getLogger(__name__)
 
-# Intervals (minutes) and bar-close rules for session candle capture (6:30–8:00)
+# Intervals (minutes) and bar-close rules for session candle capture (session start–end from config)
 SESSION_CANDLE_INTERVALS = (1, 5, 15, 60)
 
 
-def _intervals_closing_at(hour: int, minute: int) -> list[int]:
-    """Return which of (1, 5, 15, 60) close at this (hour, minute)."""
+def _parse_session_time(time_str: str) -> tuple[int, int]:
+    """Parse HH:MM string to (hour, minute)."""
+    parts = time_str.strip().split(":")
+    h, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    return h, m
+
+
+def _intervals_closing_at(hour: int, minute: int, session_end_hour: int, session_end_minute: int) -> list[int]:
+    """Return which of (1, 5, 15, 60) close at this (hour, minute). Session end used for 1h bar boundary."""
     out = [1]  # 1m closes every minute
     if minute % 5 == 0:
         out.append(5)
     if minute % 15 == 0:
         out.append(15)
-    if (hour, minute) in ((7, 0), (8, 0)):
+    # 1h bars close at :00 or :30; only include up to session end
+    if (minute == 0 or minute == 30) and (hour < session_end_hour or (hour == session_end_hour and minute <= session_end_minute)):
         out.append(60)
     return out
 
@@ -38,15 +46,17 @@ def _collect_session_minute_bars(
     tz: pytz.BaseTzInfo,
 ) -> int:
     """
-    Fetch and store minute bars for 6:30–8:00 on session_date (exact numeric path).
+    Fetch and store minute bars for session start–end (from settings) on session_date.
     Idempotent: replaces any existing bars for that session_date per symbol.
     Returns number of bars stored.
     """
     total = 0
+    start_str = settings.SESSION_START_TIME
+    end_str = settings.SESSION_END_TIME
     for symbol in settings.SYMBOLS:
         try:
-            start_dt = tz.localize(datetime.strptime(f"{session_date} 06:30", "%Y-%m-%d %H:%M"))
-            end_dt = tz.localize(datetime.strptime(f"{session_date} 08:00", "%Y-%m-%d %H:%M"))
+            start_dt = tz.localize(datetime.strptime(f"{session_date} {start_str}", "%Y-%m-%d %H:%M"))
+            end_dt = tz.localize(datetime.strptime(f"{session_date} {end_str}", "%Y-%m-%d %H:%M"))
             bars = polygon_client.get_historical_data(
                 symbol, start_dt, end_dt, multiplier=1, timespan="minute"
             )
@@ -64,7 +74,7 @@ def _collect_session_minute_bars(
                 if ts.tzinfo and ts.tzinfo != tz:
                     ts = ts.astimezone(tz)
                 if ts.tzinfo is not None:
-                    ts = ts.replace(tzinfo=None)  # store naive in DB for consistency
+                    ts = ts.replace(tzinfo=None)  # store naive (session TZ) in DB
                 db.add(
                     SessionMinuteBar(
                         session_date=session_date,
@@ -96,20 +106,21 @@ def run_collection(
     """
     Collect before or after snapshots for configured symbols only (MNQ & MES by default).
 
-    When run at 6:30 AM PST, collects "before" snapshots; at 8:00 AM PST, "after".
+    When run at session open (e.g. 9:30 ET), collects "before"; at session close (e.g. 16:00 ET), "after".
     If snapshot_type_override is set, use that instead of inferring from current time.
+    Uses SESSION_TIMEZONE for before/after decision.
 
     Args:
         db: Database session (caller manages lifecycle).
-        session_date: Date string YYYY-MM-DD; default is today in settings.TIMEZONE.
+        session_date: Date string YYYY-MM-DD; default is today in session timezone.
         snapshot_type_override: If "before" or "after", skip time check and use this.
         capture_screenshots: If False, only fetch Polygon price data (no Selenium).
 
     Returns:
         Dict with keys: collected (int), failed (int), snapshot_type (str), errors (list).
     """
-    tz = pytz.timezone(settings.TIMEZONE)
-    now = datetime.now(tz)
+    session_tz = pytz.timezone(settings.SESSION_TIMEZONE)
+    now = datetime.now(session_tz)
     if session_date is None:
         session_date = now.strftime("%Y-%m-%d")
 
@@ -193,10 +204,10 @@ def run_collection(
                 failed += 1
                 errors.append(f"{symbol}: {e}")
 
-        # After 8:00 snapshot, fetch and store 6:30–8:00 minute bars and update prediction outcomes
+        # After close snapshot, fetch and store session minute bars (open–close) and update prediction outcomes
         if snapshot_type == "after":
             try:
-                bars_stored = _collect_session_minute_bars(db, polygon_client, session_date, tz)
+                bars_stored = _collect_session_minute_bars(db, polygon_client, session_date, session_tz)
                 logger.info("Session minute bars stored: %s for %s", bars_stored, session_date)
             except Exception as e:
                 logger.exception("Failed to collect session minute bars: %s", e)
@@ -225,26 +236,34 @@ def run_session_candle_capture(
     session_date: Optional[str] = None,
 ) -> dict:
     """
-    Capture every candle between 6:30 and 8:00 at 1m, 5m, 15m, 1h for each configured symbol.
-    Runs from 6:31 to 8:00 (inclusive); at each clock minute captures the timeframe(s) that just closed.
-    One browser session; login once. Saves snapshots with snapshot_type='session_candle', interval_minutes, bar_time.
+    Capture every candle between session start and end at 1m, 5m, 15m, 1h for each configured symbol.
+    Runs from first bar after start to session end (e.g. 9:31–16:00 ET). One browser session; login once.
+    Saves snapshots with snapshot_type='session_candle', interval_minutes, bar_time.
+    No-op if ENABLE_SESSION_CANDLE_CAPTURE is False (long-running; disabled by default).
 
     Returns:
         Dict with collected (int), failed (int), errors (list).
     """
-    tz = pytz.timezone(settings.TIMEZONE)
-    now = datetime.now(tz)
+    if not getattr(settings, "ENABLE_SESSION_CANDLE_CAPTURE", False):
+        return {"collected": 0, "failed": 0, "errors": ["Session candle capture is disabled (ENABLE_SESSION_CANDLE_CAPTURE=False)"]}
+
+    session_tz = pytz.timezone(settings.SESSION_TIMEZONE)
+    now = datetime.now(session_tz)
     if session_date is None:
         session_date = now.strftime("%Y-%m-%d")
 
-    # Build list of (bar_time, intervals) from 6:31 to 8:00
+    start_h, start_m = _parse_session_time(settings.SESSION_START_TIME)
+    end_h, end_m = _parse_session_time(settings.SESSION_END_TIME)
+    total_minutes = (end_h * 60 + end_m) - (start_h * 60 + start_m)  # e.g. 390 for 9:30–16:00
+
+    # Build list of (bar_time, intervals) from first bar after start to session end
     base_date = datetime.strptime(session_date, "%Y-%m-%d").date()
     bar_schedule: list[tuple[datetime, list[int]]] = []
-    for minute_offset in range(1, 91):  # 6:31 = +1, 8:00 = +90
-        dt = datetime.combine(base_date, datetime.strptime("06:30", "%H:%M").time()) + timedelta(minutes=minute_offset)
-        dt = tz.localize(dt) if dt.tzinfo is None else dt
+    for minute_offset in range(1, total_minutes + 1):
+        dt = datetime.combine(base_date, datetime.strptime(settings.SESSION_START_TIME, "%H:%M").time()) + timedelta(minutes=minute_offset)
+        dt = session_tz.localize(dt) if dt.tzinfo is None else dt
         h, m = dt.hour, dt.minute
-        bar_schedule.append((dt, _intervals_closing_at(h, m)))
+        bar_schedule.append((dt, _intervals_closing_at(h, m, end_h, end_m)))
 
     screenshot_capture = ScreenshotCapture()
     collected = 0
@@ -256,7 +275,7 @@ def run_session_candle_capture(
         screenshot_capture._ensure_logged_in()
 
         for bar_time, intervals in bar_schedule:
-            now = datetime.now(tz)
+            now = datetime.now(session_tz)
             if now < bar_time:
                 wait_secs = (bar_time - now).total_seconds()
                 if wait_secs > 0:

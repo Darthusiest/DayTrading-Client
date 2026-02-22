@@ -13,9 +13,37 @@ from backend.services.data_processing.labeler import Labeler
 
 logger = logging.getLogger(__name__)
 
-# Per-interval first candle-close time (hour, minute) in session 6:30–8:00
-SESSION_FIRST_BAR_TIME = {1: (6, 31), 5: (6, 35), 15: (6, 45), 60: (7, 0)}
-SESSION_END_HOUR, SESSION_END_MINUTE = 8, 0
+
+def _parse_session_time(time_str: str) -> tuple[int, int]:
+    """Parse HH:MM to (hour, minute)."""
+    parts = time_str.strip().split(":")
+    h, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    return h, m
+
+
+def _get_session_first_bar_times() -> dict[int, tuple[int, int]]:
+    """Derive first bar close (hour, minute) per interval from SESSION_START_TIME. Bars stored in session TZ."""
+    start_h, start_m = _parse_session_time(settings.SESSION_START_TIME)
+    start_mins = start_h * 60 + start_m
+    out = {}
+    # 1m: first close at start + 1
+    m1 = start_mins + 1
+    out[1] = (m1 // 60, m1 % 60)
+    # 5m: first close strictly after start (e.g. 9:30 -> 9:35)
+    m5 = ((start_mins // 5) + 1) * 5
+    out[5] = (m5 // 60, m5 % 60)
+    # 15m: first close strictly after start (9:30 -> 9:45)
+    m15 = ((start_mins // 15) + 1) * 15
+    out[15] = (m15 // 60, m15 % 60)
+    # 60m: first bar closes at start + 60 (9:30 -> 10:30)
+    m60 = start_mins + 60
+    out[60] = (m60 // 60, m60 % 60)
+    return out
+
+
+def _get_session_end_time() -> tuple[int, int]:
+    """Session end (hour, minute) from settings."""
+    return _parse_session_time(settings.SESSION_END_TIME)
 
 
 def process_training_data_from_snapshots(db: Session) -> dict:
@@ -129,21 +157,21 @@ def process_training_data_from_snapshots(db: Session) -> dict:
 
 def process_training_data_from_session_candles(db: Session) -> dict:
     """
-    Create training samples from session_candle snapshots: per-interval "before" (first bar) vs "after" (8:00).
+    Create training samples from session_candle snapshots: per-interval "before" (first bar) vs "after" (session end).
     Uses SessionMinuteBar for labels (before_price, after_price, session_high, session_low).
     Idempotent: skips (session_date, symbol, interval) that already have a training sample from that before snapshot.
-
-    Returns:
-        Dict with keys: created (int), skipped (int), errors (list).
+    Session start/end from settings (e.g. 9:30–16:00 ET).
     """
     preprocessor = ImagePreprocessor()
     feature_extractor = FeatureExtractor()
     created = 0
     skipped = 0
     errors = []
+    first_bar_times = _get_session_first_bar_times()
+    session_end_hour, session_end_minute = _get_session_end_time()
 
     for interval_minutes in (1, 5, 15, 60):
-        h, m = SESSION_FIRST_BAR_TIME[interval_minutes]
+        h, m = first_bar_times[interval_minutes]
         for before_snapshot in db.query(Snapshot).filter(
             Snapshot.snapshot_type == "session_candle",
             Snapshot.interval_minutes == interval_minutes,
@@ -156,7 +184,7 @@ def process_training_data_from_session_candles(db: Session) -> dict:
                 session_date = before_snapshot.session_date
                 end_dt = datetime.combine(
                     datetime.strptime(session_date, "%Y-%m-%d").date(),
-                    datetime.strptime(f"{SESSION_END_HOUR:02d}:{SESSION_END_MINUTE:02d}", "%H:%M").time(),
+                    datetime.strptime(f"{session_end_hour:02d}:{session_end_minute:02d}", "%H:%M").time(),
                 )
                 after_snapshot = db.query(Snapshot).filter(
                     Snapshot.symbol == before_snapshot.symbol,

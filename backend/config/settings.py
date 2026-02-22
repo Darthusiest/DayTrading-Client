@@ -39,9 +39,15 @@ class Settings(BaseSettings):
         "MNQ1!": "C:MNQ1",  # Micro E-mini Nasdaq continuous
         "MES1!": "C:MES1",  # Micro E-mini S&P 500 continuous
     }
-    BEFORE_SNAPSHOT_TIME: str = "06:30"  # PST
-    AFTER_SNAPSHOT_TIME: str = "08:00"  # PST
+    # Session: US RTH 9:30 AM – 4:00 PM Eastern (market open/close)
+    SESSION_START_TIME: str = os.getenv("SESSION_START_TIME", "09:30")
+    SESSION_END_TIME: str = os.getenv("SESSION_END_TIME", "16:00")
+    SESSION_TIMEZONE: str = os.getenv("SESSION_TIMEZONE", "America/New_York")
+    BEFORE_SNAPSHOT_TIME: str = os.getenv("BEFORE_SNAPSHOT_TIME", "09:30")  # Align with session open
+    AFTER_SNAPSHOT_TIME: str = os.getenv("AFTER_SNAPSHOT_TIME", "16:00")   # Align with session close
     TIMEZONE: str = "America/Los_Angeles"
+    # Session candle capture (9:31–16:00) is long-running; disable by default
+    ENABLE_SESSION_CANDLE_CAPTURE: bool = os.getenv("ENABLE_SESSION_CANDLE_CAPTURE", "False").lower() == "true"
 
     # TradingView (optional — for chart screenshot capture; login gives full chart access)
     TRADINGVIEW_USERNAME: str = os.getenv("TRADINGVIEW_USERNAME", "")

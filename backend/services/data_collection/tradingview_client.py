@@ -194,20 +194,16 @@ class PolygonClient:
             return None
     
     def is_market_open(self) -> bool:
-        """Check if market is currently open."""
-        # NY AM session: 6:30 AM - 8:00 AM PST
-        now = datetime.now(self.timezone)
+        """Check if market is currently within session hours (e.g. RTH 9:30–16:00 ET from settings)."""
+        import pytz
+        session_tz = pytz.timezone(settings.SESSION_TIMEZONE)
+        now = datetime.now(session_tz)
         current_time = now.time()
-        
-        # Check if it's a weekday (Monday-Friday)
         if now.weekday() >= 5:  # Saturday = 5, Sunday = 6
             return False
-        
-        # Check if within NY AM hours (6:30 AM - 8:00 AM PST)
-        before_time = datetime.strptime(settings.BEFORE_SNAPSHOT_TIME, "%H:%M").time()
-        after_time = datetime.strptime(settings.AFTER_SNAPSHOT_TIME, "%H:%M").time()
-        
-        return before_time <= current_time <= after_time
+        start_time = datetime.strptime(settings.SESSION_START_TIME, "%H:%M").time()
+        end_time = datetime.strptime(settings.SESSION_END_TIME, "%H:%M").time()
+        return start_time <= current_time <= end_time
     
     def get_session_date(self) -> str:
         """Get current session date in YYYY-MM-DD format."""

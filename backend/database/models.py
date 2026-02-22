@@ -17,7 +17,7 @@ class Snapshot(Base):
     session_date = Column(String(10), nullable=False, index=True)  # YYYY-MM-DD
     # Multi-timeframe session capture: chart interval and candle-close time (null for before/after/manual)
     interval_minutes = Column(Integer, nullable=True, index=True)  # 1, 5, 15, 60
-    bar_time = Column(DateTime, nullable=True, index=True)  # Candle-close time (session 6:30-8:00)
+    bar_time = Column(DateTime, nullable=True, index=True)  # Candle-close time (session start–end)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -26,7 +26,7 @@ class Snapshot(Base):
 
 
 class SessionMinuteBar(Base):
-    """Minute OHLCV bars for the 6:30–8:00 session (exact price path)."""
+    """Minute OHLCV bars for the session (open–close, e.g. 9:30–16:00 ET)."""
     __tablename__ = "session_minute_bars"
 
     id = Column(Integer, primary_key=True, index=True)

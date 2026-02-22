@@ -72,11 +72,11 @@ class FeatureExtractor:
         }
     
     def _is_market_hours(self, timestamp: datetime) -> bool:
-        """Check if timestamp is within NY AM market hours."""
+        """Check if timestamp is within session hours (e.g. RTH 9:30–16:00 ET from settings)."""
         current_time = timestamp.time()
-        before_time = datetime.strptime(settings.BEFORE_SNAPSHOT_TIME, "%H:%M").time()
-        after_time = datetime.strptime(settings.AFTER_SNAPSHOT_TIME, "%H:%M").time()
-        return before_time <= current_time <= after_time
+        start_time = datetime.strptime(settings.SESSION_START_TIME, "%H:%M").time()
+        end_time = datetime.strptime(settings.SESSION_END_TIME, "%H:%M").time()
+        return start_time <= current_time <= end_time
     
     def _extract_price_features(self, price_data: Dict[str, Any]) -> Dict[str, Any]:
         """Extract features from OHLCV price data."""
@@ -117,7 +117,7 @@ class FeatureExtractor:
         db: "Session",
     ) -> Dict[str, Any]:
         """
-        Extract summary features from SessionMinuteBar rows (6:30–8:00 path).
+        Extract summary features from SessionMinuteBar rows (session start–end from settings).
         Returns dict with session_return_pct, session_range_pct, session_volatility, session_num_bars.
         """
         from backend.database.models import SessionMinuteBar

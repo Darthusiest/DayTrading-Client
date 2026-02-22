@@ -23,7 +23,7 @@ def run_collection_now(
 ):
     """
     Run data collection once now (before or after snapshot based on current time).
-    Optionally disable screenshot capture to only fetch Polygon price data.
+    Optionally disable screenshot capture.
     """
     result = run_collection(
         db,

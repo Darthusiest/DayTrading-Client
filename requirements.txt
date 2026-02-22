@@ -1,4 +1,4 @@
-# Build/install (pin setuptools<82 for pkg_resources; polygon-api-client depends on it)
+# Build/install
 setuptools>=60,<82
 
 # FastAPI and web server
@@ -28,9 +28,6 @@ python-dateutil==2.8.2
 # Web scraping / screenshot capture
 selenium==4.15.2
 webdriver-manager==4.0.1
-
-# Market Data API
-polygon-api-client==1.13.0
 
 # Utilities
 python-dotenv==1.0.0

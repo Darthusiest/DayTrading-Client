@@ -4,9 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.config.settings import settings
 from backend.database.db import init_db
-from backend.api.routes import predict, training, evaluation, notes, collection, live
+from backend.api.routes import predict, training, evaluation, notes, collection
 from backend.services.data_collection.scheduler import start_scheduler, stop_scheduler
-from backend.services.data_collection.polygon_websocket import start_polygon_websocket, stop_polygon_websocket
 import logging
 
 # Configure logging
@@ -26,10 +25,8 @@ async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database initialized")
     start_scheduler()
-    start_polygon_websocket()
     yield
     # Shutdown
-    stop_polygon_websocket()
     stop_scheduler()
     logger.info("Shutting down...")
 
@@ -57,7 +54,6 @@ app.include_router(training.router, prefix=settings.API_V1_PREFIX)
 app.include_router(evaluation.router, prefix=settings.API_V1_PREFIX)
 app.include_router(notes.router, prefix=settings.API_V1_PREFIX)
 app.include_router(collection.router, prefix=settings.API_V1_PREFIX)
-app.include_router(live.router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/")

@@ -29,18 +29,10 @@ class Settings(BaseSettings):
     # Databento: raw batch downloads (e.g. glbx-mdp3-YYYYMMDD.ohlcv-1m.dbn.zst); ingest → SessionMinuteBar
     DATABENTO_RAW_DIR: Path = DATA_DIR / "databento" / "raw"
     
-    # Polygon.io Configuration
-    POLYGON_API_KEY: str = os.getenv("POLYGON_API_KEY", "")
-    ENABLE_POLYGON_WEBSOCKET: bool = os.getenv("ENABLE_POLYGON_WEBSOCKET", "True").lower() == "true"
-    
     # Market Data — focused on MNQ & MES only so the model gets really good at these
     # MNQ = Micro E-mini Nasdaq, MES = Micro E-mini S&P 500
-    # Collecting only these two avoids dilution from other symbols
+    # Minute bars are ingested from Databento (see docs/databento_storage.md)
     SYMBOLS: list[str] = ["MNQ1!", "MES1!"]
-    POLYGON_SYMBOL_MAP: dict[str, str] = {
-        "MNQ1!": "C:MNQ1",  # Micro E-mini Nasdaq continuous
-        "MES1!": "C:MES1",  # Micro E-mini S&P 500 continuous
-    }
     # Session: US RTH 9:30 AM – 4:00 PM Eastern (market open/close)
     SESSION_START_TIME: str = os.getenv("SESSION_START_TIME", "09:30")
     SESSION_END_TIME: str = os.getenv("SESSION_END_TIME", "16:00")
@@ -98,6 +90,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = str(Path(__file__).resolve().parent.parent.parent / ".env")
         case_sensitive = True
+        extra = "ignore"  # Ignore unknown env vars (e.g. legacy POLYGON_* after removal)
 
 
 # Create data directories if they don't exist

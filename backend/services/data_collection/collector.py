@@ -8,8 +8,7 @@ import pytz
 from sqlalchemy.orm import Session
 
 from backend.config.settings import settings
-from backend.database.models import Snapshot, PriceData, SessionMinuteBar
-from backend.services.data_collection.tradingview_client import PolygonClient
+from backend.database.models import Snapshot, SessionMinuteBar
 from backend.services.data_collection.screenshot_capture import ScreenshotCapture
 from backend.services.evaluation.outcome_feedback import update_predictions_with_outcomes
 
@@ -41,60 +40,18 @@ def _intervals_closing_at(hour: int, minute: int, session_end_hour: int, session
 
 def _collect_session_minute_bars(
     db: Session,
-    polygon_client: PolygonClient,
     session_date: str,
     tz: pytz.BaseTzInfo,
 ) -> int:
     """
-    Fetch and store minute bars for session start–end (from settings) on session_date.
-    Idempotent: replaces any existing bars for that session_date per symbol.
-    Returns number of bars stored.
+    Placeholder: minute bars are ingested from Databento (data/databento/raw/).
+    Returns 0. Session minute bars must be loaded via a Databento ingestion script.
     """
-    total = 0
-    start_str = settings.SESSION_START_TIME
-    end_str = settings.SESSION_END_TIME
-    for symbol in settings.SYMBOLS:
-        try:
-            start_dt = tz.localize(datetime.strptime(f"{session_date} {start_str}", "%Y-%m-%d %H:%M"))
-            end_dt = tz.localize(datetime.strptime(f"{session_date} {end_str}", "%Y-%m-%d %H:%M"))
-            bars = polygon_client.get_historical_data(
-                symbol, start_dt, end_dt, multiplier=1, timespan="minute"
-            )
-            if not bars:
-                logger.warning("No minute bars returned for %s on %s", symbol, session_date)
-                continue
-            db.query(SessionMinuteBar).filter(
-                SessionMinuteBar.session_date == session_date,
-                SessionMinuteBar.symbol == symbol,
-            ).delete()
-            for b in bars:
-                ts = b["timestamp"]
-                if isinstance(ts, str):
-                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                if ts.tzinfo and ts.tzinfo != tz:
-                    ts = ts.astimezone(tz)
-                if ts.tzinfo is not None:
-                    ts = ts.replace(tzinfo=None)  # store naive (session TZ) in DB
-                db.add(
-                    SessionMinuteBar(
-                        session_date=session_date,
-                        symbol=symbol,
-                        bar_time=ts,
-                        open_price=float(b.get("open", 0)),
-                        high_price=float(b.get("high", 0)),
-                        low_price=float(b.get("low", 0)),
-                        close_price=float(b.get("close", 0)),
-                        volume=int(b.get("volume", 0) or 0),
-                    )
-                )
-                total += 1
-            logger.info("Stored %s minute bars for %s on %s", len(bars), symbol, session_date)
-        except Exception as e:
-            logger.exception("Error storing minute bars for %s on %s: %s", symbol, session_date, e)
-            db.rollback()
-            raise
-    db.commit()
-    return total
+    logger.debug(
+        "Session minute bars for %s: use Databento ingestion (data/databento/raw/)",
+        session_date,
+    )
+    return 0
 
 
 def run_collection(
@@ -114,7 +71,7 @@ def run_collection(
         db: Database session (caller manages lifecycle).
         session_date: Date string YYYY-MM-DD; default is today in session timezone.
         snapshot_type_override: If "before" or "after", skip time check and use this.
-        capture_screenshots: If False, only fetch Polygon price data (no Selenium).
+        capture_screenshots: If False, skip screenshots (no Selenium).
 
     Returns:
         Dict with keys: collected (int), failed (int), snapshot_type (str), errors (list).
@@ -148,7 +105,6 @@ def run_collection(
             "errors": ["Current time is between before and after snapshot windows"],
         }
 
-    polygon_client = PolygonClient()
     screenshot_capture = ScreenshotCapture() if capture_screenshots else None
     collected = 0
     failed = 0
@@ -176,22 +132,6 @@ def run_collection(
                         session_date=session_date,
                     )
                     db.add(snapshot)
-                    db.flush()
-
-                    price_data_dict = polygon_client.get_price_data(symbol, now)
-                    if price_data_dict:
-                        price_data = PriceData(
-                            snapshot_id=snapshot.id,
-                            symbol=symbol,
-                            timestamp=now,
-                            open_price=price_data_dict.get("open", 0.0),
-                            high_price=price_data_dict.get("high", 0.0),
-                            low_price=price_data_dict.get("low", 0.0),
-                            close_price=price_data_dict.get("close", 0.0),
-                            volume=price_data_dict.get("volume", 0),
-                        )
-                        db.add(price_data)
-
                     db.commit()
                     collected += 1
                     logger.info("Saved %s snapshot for %s", snapshot_type, symbol)
@@ -204,13 +144,12 @@ def run_collection(
                 failed += 1
                 errors.append(f"{symbol}: {e}")
 
-        # After close snapshot, fetch and store session minute bars (open–close) and update prediction outcomes
+        # After close snapshot: minute bars come from Databento ingestion; update prediction outcomes
         if snapshot_type == "after":
             try:
-                bars_stored = _collect_session_minute_bars(db, polygon_client, session_date, session_tz)
-                logger.info("Session minute bars stored: %s for %s", bars_stored, session_date)
+                _collect_session_minute_bars(db, session_date, session_tz)
             except Exception as e:
-                logger.exception("Failed to collect session minute bars: %s", e)
+                logger.exception("Session minute bars placeholder failed: %s", e)
                 errors.append(f"Session minute bars: {e}")
             try:
                 n = update_predictions_with_outcomes(db, session_date)
@@ -341,7 +280,7 @@ def capture_snapshot_now(
     """
     Log in to TradingView (if credentials set), capture a screenshot of the current
     chart for the given symbol at the given timeframe, save the image to disk, and
-    store a Snapshot row in the database. Optionally attach Polygon price data.
+    store a Snapshot row in the database.
 
     Args:
         db: Database session.
@@ -383,22 +322,6 @@ def capture_snapshot_now(
             session_date=session_date,
         )
         db.add(snapshot)
-        db.flush()
-        polygon_client = PolygonClient()
-        price_data_dict = polygon_client.get_price_data(symbol, now)
-        if price_data_dict:
-            db.add(
-                PriceData(
-                    snapshot_id=snapshot.id,
-                    symbol=symbol,
-                    timestamp=now,
-                    open_price=price_data_dict.get("open", 0.0),
-                    high_price=price_data_dict.get("high", 0.0),
-                    low_price=price_data_dict.get("low", 0.0),
-                    close_price=price_data_dict.get("close", 0.0),
-                    volume=price_data_dict.get("volume", 0),
-                )
-            )
         db.commit()
         db.refresh(snapshot)
         return {

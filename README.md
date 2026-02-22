@@ -4,7 +4,7 @@ A backend system for a day trading AI agent that learns from US regular trading 
 
 ## Features
 
-- **Data Collection**: Polygon.io integration for market data and TradingView for chart screenshots
+- **Data Collection**: TradingView for chart screenshots; minute bar data from Databento (see `docs/databento_storage.md`)
 - **ML Model**: Hybrid CNN + Time Series model for price prediction from chart images
 - **Learning Evaluation**: Comprehensive metrics tracking and learning progress monitoring
 - **REST API**: FastAPI-based API for predictions, training, and notes management
@@ -93,14 +93,10 @@ The API will be available at `http://localhost:8000`
 #### Data collection (scheduled and manual)
 - **Scheduled**: When the API server runs, data collection is scheduled at **session open** (e.g. 9:30 AM ET) and **session close** (e.g. 4:00 PM ET). Configure `SESSION_START_TIME`, `SESSION_END_TIME`, `SESSION_TIMEZONE` in `.env`. Set `ENABLE_SCHEDULED_COLLECTION=false` to disable.
 - **Session candle capture**: Optional long-running job from first bar after session start to session end (e.g. 9:31–16:00 ET) at 1m, 5m, 15m, 1h. Disabled by default (`ENABLE_SESSION_CANDLE_CAPTURE=false`). Run manually: `POST /api/v1/collection/run-session-candles` (optional `?session_date=YYYY-MM-DD`).
-- `POST /api/v1/collection/run` - Run collection once now (optional `capture_screenshots=false` to fetch only Polygon price data).
+- `POST /api/v1/collection/run` - Run collection once now (optional `capture_screenshots=false` to skip screenshots).
 - `POST /api/v1/collection/capture-now` - Log in to TradingView, take a screenshot of the current MNQ (or other symbol) chart, save to disk and database. Optional query: `?symbol=MES1!&interval=15`.
 - `POST /api/v1/collection/process-training-data` - Build training samples from before/after pairs and from **session_candle** pairs (per-interval first bar vs session end). Session candle labels use `SessionMinuteBar` (populated after session close collection).
 - `GET /api/v1/collection/schedule` - Scheduler status and next run times.
-
-#### Live data (Polygon WebSocket)
-- When enabled, a background WebSocket stream receives real-time minute bars for MNQ and MES. Set `ENABLE_POLYGON_WEBSOCKET=false` in `.env` to disable.
-- `GET /api/v1/live/prices` - Latest minute-aggregate bar per symbol (OHLCV + timestamps) from the stream.
 
 #### Notes
 - `POST /api/v1/notes` - Create a note
@@ -123,18 +119,9 @@ Upload a screenshot of the market **at or before session open (e.g. 9:30 AM ET)*
 
 The system captures chart screenshots in two ways:
 
-- **Before/after snapshots**: Single capture at **session open** (e.g. 9:30 AM ET) and **session close** (e.g. 4:00 PM ET) per symbol. Minute bars for the full session (9:30–16:00) are fetched and stored in `session_minute_bars` after the close snapshot.
+- **Before/after snapshots**: Single capture at **session open** (e.g. 9:30 AM ET) and **session close** (e.g. 4:00 PM ET) per symbol. Minute bars for the session are ingested from Databento into `session_minute_bars` (see `docs/databento_storage.md`).
 - **Session candle capture (optional)**: From first bar after session start to session end (e.g. 9:31–16:00 ET), at each candle-close time, screenshots can be taken at 1m, 5m, 15m, 1h. Disabled by default (`ENABLE_SESSION_CANDLE_CAPTURE=false`). Files are named like `MNQ1!_session_2026-02-21_1m_0931.png`.
 
-### Polygon.io Integration
-
-The Polygon.io client (`backend/services/data_collection/tradingview_client.py`) provides:
-- Real-time and historical price data fetching (OHLCV)
-- Market status checking
-- Session date management
-- Support for futures contracts (Nasdaq E-mini, S&P 500 E-mini)
-
-**Note**: Requires a Polygon.io API key. Set `POLYGON_API_KEY` in your `.env` file. The free tier is limited (5 calls/min, end-of-day data only; intraday/minute data requires a paid plan). See [docs/polygon_data.md](docs/polygon_data.md) for limits and example response data. If Polygon doesn’t offer futures API access for your plan, see [docs/futures_data_sources.md](docs/futures_data_sources.md) for alternative futures data providers and the data contract needed to plug one in.
 
 ### Screenshot Capture
 
@@ -145,7 +132,7 @@ The screenshot capture service (`backend/services/data_collection/screenshot_cap
 - Save images to the data directory
 
 **Where screenshots are saved:**
-- **Database**: Table **`snapshots`**. Each capture creates one row with: `id`, `symbol`, `snapshot_type` (`"before"`, `"after"`, `"manual"`, or `"session_candle"`), `timestamp`, `image_path`, `session_date`, `created_at`. For session_candle captures, `interval_minutes` (1, 5, 15, 60) and `bar_time` (candle-close time) are set. Optional current price from Polygon is stored in **`price_data`** linked by `snapshot_id`.
+- **Database**: Table **`snapshots`**. Each capture creates one row with: `id`, `symbol`, `snapshot_type` (`"before"`, `"after"`, `"manual"`, or `"session_candle"`), `timestamp`, `image_path`, `session_date`, `created_at`. For session_candle captures, `interval_minutes` (1, 5, 15, 60) and `bar_time` (candle-close time) are set. **`price_data`** can link OHLCV to a snapshot when provided by another source.
 - **Filesystem**: Under **`data/raw/`**. Manual/before/after: `MNQ1!_manual_2025-02-19_143022.png`. Session candles: `MNQ1!_session_2026-02-21_1m_0631.png` (symbol, session, interval, bar time).
 
 ## ML Model
@@ -166,7 +153,7 @@ To train the model:
 3. Trigger training via API: `POST /api/v1/train`
 
 The training pipeline:
-- Builds training samples from **before/after** snapshot pairs and from **session_candle** pairs (per-interval: first bar of session vs 8:00 bar). Session candle labels use **SessionMinuteBar** (minute bars 6:30–8:00, populated after the 8:00 collection).
+- Builds training samples from **before/after** snapshot pairs and from **session_candle** pairs (per-interval: first bar of session vs session close). Session candle labels use **SessionMinuteBar** (minute bars for the session, ingested from Databento).
 - Preprocesses images, extracts features (including `interval_minutes` and `bar_time` for session samples)
 - Trains with validation split
 - Saves checkpoints and metrics
@@ -182,7 +169,7 @@ The system tracks:
 ## Database Schema
 
 - `snapshots`: Raw screenshot data. Columns include `snapshot_type`, `interval_minutes`, `bar_time` (for session_candle).
-- `session_minute_bars`: Minute OHLCV bars for 6:30–8:00 session (used for session_candle training labels).
+- `session_minute_bars`: Minute OHLCV bars for the configured session (e.g. 9:30–16:00 ET), ingested from Databento; used for session_candle training labels.
 - `price_data`: OHLCV market data (linked to snapshots).
 - `training_samples`: Processed training data with labels; `interval_minutes` set for session_candle-derived samples.
 - `model_checkpoints`: Saved model versions
@@ -194,8 +181,8 @@ The system tracks:
 
 Key settings in `backend/config/settings.py`:
 - `SYMBOLS`: Trading symbols (default: ["MNQ1!", "MES1!"] — MNQ & MES micro futures only)
-- `BEFORE_SNAPSHOT_TIME`: Before snapshot time (default: "06:30")
-- `AFTER_SNAPSHOT_TIME`: After snapshot time (default: "08:00")
+- `BEFORE_SNAPSHOT_TIME`: Before snapshot time (default: "09:30")
+- `AFTER_SNAPSHOT_TIME`: After snapshot time (default: "16:00")
 - `BATCH_SIZE`: Training batch size (default: 64; set in `.env` if needed)
 - `LEARNING_RATE`: Learning rate (default: 1e-4)
 - `NUM_EPOCHS`: Training epochs (default: 200)

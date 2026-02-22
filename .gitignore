@@ -37,10 +37,11 @@ ENV/
 .env
 .env.local
 
-# Data
+# Data (raw, processed, models, and Databento downloads — never commit)
 data/raw/*
 data/processed/*
 data/models/*
+data/databento/
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/models/.gitkeep

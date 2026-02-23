@@ -20,12 +20,31 @@
 | Ingested minute bars | DB table `session_minute_bars` |
 | Other app data (screenshots, processed images, DB file) | `data/raw/`, `data/processed/`, `data/daytrade.db` |
 
-## Next step
+## Ingestion
 
-Implement an ingestion script or service that:
+The app ingests OHLCV-1m from `.dbn.zst` files under `data/databento/raw/` (including subdirs like `GLBX-20260222-CPH8DH3NDW/`) into the `session_minute_bars` table. RTH filtering uses `SESSION_START_TIME`, `SESSION_END_TIME`, and `SESSION_TIMEZONE` from settings (default 9:30–16:00 ET).
 
-1. Reads `.dbn.zst` files from `settings.DATABENTO_RAW_DIR`.
-2. Decodes OHLCV-1m records (Databento schema `ohlcv-1m`).
-3. Maps instrument IDs to your symbols (e.g. MNQ, MES).
-4. Filters to RTH (e.g. 9:30–16:00 ET) if the files contain full globex.
-5. Inserts/upserts into `SessionMinuteBar` (session_date, symbol, bar_time, open/high/low/close, volume).
+### CLI (recommended for bulk)
+
+From the project root:
+
+```bash
+python scripts/ingest_databento.py
+```
+
+- **`--dry-run`** — Decode and count bars only; do not write to the database.
+- **`--path <file_or_dir>`** — Process a single file or directory instead of the full `DATABENTO_RAW_DIR`.
+
+### API
+
+- **`POST /api/v1/collection/ingest-databento`** — Run ingestion. Optional query: `?path=<file_or_dir>`, `?dry_run=true`.
+
+### Symbol mapping
+
+Databento raw symbols (e.g. `MNQU5`, `MESZ5`) are mapped to app symbols (`MNQ1!`, `MES1!`) via **`DATABENTO_SYMBOL_MAP`** in settings. Default: any raw symbol containing `"MNQ"` → `MNQ1!`, containing `"MES"` → `MES1!`. Override in `.env` with JSON, e.g.:
+
+```env
+DATABENTO_SYMBOL_MAP={"MNQ":"MNQ1!","MES":"MES1!"}
+```
+
+Only symbols in `SYMBOLS` (default `["MNQ1!", "MES1!"]`) are inserted. Re-running ingestion for the same `(session_date, symbol)` replaces existing bars (idempotent).

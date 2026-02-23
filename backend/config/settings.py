@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     MODELS_DIR: Path = DATA_DIR / "models"
     # Databento: raw batch downloads (e.g. glbx-mdp3-YYYYMMDD.ohlcv-1m.dbn.zst); ingest → SessionMinuteBar
     DATABENTO_RAW_DIR: Path = DATA_DIR / "databento" / "raw"
+    # Map Databento raw_symbol substring to app symbol (e.g. MNQ -> MNQ1!, MES -> MES1!). Env: JSON object.
+    DATABENTO_SYMBOL_MAP: dict[str, str] = {"MNQ": "MNQ1!", "MES": "MES1!"}
     
     # Market Data — focused on MNQ & MES only so the model gets really good at these
     # MNQ = Micro E-mini Nasdaq, MES = Micro E-mini S&P 500

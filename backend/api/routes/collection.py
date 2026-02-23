@@ -1,5 +1,6 @@
 """Data collection API: manual trigger, scheduler status, and training data processing."""
 import logging
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from backend.database.db import get_db
@@ -10,6 +11,7 @@ from backend.services.data_processing.training_data_pipeline import (
     process_training_data_from_snapshots,
     process_training_data_from_session_candles,
 )
+from backend.services.data_collection.databento_ingestion import run_ingestion
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,20 @@ def run_session_candles_now(
     No-op if ENABLE_SESSION_CANDLE_CAPTURE is False. Optional query: session_date=YYYY-MM-DD (default: today).
     """
     return run_session_candle_capture(db, session_date=session_date)
+
+
+@router.post("/ingest-databento")
+def ingest_databento_now(
+    path: str | None = None,
+    dry_run: bool = False,
+    db: Session = Depends(get_db),
+):
+    """
+    Ingest Databento OHLCV-1m batch files from data/databento/raw/ (or optional path) into session_minute_bars.
+    Optional query: path=<file or dir> to restrict to a single file or directory; dry_run=true to decode only.
+    """
+    path_override = Path(path) if path else None
+    return run_ingestion(db, path_override=path_override, dry_run=dry_run)
 
 
 @router.post("/process-training-data")

@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     IMAGE_SIZE: tuple[int, int] = (224, 224)
     VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
     TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)
+    # Optional seed for reproducible train-set shuffle (avoids memorization while keeping split time-based)
+    _rs: str | None = os.getenv("RANDOM_SEED")
+    RANDOM_SEED: int | None = int(_rs) if (_rs and _rs.strip()) else None
 
     @computed_field
     @property

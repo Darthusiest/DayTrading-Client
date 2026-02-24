@@ -1,16 +1,19 @@
 """Training API endpoints."""
+import logging
+from pathlib import Path
+from typing import Optional
+
+import torch
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from typing import Optional
-from pathlib import Path
+from torch.utils.data import DataLoader
+
+from backend.config.settings import settings
 from backend.database.db import get_db
 from backend.database.models import TrainingSample, ModelCheckpoint
-from backend.services.ml.training.trainer import Trainer, PriceDataset
-from backend.services.ml.models.price_predictor import PricePredictor, price_predictor_kwargs_from_settings
 from backend.services.data_processing.image_preprocessor import ImagePreprocessor
-from backend.config.settings import settings
-from torch.utils.data import DataLoader
-import logging
+from backend.services.ml.models.price_predictor import PricePredictor, price_predictor_kwargs_from_settings
+from backend.services.ml.training.trainer import Trainer, PriceDataset
 
 router = APIRouter(prefix="/train", tags=["training"])
 logger = logging.getLogger(__name__)
@@ -47,18 +50,20 @@ def train_model_task(db: Session):
 
         logger.info(f"Split: train={len(train_samples)}, val={len(val_samples)}, test={len(test_samples)}")
 
-        # Create datasets
+        # Create datasets (each sample = one chart + its labels; split is time-based so no future leakage)
         image_preprocessor = ImagePreprocessor()
         train_dataset = PriceDataset(train_samples, image_preprocessor)
         val_dataset = PriceDataset(val_samples, image_preprocessor)
         test_dataset = PriceDataset(test_samples, image_preprocessor) if test_samples else None
 
-        # Create data loaders
+        # Shuffle training set each epoch to avoid memorization; optional seed for reproducibility
+        train_generator = (torch.Generator().manual_seed(settings.RANDOM_SEED) if settings.RANDOM_SEED is not None else None)
         train_loader = DataLoader(
             train_dataset,
             batch_size=settings.BATCH_SIZE,
             shuffle=True,
-            num_workers=0
+            num_workers=0,
+            generator=train_generator,
         )
         val_loader = DataLoader(
             val_dataset,

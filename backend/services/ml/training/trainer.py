@@ -1,5 +1,6 @@
 """Training pipeline for the price prediction model."""
 import logging
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -353,13 +354,19 @@ class Trainer:
         test_loader: Optional[DataLoader] = None,
         plot_show: bool = True
     ) -> Dict[str, Any]:
-        """Full training loop with optional test set and validation curves plot."""
+        """Full training loop with optional test set and validation curves plot.
+
+        Adds simple progress reporting and per-epoch / total timing so you can
+        see how long training takes and how far along it is.
+        """
         save_dir.mkdir(parents=True, exist_ok=True)
         best_val_loss = float("inf")
-        training_history = []
+        training_history: List[Dict[str, Any]] = []
+        overall_start = time.perf_counter()
 
         for epoch in range(num_epochs):
-            logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+            epoch_start = time.perf_counter()
+            logger.info("Epoch %s/%s", epoch + 1, num_epochs)
 
             # Train
             train_metrics = self.train_epoch(train_loader, epoch)
@@ -370,11 +377,20 @@ class Trainer:
             # Update learning rate
             self.scheduler.step(val_metrics["loss"])
 
-            # Log metrics
+            epoch_seconds = time.perf_counter() - epoch_start
+            progress_pct = ((epoch + 1) / max(1, num_epochs)) * 100.0
+
+            # Log metrics + progress/timing
             logger.info(
-                f"Train Loss: {train_metrics['loss']:.4f}, "
-                f"Val Loss: {val_metrics['loss']:.4f}, "
-                f"Val Accuracy: {val_metrics['direction_accuracy']:.4f}"
+                "Epoch %s/%s (%.1f%%) finished in %.2fs | "
+                "Train Loss=%.4f Val Loss=%.4f Val Acc=%.4f",
+                epoch + 1,
+                num_epochs,
+                progress_pct,
+                epoch_seconds,
+                train_metrics["loss"],
+                val_metrics["loss"],
+                val_metrics.get("direction_accuracy", 0.0),
             )
 
             # Save metrics to database
@@ -397,7 +413,9 @@ class Trainer:
             training_history.append({
                 "epoch": epoch,
                 "train": train_metrics,
-                "val": val_metrics
+                "val": val_metrics,
+                "duration_seconds": epoch_seconds,
+                "checkpoint_path": str(checkpoint_path),
             })
 
         # Final test set evaluation (optional)
@@ -413,11 +431,20 @@ class Trainer:
         plot_path = save_dir / "validation_curves.png"
         self.plot_validation_curves(training_history, plot_path, show=plot_show)
 
+        total_seconds = time.perf_counter() - overall_start
+        logger.info(
+            "Training complete in %.2fs (%.2f min) over %s epochs",
+            total_seconds,
+            total_seconds / 60.0,
+            num_epochs,
+        )
+
         return {
             "history": training_history,
             "best_val_loss": best_val_loss,
             "test_metrics": test_metrics,
-            "plot_path": str(plot_path)
+            "plot_path": str(plot_path),
+            "total_duration_seconds": total_seconds,
         }
     
     def _save_metrics(

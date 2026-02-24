@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "64"))  # Larger batches for more stable gradients
     LEARNING_RATE: float = float(os.getenv("LEARNING_RATE", "1e-4"))
     NUM_EPOCHS: int = int(os.getenv("NUM_EPOCHS", "200"))  # More epochs for better convergence
+    # Early stopping: stop when val loss stops improving
+    EARLY_STOP_PATIENCE: int = int(os.getenv("EARLY_STOP_PATIENCE", "10"))
+    EARLY_STOP_MIN_DELTA: float = float(os.getenv("EARLY_STOP_MIN_DELTA", "0.0"))
     IMAGE_SIZE: tuple[int, int] = (224, 224)
     VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
     TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)

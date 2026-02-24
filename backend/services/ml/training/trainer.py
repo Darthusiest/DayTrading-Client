@@ -361,8 +361,12 @@ class Trainer:
         """
         save_dir.mkdir(parents=True, exist_ok=True)
         best_val_loss = float("inf")
+        epochs_without_improvement = 0
         training_history: List[Dict[str, Any]] = []
         overall_start = time.perf_counter()
+
+        patience = settings.EARLY_STOP_PATIENCE
+        min_delta = settings.EARLY_STOP_MIN_DELTA
 
         for epoch in range(num_epochs):
             epoch_start = time.perf_counter()
@@ -373,9 +377,10 @@ class Trainer:
 
             # Validate
             val_metrics = self.validate(val_loader)
+            current_val_loss = val_metrics["loss"]
 
             # Update learning rate
-            self.scheduler.step(val_metrics["loss"])
+            self.scheduler.step(current_val_loss)
 
             epoch_seconds = time.perf_counter() - epoch_start
             progress_pct = ((epoch + 1) / max(1, num_epochs)) * 100.0
@@ -389,18 +394,29 @@ class Trainer:
                 progress_pct,
                 epoch_seconds,
                 train_metrics["loss"],
-                val_metrics["loss"],
+                current_val_loss,
                 val_metrics.get("direction_accuracy", 0.0),
             )
+
+            # Early stopping: track improvement in validation loss
+            improved = current_val_loss < (best_val_loss - min_delta)
+            if improved:
+                best_val_loss = current_val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                logger.info(
+                    "No val loss improvement for %s epoch(s) (current=%.4f best=%.4f)",
+                    epochs_without_improvement,
+                    current_val_loss,
+                    best_val_loss,
+                )
 
             # Save metrics to database
             self._save_metrics(db, epoch, train_metrics, val_metrics)
 
-            # Save checkpoint
-            is_best = val_metrics["loss"] < best_val_loss
-            if is_best:
-                best_val_loss = val_metrics["loss"]
-
+            # Save checkpoint (mark as best only when val loss improves)
+            is_best = improved
             checkpoint_path = self._save_checkpoint(
                 db,
                 epoch,
@@ -418,6 +434,18 @@ class Trainer:
                 "checkpoint_path": str(checkpoint_path),
             })
 
+            # Early stopping break condition
+            if epochs_without_improvement >= patience:
+                logger.info(
+                    "Early stopping triggered: no val loss improvement for %s epochs "
+                    "(patience=%s). Stopping at epoch %s/%s.",
+                    epochs_without_improvement,
+                    patience,
+                    epoch + 1,
+                    num_epochs,
+                )
+                break
+
         # Final test set evaluation (optional)
         test_metrics = None
         if test_loader is not None:
@@ -432,11 +460,12 @@ class Trainer:
         self.plot_validation_curves(training_history, plot_path, show=plot_show)
 
         total_seconds = time.perf_counter() - overall_start
+        effective_epochs = len(training_history)
         logger.info(
             "Training complete in %.2fs (%.2f min) over %s epochs",
             total_seconds,
             total_seconds / 60.0,
-            num_epochs,
+            effective_epochs,
         )
 
         return {

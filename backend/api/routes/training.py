@@ -17,6 +17,7 @@ from backend.services.ml.training.trainer import Trainer, PriceDataset
 
 router = APIRouter(prefix="/train", tags=["training"])
 logger = logging.getLogger(__name__)
+MIN_TRAIN_SAMPLES = 2  # Lowered for early-stage testing; increase when you have more data
 
 
 def train_model_task(db: Session):
@@ -120,10 +121,10 @@ def trigger_training(
         TrainingSample.actual_price.isnot(None)
     ).count()
     
-    if sample_count < 10:
+    if sample_count < MIN_TRAIN_SAMPLES:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient training data: {sample_count} samples (minimum 10 required)"
+            detail=f"Insufficient training data: {sample_count} samples (minimum {MIN_TRAIN_SAMPLES} required)"
         )
     
     # Start training in background
@@ -139,29 +140,35 @@ def trigger_training(
 @router.get("/status")
 def get_training_status(db: Session = Depends(get_db)):
     """Get training status and available data."""
-    total_samples = db.query(TrainingSample).count()
-    unused_samples = db.query(TrainingSample).filter(
-        TrainingSample.is_used_for_training == False,
-        TrainingSample.actual_price.isnot(None)
-    ).count()
-    
-    latest_checkpoint = db.query(ModelCheckpoint).order_by(
-        ModelCheckpoint.created_at.desc()
-    ).first()
-    
-    status = {
-        "total_samples": total_samples,
-        "unused_samples": unused_samples,
-        "can_train": unused_samples >= 10
-    }
-    
-    if latest_checkpoint:
-        status["latest_model"] = {
-            "version": latest_checkpoint.version,
-            "epoch": latest_checkpoint.epoch,
-            "val_loss": latest_checkpoint.val_loss,
-            "val_accuracy": latest_checkpoint.val_accuracy,
-            "created_at": latest_checkpoint.created_at.isoformat()
+    try:
+        total_samples = db.query(TrainingSample).count()
+        unused_samples = db.query(TrainingSample).filter(
+            TrainingSample.is_used_for_training == False,
+            TrainingSample.actual_price.isnot(None)
+        ).count()
+
+        latest_checkpoint = db.query(ModelCheckpoint).order_by(
+            ModelCheckpoint.created_at.desc()
+        ).first()
+
+        status = {
+            "total_samples": total_samples,
+            "unused_samples": unused_samples,
+            "can_train": unused_samples >= MIN_TRAIN_SAMPLES,
+            "min_train_samples": MIN_TRAIN_SAMPLES,
         }
-    
-    return status
+
+        if latest_checkpoint:
+            created_at = latest_checkpoint.created_at
+            status["latest_model"] = {
+                "version": latest_checkpoint.version,
+                "epoch": latest_checkpoint.epoch,
+                "val_loss": latest_checkpoint.val_loss,
+                "val_accuracy": latest_checkpoint.val_accuracy,
+                "created_at": created_at.isoformat() if created_at else None
+            }
+
+        return status
+    except Exception as e:
+        logger.exception("get_training_status failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

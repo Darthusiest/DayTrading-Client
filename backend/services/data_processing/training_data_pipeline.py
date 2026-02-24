@@ -1,8 +1,10 @@
-"""Pipeline to create training samples from before/after snapshot pairs and session candle pairs."""
+"""Pipeline to create training samples from before/after snapshot pairs, session candle pairs, or bar-only (Databento)."""
 import logging
 from pathlib import Path
 from datetime import datetime
 
+import numpy as np
+from PIL import Image
 from sqlalchemy.orm import Session
 
 from backend.database.models import Snapshot, TrainingSample, SessionMinuteBar
@@ -12,6 +14,20 @@ from backend.services.data_processing.feature_extractor import FeatureExtractor
 from backend.services.data_processing.labeler import Labeler
 
 logger = logging.getLogger(__name__)
+
+PLACEHOLDER_IMAGE_NAME = "placeholder_chart.png"
+
+
+def _ensure_placeholder_image() -> Path:
+    """Create a single placeholder chart image (gray 224x224) for bar-only training samples. Idempotent."""
+    path = settings.PROCESSED_DATA_DIR / PLACEHOLDER_IMAGE_NAME
+    if path.is_file():
+        return path
+    size = settings.IMAGE_SIZE
+    arr = np.full((size[1], size[0], 3), 128, dtype=np.uint8)
+    Image.fromarray(arr).save(path)
+    logger.info("Created placeholder image at %s", path)
+    return path
 
 
 def _parse_session_time(time_str: str) -> tuple[int, int]:
@@ -297,4 +313,114 @@ def process_training_data_from_session_candles(db: Session) -> dict:
                 db.rollback()
                 errors.append(f"session_candle {interval_minutes}m: {e}")
 
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
+def process_training_data_from_bars_only(db: Session) -> dict:
+    """
+    Create training samples from SessionMinuteBar (Databento) only — no snapshots/charts.
+    One sample per (session_date, symbol): labels from session open/close/high/low;
+    uses a placeholder image so the model can train on price movement; at inference
+    the user supplies a real chart.
+    Returns dict with created, skipped, errors.
+    """
+    placeholder_path = _ensure_placeholder_image()
+    feature_extractor = FeatureExtractor()
+    created = 0
+    skipped = 0
+    errors = []
+
+    # Distinct (session_date, symbol) that have bars
+    rows = (
+        db.query(SessionMinuteBar.session_date, SessionMinuteBar.symbol)
+        .distinct()
+        .all()
+    )
+    for session_date, symbol in rows:
+        try:
+            existing = (
+                db.query(TrainingSample)
+                .filter(
+                    TrainingSample.session_date == session_date,
+                    TrainingSample.symbol == symbol,
+                    TrainingSample.snapshot_id.is_(None),
+                )
+                .first()
+            )
+            if existing:
+                skipped += 1
+                continue
+
+            bars = (
+                db.query(SessionMinuteBar)
+                .filter(
+                    SessionMinuteBar.session_date == session_date,
+                    SessionMinuteBar.symbol == symbol,
+                )
+                .order_by(SessionMinuteBar.bar_time)
+                .all()
+            )
+            if not bars or len(bars) < 2:
+                skipped += 1
+                continue
+
+            first_open = float(bars[0].open_price)
+            last_close = float(bars[-1].close_price)
+            session_high = max(float(b.high_price) for b in bars)
+            session_low = min(float(b.low_price) for b in bars)
+            price_change_absolute = last_close - first_open
+            price_change_percentage = (price_change_absolute / first_open * 100) if first_open > 0 else 0.0
+            threshold = 0.01
+            if abs(price_change_percentage) < threshold:
+                direction = "sideways"
+            elif price_change_percentage > 0:
+                direction = "up"
+            else:
+                direction = "down"
+
+            features = feature_extractor.extract_session_bar_features(
+                session_date, symbol, db
+            )
+            # Add time/pattern fields the trainer expects (no chart for bar-only)
+            dt = datetime.strptime(session_date, "%Y-%m-%d")
+            features["hour"] = 9
+            features["minute"] = 30
+            features["day_of_week"] = dt.weekday()
+            features["price_change_pct"] = price_change_percentage
+            features["price_range_pct"] = (session_high - session_low) / first_open * 100 if first_open > 0 else 0.0
+            features["trend_direction"] = direction
+            features["volatility_estimate"] = features.get("session_volatility", 0.0)
+            features["has_support_level"] = False
+            features["has_resistance_level"] = False
+
+            sample = TrainingSample(
+                snapshot_id=None,
+                symbol=symbol,
+                session_date=session_date,
+                interval_minutes=None,
+                processed_image_path=str(placeholder_path),
+                features=features,
+                price_change_absolute=price_change_absolute,
+                price_change_percentage=price_change_percentage,
+                direction=direction,
+                target_hit=None,
+                expected_price=None,
+                actual_price=last_close,
+            )
+            db.add(sample)
+            db.commit()
+            created += 1
+            if created <= 5 or created % 500 == 0:
+                logger.info(
+                    "Created bar-only training sample %s %s (total so far: %s)",
+                    symbol,
+                    session_date,
+                    created,
+                )
+        except Exception as e:
+            logger.exception("Error creating bar-only sample %s %s: %s", symbol, session_date, e)
+            db.rollback()
+            errors.append(f"{symbol} {session_date}: {e}")
+
+    logger.info("process_training_data_from_bars_only: created=%s skipped=%s errors=%s", created, skipped, len(errors))
     return {"created": created, "skipped": skipped, "errors": errors}

@@ -65,7 +65,7 @@ class TrainingSample(Base):
     __tablename__ = "training_samples"
     
     id = Column(Integer, primary_key=True, index=True)
-    snapshot_id = Column(Integer, ForeignKey("snapshots.id"))
+    snapshot_id = Column(Integer, ForeignKey("snapshots.id"), nullable=True)  # None for bar-only (Databento) samples
     symbol = Column(String(20), nullable=False, index=True)
     session_date = Column(String(10), nullable=False, index=True)
     # For session_candle pairs: chart interval (1, 5, 15, 60)

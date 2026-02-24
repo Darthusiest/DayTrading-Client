@@ -37,9 +37,14 @@ class PriceDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        
-        # Load and preprocess image
-        image_path = Path(sample.processed_image_path or sample.snapshot.image_path)
+        # Image: bar-only samples have processed_image_path (e.g. placeholder); else use snapshot
+        image_path = (
+            Path(sample.processed_image_path)
+            if sample.processed_image_path
+            else (Path(sample.snapshot.image_path) if sample.snapshot else None)
+        )
+        if image_path is None or not image_path.is_file():
+            image_path = Path(settings.PROCESSED_DATA_DIR) / "placeholder_chart.png"
         image = self.image_preprocessor.preprocess(image_path)
         
         if image is None:

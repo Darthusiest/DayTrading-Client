@@ -10,6 +10,7 @@ from backend.services.data_collection.scheduler import get_scheduler
 from backend.services.data_processing.training_data_pipeline import (
     process_training_data_from_snapshots,
     process_training_data_from_session_candles,
+    process_training_data_from_bars_only,
 )
 from backend.services.data_collection.databento_ingestion import run_ingestion
 
@@ -93,17 +94,21 @@ def ingest_databento_now(
 @router.post("/process-training-data")
 def process_training_data_now(db: Session = Depends(get_db)):
     """
-    Process before/after snapshot pairs and session_candle (per-interval) pairs into training samples.
-    Idempotent: skips pairs that already have a sample. Session candle labels use SessionMinuteBar (run after session close).
+    Build training samples from: (1) before/after snapshot pairs, (2) session_candle pairs,
+    (3) bar-only (Databento SessionMinuteBar) — one sample per session/symbol so you can
+    train from ingested bars without any screenshots. Idempotent.
     """
     result_before_after = process_training_data_from_snapshots(db)
     result_session = process_training_data_from_session_candles(db)
+    result_bars = process_training_data_from_bars_only(db)
+    total_created = result_before_after["created"] + result_session["created"] + result_bars["created"]
     return {
         "before_after": result_before_after,
         "session_candles": result_session,
-        "created": result_before_after["created"] + result_session["created"],
-        "skipped": result_before_after["skipped"] + result_session["skipped"],
-        "errors": result_before_after["errors"] + result_session["errors"],
+        "bars_only": result_bars,
+        "created": total_created,
+        "skipped": result_before_after["skipped"] + result_session["skipped"] + result_bars["skipped"],
+        "errors": result_before_after["errors"] + result_session["errors"] + result_bars["errors"],
     }
 
 

@@ -12,6 +12,7 @@ from backend.services.data_collection.collector import run_collection, run_sessi
 from backend.services.data_processing.training_data_pipeline import (
     process_training_data_from_snapshots,
     process_training_data_from_session_candles,
+    process_training_data_from_bars_only,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,18 +76,24 @@ def _scheduled_session_candle_capture_job() -> None:
 
 
 def _scheduled_process_training_data_job() -> None:
-    """Job run by APScheduler: create training samples from before/after pairs and session candles."""
+    """Job run by APScheduler: create training samples from before/after, session candles, and bar-only (Databento)."""
     logger.info("Scheduled process training data started")
     db = SessionLocal()
     try:
         result_before_after = process_training_data_from_snapshots(db)
         result_session = process_training_data_from_session_candles(db)
+        result_bars = process_training_data_from_bars_only(db)
         logger.info(
-            "Process training data finished: before/after created=%s, session created=%s",
+            "Process training data finished: before/after=%s, session=%s, bars_only=%s",
             result_before_after["created"],
             result_session["created"],
+            result_bars["created"],
         )
-        for err in result_before_after.get("errors", []) + result_session.get("errors", []):
+        for err in (
+            result_before_after.get("errors", [])
+            + result_session.get("errors", [])
+            + result_bars.get("errors", [])
+        ):
             logger.warning("Process training data error: %s", err)
     except Exception as e:
         logger.exception("Scheduled process training data failed: %s", e)

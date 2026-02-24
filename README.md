@@ -214,6 +214,18 @@ DayTrade/
 pytest tests/
 ```
 
+### Train then predict with a chart image
+
+With the API server running and (optionally) enough training data:
+
+```bash
+# Train (if ≥10 samples), wait for completion, then predict with your chart
+python scripts/train_then_predict.py path/to/your_chart.png --symbol MNQ1!
+
+# Skip training and only predict (use existing model)
+python scripts/train_then_predict.py path/to/your_chart.png --skip-train
+```
+
 ## Next Steps
 
 1. **Model Improvements**: Experiment with different architectures and hyperparameters (e.g. multi-interval or sequence inputs from session candles)

@@ -1,13 +1,18 @@
 """Evaluation and learning metrics API endpoints."""
+import io
 import math
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from backend.config.settings import settings
 from backend.database.db import get_db
-from backend.database.models import TrainingSample
+from backend.database.models import LearningMetric, TrainingSample
 from backend.services.evaluation.learning_tracker import LearningTracker
 from backend.services.evaluation.metrics import MetricsCalculator
 from backend.services.ml.inference.predictor import Predictor
@@ -44,6 +49,89 @@ def get_best_model_info(db: Session = Depends(get_db)):
     tracker = LearningTracker(db)
     model_info = tracker.get_best_model_info()
     return model_info
+
+
+@router.get("/learning-plot", response_class=Response)
+def get_learning_plot(db: Session = Depends(get_db)):
+    """
+    Return a PNG plot of training/validation loss and direction accuracy over epochs
+    for the most recent training run (from LearningMetric).
+    """
+    # Latest run = most recent contiguous val_loss by timestamp (until epoch 0)
+    val_loss_rows = (
+        db.query(LearningMetric)
+        .filter(LearningMetric.metric_type == "val_loss")
+        .order_by(LearningMetric.timestamp.desc())
+        .all()
+    )
+    if not val_loss_rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No learning metrics found. Train a model first (POST /api/v1/train)."
+        )
+    seen_epochs = set()
+    run_epochs = []
+    model_version = val_loss_rows[0].model_version
+    for row in val_loss_rows:
+        if row.model_version != model_version:
+            break
+        if row.epoch in seen_epochs:
+            continue
+        seen_epochs.add(row.epoch)
+        run_epochs.append(row.epoch)
+        if row.epoch == 0:
+            break
+    if not run_epochs:
+        raise HTTPException(status_code=404, detail="No complete run found in learning metrics.")
+    run_epochs = sorted(run_epochs)
+
+    # Load all four series for this run
+    types = ("train_loss", "val_loss", "train_direction_accuracy", "val_direction_accuracy")
+    rows = (
+        db.query(LearningMetric)
+        .filter(
+            LearningMetric.model_version == model_version,
+            LearningMetric.epoch.in_(run_epochs),
+            LearningMetric.metric_type.in_(types),
+        )
+        .all()
+    )
+    by_epoch = {e: {} for e in run_epochs}
+    for r in rows:
+        by_epoch[r.epoch][r.metric_type] = r.metric_value
+
+    # Only plot epochs that have at least val_loss
+    run_epochs_ok = [e for e in run_epochs if by_epoch[e].get("val_loss") is not None]
+    if not run_epochs_ok:
+        raise HTTPException(status_code=404, detail="No valid loss metrics found for plotting.")
+    train_loss = [by_epoch[e].get("train_loss") or 0.0 for e in run_epochs_ok]
+    val_loss = [by_epoch[e].get("val_loss") or 0.0 for e in run_epochs_ok]
+    train_acc = [by_epoch[e].get("train_direction_accuracy") or 0.0 for e in run_epochs_ok]
+    val_acc = [by_epoch[e].get("val_direction_accuracy") or 0.0 for e in run_epochs_ok]
+    epochs_display = [e + 1 for e in run_epochs_ok]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+    ax1.plot(epochs_display, train_loss, label="Train loss", color="C0")
+    ax1.plot(epochs_display, val_loss, label="Validation loss", color="C1")
+    ax1.set_ylabel("Loss")
+    ax1.legend(loc="upper right")
+    ax1.set_title("Training and validation loss")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(epochs_display, train_acc, label="Train accuracy", color="C0")
+    ax2.plot(epochs_display, val_acc, label="Validation accuracy", color="C1")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Accuracy")
+    ax2.legend(loc="lower right")
+    ax2.set_title("Training and validation accuracy (direction)")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return Response(content=buf.getvalue(), media_type="image/png")
 
 
 @router.get("/test-accuracy")

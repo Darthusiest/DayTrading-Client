@@ -90,6 +90,7 @@ The API will be available at `http://localhost:8000`
 - `GET /api/v1/evaluation/learning-curve` - Get learning curve data
 - `GET /api/v1/evaluation/best-model` - Get best model information
 - `GET /api/v1/evaluation/test-accuracy` - Run the best model on the chronological test split and return **MAE**, **RMSE**, and **direction accuracy** (up/down/sideways)
+- `GET /api/v1/evaluation/learning-plot` - Returns a **PNG image** of training/validation **loss** and **direction accuracy** over epochs (matplotlib plot from the latest training run)
 
 #### Data collection (scheduled and manual)
 - **Scheduled**: When the API server runs, data collection is scheduled at **session open** (e.g. 9:30 AM ET) and **session close** (e.g. 4:00 PM ET). Configure `SESSION_START_TIME`, `SESSION_END_TIME`, `SESSION_TIMEZONE` in `.env`. Set `ENABLE_SCHEDULED_COLLECTION=false` to disable.

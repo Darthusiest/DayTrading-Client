@@ -1,9 +1,9 @@
 """Labeling system for training data."""
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 from sqlalchemy.orm import Session
-from backend.database.models import Snapshot, PriceData, TrainingSample
+from backend.database.models import Snapshot, PriceData, TrainingSample, SessionMinuteBar
 from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -11,7 +11,31 @@ logger = logging.getLogger(__name__)
 
 class Labeler:
     """Create labels for training data from before/after snapshots."""
-    
+
+    def _prices_from_session_minute_bars(
+        self, db: Session, session_date: str, symbol: str
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """
+        Get (before_price, after_price, session_high, session_low) from SessionMinuteBar.
+        Before = first bar close, after = last bar close. Returns None if no bars.
+        """
+        bars = (
+            db.query(SessionMinuteBar)
+            .filter(
+                SessionMinuteBar.session_date == session_date,
+                SessionMinuteBar.symbol == symbol,
+            )
+            .order_by(SessionMinuteBar.bar_time)
+            .all()
+        )
+        if not bars or len(bars) < 2:
+            return None
+        before_price = float(bars[0].close_price)
+        after_price = float(bars[-1].close_price)
+        session_high = max(float(b.high_price) for b in bars)
+        session_low = min(float(b.low_price) for b in bars)
+        return (before_price, after_price, session_high, session_low)
+
     def create_labels(
         self,
         db: Session,
@@ -21,7 +45,8 @@ class Labeler:
     ) -> Optional[TrainingSample]:
         """
         Create training labels from before/after snapshot pair.
-        
+        Uses PriceData when available; otherwise uses SessionMinuteBar (Databento):
+        first bar close = before price, last bar close = after price.
         Args:
             db: Database session
             before_snapshot_id: ID of before snapshot
@@ -52,40 +77,54 @@ class Labeler:
                 PriceData.snapshot_id == after_snapshot_id
             ).first()
             
-            if not before_price_data or not after_price_data:
-                logger.warning("Price data not available for labeling")
-                return None
-            
-            # Calculate price movement
-            before_price = before_price_data.close_price
-            after_price = after_price_data.close_price
-            
+            before_price: float
+            after_price: float
+            session_high: float
+            session_low: float
+
+            if before_price_data and after_price_data:
+                before_price = before_price_data.close_price
+                after_price = after_price_data.close_price
+                session_high = max(
+                    before_price_data.high_price,
+                    after_price_data.high_price,
+                )
+                session_low = min(
+                    before_price_data.low_price,
+                    after_price_data.low_price,
+                )
+            else:
+                # Fallback: use SessionMinuteBar (Databento minute bars)
+                session_date = before_snapshot.session_date
+                symbol = before_snapshot.symbol
+                result = self._prices_from_session_minute_bars(db, session_date, symbol)
+                if result is None:
+                    logger.warning(
+                        "No SessionMinuteBar data for %s %s (and no PriceData); cannot label",
+                        symbol,
+                        session_date,
+                    )
+                    return None
+                before_price, after_price, session_high, session_low = result
+                logger.debug(
+                    "Using SessionMinuteBar for before/after labels: %s %s",
+                    symbol,
+                    session_date,
+                )
+
             price_change_absolute = after_price - before_price
             price_change_percentage = (price_change_absolute / before_price * 100) if before_price > 0 else 0.0
-            
-            # Determine direction
-            threshold = 0.01  # 0.01% threshold for sideways
+
+            threshold = 0.01
             if abs(price_change_percentage) < threshold:
                 direction = "sideways"
             elif price_change_percentage > 0:
                 direction = "up"
             else:
                 direction = "down"
-            
-            # Check if expected price was hit
+
             target_hit = None
             if expected_price is not None:
-                # Check if price reached expected price during the session
-                # Use high/low prices to determine if target was hit
-                session_high = max(
-                    before_price_data.high_price,
-                    after_price_data.high_price
-                )
-                session_low = min(
-                    before_price_data.low_price,
-                    after_price_data.low_price
-                )
-                
                 if expected_price >= session_low and expected_price <= session_high:
                     target_hit = True
                 else:

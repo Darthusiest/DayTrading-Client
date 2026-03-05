@@ -8,11 +8,11 @@ This script:
   1. Loads all SessionMinuteBar rows for symbols in settings.SYMBOLS.
   2. Builds sliding windows of length BAR_LOOKBACK (per session, per symbol), or loads
      them from cache (BAR_CACHE_DATASET=True) if a valid next_minute_dataset.pt exists.
-  3. Predicts next-bar 1m return (not raw price), plus dir5, vol10, and breakout.
+  3. Predicts next-bar 1m return (not raw price), plus 5m direction, 10m volatility, and 10m breakout.
   4. Splits chronologically into train/val/test.
   5. Trains an LSTM (NextMinuteBarLSTM) with configurable multi-task loss weights;
      early stopping on validation return_rmse (reported as price_rmse). Reports
-     return MAE/RMSE and direction/breakout accuracy on val and test.
+     return MAE/RMSE, direction_5m_accuracy, volatility_10m_rmse, breakout_10m_accuracy on val and test.
   6. Saves the trained weights and metrics:
        - models/next_minute_lstm.pt
        - models/next_minute_metrics.json
@@ -37,6 +37,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import nn, optim
@@ -398,6 +401,64 @@ def _build_sequences(
     )
 
 
+def _plot_training_curves(
+    history_epochs: List[int],
+    history_train_rmse: List[float],
+    history_val: List[Dict[str, float]],
+    save_path: Path,
+) -> None:
+    """Plot training and validation metrics across epochs and save to save_path."""
+    if not history_epochs or not history_val:
+        return
+    n_epochs = len(history_epochs)
+    val_price_rmse = [m["price_rmse"] for m in history_val]
+    val_price_mae = [m["price_mae"] for m in history_val]
+    val_direction_5m = [m["direction_5m_accuracy"] for m in history_val]
+    val_volatility_10m = [m["volatility_10m_rmse"] for m in history_val]
+    val_breakout_10m = [m["breakout_10m_accuracy"] for m in history_val]
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 9))
+    fig.suptitle("Next-minute LSTM training curves", fontsize=12)
+
+    axes[0, 0].plot(history_epochs, history_train_rmse, "b-o", markersize=4)
+    axes[0, 0].set_title("Train RMSE (return)")
+    axes[0, 0].set_xlabel("Epoch")
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(history_epochs, val_price_rmse, "g-o", markersize=4)
+    axes[0, 1].set_title("Validation price RMSE")
+    axes[0, 1].set_xlabel("Epoch")
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[0, 2].plot(history_epochs, val_price_mae, "g-s", markersize=4)
+    axes[0, 2].set_title("Validation price MAE")
+    axes[0, 2].set_xlabel("Epoch")
+    axes[0, 2].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(history_epochs, val_direction_5m, "m-o", markersize=4)
+    axes[1, 0].set_title("Validation 5m direction accuracy")
+    axes[1, 0].set_xlabel("Epoch")
+    axes[1, 0].set_ylim(0, 1)
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(history_epochs, val_volatility_10m, "c-o", markersize=4)
+    axes[1, 1].set_title("Validation 10m volatility RMSE")
+    axes[1, 1].set_xlabel("Epoch")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    axes[1, 2].plot(history_epochs, val_breakout_10m, "orange", marker="o", markersize=4)
+    axes[1, 2].set_title("Validation 10m breakout accuracy")
+    axes[1, 2].set_xlabel("Epoch")
+    axes[1, 2].set_ylim(0, 1)
+    axes[1, 2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved training curves to: {save_path}")
+
+
 def _time_split_indices(n: int, val_ratio: float, test_ratio: float) -> Tuple[range, range, range]:
     """Return (train_idx, val_idx, test_idx) ranges for chronological split."""
     n_val = max(1, int(n * val_ratio)) if n >= 10 else max(0, int(n * val_ratio))
@@ -419,9 +480,9 @@ def _evaluate(
     """
     Compute metrics for all tasks on a dataloader:
       - price_mae / price_rmse
-      - dir5_accuracy
-      - vol10_rmse
-      - breakout_accuracy
+      - direction_5m_accuracy (5m price direction: down/sideways/up)
+      - volatility_10m_rmse (10m realized volatility)
+      - breakout_10m_accuracy (10m ATR breakout)
     """
     model.eval()
     price_mae_sum = 0.0
@@ -478,9 +539,9 @@ def _evaluate(
         return {
             "price_mae": float("nan"),
             "price_rmse": float("nan"),
-            "dir5_accuracy": float("nan"),
-            "vol10_rmse": float("nan"),
-            "breakout_accuracy": float("nan"),
+            "direction_5m_accuracy": float("nan"),
+            "volatility_10m_rmse": float("nan"),
+            "breakout_10m_accuracy": float("nan"),
             "samples": 0,
         }
 
@@ -493,9 +554,9 @@ def _evaluate(
     return {
         "price_mae": price_mae,
         "price_rmse": price_rmse,
-        "dir5_accuracy": dir5_acc,
-        "vol10_rmse": vol10_rmse,
-        "breakout_accuracy": brk_acc,
+        "direction_5m_accuracy": dir5_acc,
+        "volatility_10m_rmse": vol10_rmse,
+        "breakout_10m_accuracy": brk_acc,
         "samples": price_n,
     }
 
@@ -622,7 +683,7 @@ def main() -> None:
         else None
     )
 
-    # dir5 class distribution (train) and balanced weights
+    # 5m direction class distribution (train) and balanced weights
     train_dir5 = targets_dir5[train_idx]
     if hasattr(train_dir5, "numpy"):
         train_dir5_np = train_dir5.numpy()
@@ -631,7 +692,7 @@ def main() -> None:
     dir5_counts = np.bincount(train_dir5_np.astype(int), minlength=3)
     dir5_total = int(dir5_counts.sum())
     print(
-        f"dir5 class distribution (train): down={dir5_counts[0]}, sideways={dir5_counts[1]}, up={dir5_counts[2]} "
+        f"5m direction class distribution (train): down={dir5_counts[0]}, sideways={dir5_counts[1]}, up={dir5_counts[2]} "
         f"(total={dir5_total})"
     )
     # Inverse frequency weights so minority classes get higher weight
@@ -649,7 +710,7 @@ def main() -> None:
         train_brk_np = np.asarray(train_brk)
     brk_pos = int((train_brk_np >= 0.5).sum())
     brk_neg = int(train_brk_np.size - brk_pos)
-    print(f"breakout class balance (train): pos={brk_pos}, neg={brk_neg} (pos_rate={brk_pos / max(1, train_brk_np.size):.3f})")
+    print(f"10m breakout class balance (train): pos={brk_pos}, neg={brk_neg} (pos_rate={brk_pos / max(1, train_brk_np.size):.3f})")
     brk_pos_weight = torch.tensor([brk_neg / max(1, brk_pos)], dtype=torch.float32, device=DEVICE) if brk_pos > 0 else None
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -687,6 +748,11 @@ def main() -> None:
     best_val_rmse = float("inf")
     best_state = None
     epochs_without_improve = 0
+
+    # Per-epoch history for training curves
+    history_epochs: List[int] = []
+    history_train_rmse: List[float] = []
+    history_val: List[Dict[str, float]] = []
 
     num_batches = len(train_loader)
     total_steps = max(1, EPOCHS * num_batches)
@@ -747,9 +813,9 @@ def main() -> None:
         val_metrics = {
             "price_mae": float("nan"),
             "price_rmse": float("nan"),
-            "dir5_accuracy": float("nan"),
-            "vol10_rmse": float("nan"),
-            "breakout_accuracy": float("nan"),
+            "direction_5m_accuracy": float("nan"),
+            "volatility_10m_rmse": float("nan"),
+            "breakout_10m_accuracy": float("nan"),
             "samples": 0,
         }
         if val_loader is not None:
@@ -760,10 +826,15 @@ def main() -> None:
             f"| train_rmse={train_rmse:.5f} "
             f"| val_price_rmse={val_metrics['price_rmse']:.5f} "
             f"| val_price_mae={val_metrics['price_mae']:.5f} "
-            f"| val_dir5_acc={val_metrics['dir5_accuracy']:.4f} "
-            f"| val_vol10_rmse={val_metrics['vol10_rmse']:.5f} "
-            f"| val_brk_acc={val_metrics['breakout_accuracy']:.4f}"
+            f"| val_direction_5m_acc={val_metrics['direction_5m_accuracy']:.4f} "
+            f"| val_volatility_10m_rmse={val_metrics['volatility_10m_rmse']:.5f} "
+            f"| val_breakout_10m_acc={val_metrics['breakout_10m_accuracy']:.4f}"
         )
+
+        # Record history for plots
+        history_epochs.append(epoch + 1)
+        history_train_rmse.append(train_rmse)
+        history_val.append(dict(val_metrics))
 
         # Track best model by validation price RMSE and early stopping
         val_rmse = val_metrics["price_rmse"]
@@ -804,6 +875,10 @@ def main() -> None:
     metrics_path = models_dir / "next_minute_metrics.json"
     with metrics_path.open("w") as f:
         json.dump(metrics, f, indent=2)
+
+    if history_epochs and history_val:
+        curves_path = models_dir / "training_curves.png"
+        _plot_training_curves(history_epochs, history_train_rmse, history_val, curves_path)
 
     print(f"Saved next-minute model to: {ckpt_path}")
     print(f"Saved metrics JSON to: {metrics_path}")

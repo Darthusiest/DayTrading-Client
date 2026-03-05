@@ -1,4 +1,4 @@
-"""Next-minute bar dataset and LSTM model for 1m next-candle prediction."""
+"""Next-minute bar dataset and LSTM model for 1m return and multi-task prediction."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,7 +17,7 @@ class NextMinuteBarDataset(Dataset):
 
     Expects prebuilt tensors:
       - sequences:         [N, T, F] float32 (T = lookback window length, F = features per bar)
-      - targets_price:     [N]       float32 (next-bar close price)
+      - targets_price:     [N]       float32 (next-bar 1m return, optionally z-scored)
       - targets_dir5:      [N]       int64   (direction next 5m: 0=down,1=sideways,2=up)
       - targets_vol10:     [N]       float32 (volatility next 10m)
       - targets_breakout:  [N]       float32 (0/1 breakout label for next 10m)
@@ -78,8 +78,8 @@ class NextMinuteBarLSTM(nn.Module):
     """
     LSTM model for 1m next-candle prediction.
 
-    Given a window of T bars with F features each, predicts a scalar target
-    (typically the next bar's close price or return).
+    Given a window of T bars with F features each, predicts next-bar return (price head),
+    direction next 5m (dir5), realized vol next 10m (vol10), and breakout (binary).
     """
 
     def __init__(self, config: NextMinuteModelConfig):
@@ -101,7 +101,7 @@ class NextMinuteBarLSTM(nn.Module):
             nn.Dropout(config.dropout),
         )
 
-        # 1) Next-bar price regression
+        # 1) Next-bar return regression (1m return, not raw price)
         self.price_head = nn.Linear(config.hidden_size, 1)
 
         # 2) Direction next 5m (3-way classification: 0=down,1=sideways,2=up)
@@ -110,11 +110,8 @@ class NextMinuteBarLSTM(nn.Module):
         # 3) Volatility next 10m (regression)
         self.vol10_head = nn.Linear(config.hidden_size, 1)
 
-        # 4) Breakout probability next 10m (binary classification)
-        self.breakout_head = nn.Sequential(
-            nn.Linear(config.hidden_size, 1),
-            nn.Sigmoid(),
-        )
+        # 4) Breakout next 10m (binary classification; outputs logits for BCEWithLogitsLoss)
+        self.breakout_head = nn.Linear(config.hidden_size, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -123,10 +120,10 @@ class NextMinuteBarLSTM(nn.Module):
 
         Returns:
             Dict of predictions:
-              - price: [B]        next-bar close price
+              - price: [B]        next-bar 1m return (or z-scored return)
               - dir5_logits: [B,3] logits for direction next 5m
               - vol10: [B]        volatility next 10m
-              - breakout: [B]     probability of breakout next 10m
+              - breakout: [B]     logits for breakout next 10m (apply sigmoid for probability)
         """
         out, _ = self.lstm(x)  # [B, T, H]
         last = out[:, -1, :]   # [B, H]
@@ -135,7 +132,7 @@ class NextMinuteBarLSTM(nn.Module):
         price = self.price_head(h).squeeze(-1)
         dir5_logits = self.dir5_head(h)
         vol10 = self.vol10_head(h).squeeze(-1)
-        breakout = self.breakout_head(h).squeeze(-1)
+        breakout = self.breakout_head(h).squeeze(-1)  # logits
 
         return {
             "price": price,

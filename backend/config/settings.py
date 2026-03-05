@@ -78,6 +78,29 @@ class Settings(BaseSettings):
     # Early stopping: stop when val loss stops improving
     EARLY_STOP_PATIENCE: int = int(os.getenv("EARLY_STOP_PATIENCE", "10"))
     EARLY_STOP_MIN_DELTA: float = float(os.getenv("EARLY_STOP_MIN_DELTA", "0.0"))
+    # Next-minute bar model: dataset cache and early stopping
+    BAR_CACHE_DATASET: bool = os.getenv("BAR_CACHE_DATASET", "True").lower() == "true"
+    BAR_REBUILD_CACHE: bool = os.getenv("BAR_REBUILD_CACHE", "False").lower() == "true"
+    BAR_EARLY_STOP_PATIENCE: int = int(os.getenv("BAR_EARLY_STOP_PATIENCE", "5"))
+    BAR_EARLY_STOP_MIN_DELTA: float = float(os.getenv("BAR_EARLY_STOP_MIN_DELTA", "0.0"))
+    # Lookback window (bars). 15–30 recommended for next-minute; 60 can add noise.
+    BAR_LOOKBACK: int = int(os.getenv("BAR_LOOKBACK", "30"))
+    # dir5: threshold for up/down (e.g. 0.001 = 0.1%). Sideways if |ret_5m| <= threshold.
+    BAR_DIR5_THRESHOLD: float = float(os.getenv("BAR_DIR5_THRESHOLD", "0.002"))
+    # Breakout: require move beyond recent range by > k * ATR to count as breakout.
+    BAR_BREAKOUT_ATR_K: float = float(os.getenv("BAR_BREAKOUT_ATR_K", "1.0"))
+    BAR_ATR_WINDOW: int = int(os.getenv("BAR_ATR_WINDOW", "14"))
+    # Per-session normalization (inputs and optionally return/vol targets).
+    BAR_NORMALIZE_INPUTS: bool = os.getenv("BAR_NORMALIZE_INPUTS", "True").lower() == "true"
+    BAR_NORMALIZE_RETURN_TARGET: bool = os.getenv("BAR_NORMALIZE_RETURN_TARGET", "False").lower() == "true"
+    BAR_NORMALIZE_VOL_TARGET: bool = os.getenv("BAR_NORMALIZE_VOL_TARGET", "False").lower() == "true"
+    # Multi-task loss weights (classification heads often need higher weight).
+    BAR_LOSS_WEIGHT_PRICE: float = float(os.getenv("BAR_LOSS_WEIGHT_PRICE", "1.0"))
+    BAR_LOSS_WEIGHT_DIR5: float = float(os.getenv("BAR_LOSS_WEIGHT_DIR5", "2.0"))
+    BAR_LOSS_WEIGHT_VOL: float = float(os.getenv("BAR_LOSS_WEIGHT_VOL", "0.5"))
+    BAR_LOSS_WEIGHT_BREAKOUT: float = float(os.getenv("BAR_LOSS_WEIGHT_BREAKOUT", "2.0"))
+    # Staged training: "all" (default) or "heads_only" (freeze trunk + return head, train dir5/breakout only).
+    BAR_TRAIN_PHASE: str = os.getenv("BAR_TRAIN_PHASE", "all")
     IMAGE_SIZE: tuple[int, int] = (224, 224)
     VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
     TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)

@@ -455,8 +455,10 @@ def main() -> None:
             f"| val_brk_acc={val_metrics['breakout_accuracy']:.4f}"
         )
 
-        if not math.isnan(val_metrics["rmse"]) and val_metrics["rmse"] < best_val_rmse:
-            best_val_rmse = val_metrics["rmse"]
+        # Track best model by validation price RMSE
+        val_rmse = val_metrics["price_rmse"]
+        if not math.isnan(val_rmse) and val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
             best_state = model.state_dict()
 
     # Use best validation model (if we found one)

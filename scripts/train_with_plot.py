@@ -1,26 +1,100 @@
-"""Run training with train/val/test split and show validation loss/accuracy plot in a window."""
+"""Run EOD model training with train/val/test split and show validation loss/accuracy plot in a window.
+
+Optionally initialize the PricePredictor LSTM weights from the bar-only next-minute model:
+
+  python scripts/train_next_minute_model.py   # train bar model first
+  python scripts/train_with_plot.py --init-from-bar-model
+"""
+import argparse
 import sys
 from pathlib import Path
 
+import torch
+from torch.utils.data import DataLoader
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backend.database.db import SessionLocal
-from backend.database.models import TrainingSample, ModelCheckpoint
-from backend.services.ml.training.trainer import Trainer, PriceDataset
-from backend.services.ml.models.price_predictor import PricePredictor, price_predictor_kwargs_from_settings
-from backend.services.data_processing.image_preprocessor import ImagePreprocessor
-from backend.config.settings import settings
-from torch.utils.data import DataLoader
+from backend.database.db import SessionLocal  # noqa: E402
+from backend.database.models import TrainingSample  # noqa: E402
+from backend.services.ml.training.trainer import Trainer, PriceDataset  # noqa: E402
+from backend.services.ml.models.price_predictor import (  # noqa: E402
+    PricePredictor,
+    price_predictor_kwargs_from_settings,
+)
+from backend.services.data_processing.image_preprocessor import ImagePreprocessor  # noqa: E402
+from backend.services.ml.bar_next_minute import (  # noqa: E402
+    NextMinuteBarLSTM,
+    NextMinuteModelConfig,
+)
+from backend.config.settings import settings  # noqa: E402
+
 
 MIN_TRAIN_SAMPLES = 2  # Keep in sync with API training route for early testing
 
+
+def _maybe_init_from_bar_model(model: PricePredictor) -> None:
+    """
+    Initialize the PricePredictor LSTM weights from the bar-only next-minute model,
+    when a checkpoint exists. Copies recurrent weights exactly and input weights
+    where dimensions allow (partial copy for larger input size).
+    """
+    ckpt_path = settings.MODELS_DIR / "next_minute_lstm.pt"
+    if not ckpt_path.is_file():
+        print(f"[init-from-bar-model] No next-minute checkpoint found at {ckpt_path}, skipping.")
+        return
+
+    # Recreate bar model architecture (input_size here only affects weight_ih shape)
+    # We use F=5 features (OHLCV) to match train_next_minute_model.py.
+    config = NextMinuteModelConfig(input_size=5)
+    bar_model = NextMinuteBarLSTM(config)
+    try:
+        state = torch.load(ckpt_path, map_location="cpu")
+        bar_model.load_state_dict(state)
+    except Exception as exc:
+        print(f"[init-from-bar-model] Failed to load bar model from {ckpt_path}: {exc}")
+        return
+
+    src_state = bar_model.lstm.state_dict()
+    dst_state = model.lstm.state_dict()
+
+    updated = 0
+    for name, param in dst_state.items():
+        src_param = src_state.get(name)
+        if src_param is None:
+            continue
+        if src_param.shape == param.shape:
+            param.copy_(src_param)
+            updated += 1
+        elif "weight_ih" in name and src_param.shape[0] == param.shape[0]:
+            # Partial copy for input weights when PricePredictor has larger input_size.
+            cols = min(src_param.shape[1], param.shape[1])
+            param[:, :cols].copy_(src_param[:, :cols])
+            updated += 1
+
+    model.lstm.load_state_dict(dst_state)
+    print(f"[init-from-bar-model] Copied {updated} LSTM parameter tensors from bar model.")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Train EOD PricePredictor and show validation plot.")
+    parser.add_argument(
+        "--init-from-bar-model",
+        action="store_true",
+        help="Initialize PricePredictor LSTM from next-minute bar model weights before training.",
+    )
+    args = parser.parse_args()
+
     db = SessionLocal()
     try:
-        samples = db.query(TrainingSample).filter(
-            TrainingSample.is_used_for_training == False,
-            TrainingSample.actual_price.isnot(None)
-        ).order_by(TrainingSample.session_date, TrainingSample.id).all()
+        samples = (
+            db.query(TrainingSample)
+            .filter(
+                TrainingSample.is_used_for_training == False,
+                TrainingSample.actual_price.isnot(None),
+            )
+            .order_by(TrainingSample.session_date, TrainingSample.id)
+            .all()
+        )
 
         if len(samples) < MIN_TRAIN_SAMPLES:
             print(f"Insufficient training samples: {len(samples)} (need at least {MIN_TRAIN_SAMPLES})")
@@ -54,6 +128,8 @@ def main():
         num_workers = settings.DATA_LOADER_WORKERS
         num_epochs = settings.QUICK_NUM_EPOCHS if settings.QUICK_MODE else settings.NUM_EPOCHS
 
+        from torch.utils.data import DataLoader  # local import to avoid shadowing
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -76,6 +152,9 @@ def main():
             )
 
         model = PricePredictor(**price_predictor_kwargs_from_settings())
+        if args.init_from_bar_model:
+            _maybe_init_from_bar_model(model)
+
         trainer = Trainer(model)
         save_dir = settings.MODELS_DIR / settings.MODEL_NAME
 
@@ -87,7 +166,7 @@ def main():
             db,
             save_dir,
             test_loader=test_loader,
-            plot_show=False
+            plot_show=False,
         )
 
         for sample in samples:
@@ -99,6 +178,7 @@ def main():
             # Show the saved plot in a matplotlib window (pops up)
             try:
                 import matplotlib
+
                 for backend in ("TkAgg", "Qt5Agg", "MacOSX", "GTK3Agg", "WXAgg"):
                     try:
                         matplotlib.use(backend)
@@ -106,6 +186,7 @@ def main():
                     except Exception:
                         continue
                 import matplotlib.pyplot as plt
+
                 img = plt.imread(plot_path)
                 plt.figure(figsize=(8, 8))
                 plt.imshow(img)
@@ -117,6 +198,7 @@ def main():
                 print(f"Could not show plot window: {e}. Opening file with default viewer.")
                 import subprocess
                 import platform
+
                 path = Path(plot_path)
                 if platform.system() == "Darwin":
                     subprocess.run(["open", str(path)])
@@ -132,3 +214,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

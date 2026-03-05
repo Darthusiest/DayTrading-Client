@@ -232,3 +232,27 @@ def get_test_accuracy(db: Session = Depends(get_db)):
         "direction_correct": direction_correct,
         "direction_total": direction_total,
     }
+
+
+@router.get("/next-minute-metrics")
+def get_next_minute_metrics():
+    """
+    Return precomputed metrics for the 1m next-minute bar model.
+
+    These metrics are written by scripts/train_next_minute_model.py to:
+        models/next_minute_metrics.json
+    and include MAE, RMSE, and direction accuracy for validation and test splits.
+    """
+    metrics_path = settings.MODELS_DIR / "next_minute_metrics.json"
+    if not metrics_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No next-minute metrics found at {metrics_path}. "
+            "Run `python scripts/train_next_minute_model.py` first.",
+        )
+    import json
+
+    with metrics_path.open("r") as f:
+        data = json.load(f)
+    return data
+

@@ -68,7 +68,13 @@ class Settings(BaseSettings):
     CNN_TRAINABLE_PARAM_GROUPS: int = int(os.getenv("CNN_TRAINABLE_PARAM_GROUPS", "10"))  # 0 = unfreeze all CNN
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "64"))  # Larger batches for more stable gradients
     LEARNING_RATE: float = float(os.getenv("LEARNING_RATE", "1e-4"))
-    NUM_EPOCHS: int = int(os.getenv("NUM_EPOCHS", "200"))  # More epochs for better convergence
+    NUM_EPOCHS: int = int(os.getenv("NUM_EPOCHS", "50"))  # Default epochs for full training runs
+    # Quick mode: faster, lighter runs for experimentation
+    QUICK_MODE: bool = os.getenv("QUICK_MODE", "False").lower() == "true"
+    QUICK_NUM_EPOCHS: int = int(os.getenv("QUICK_NUM_EPOCHS", "10"))
+    QUICK_BATCH_SIZE: int = int(os.getenv("QUICK_BATCH_SIZE", "64"))
+    # Data loading workers for PyTorch DataLoader
+    DATA_LOADER_WORKERS: int = int(os.getenv("DATA_LOADER_WORKERS", "2"))
     # Early stopping: stop when val loss stops improving
     EARLY_STOP_PATIENCE: int = int(os.getenv("EARLY_STOP_PATIENCE", "10"))
     EARLY_STOP_MIN_DELTA: float = float(os.getenv("EARLY_STOP_MIN_DELTA", "0.0"))

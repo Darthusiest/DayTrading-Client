@@ -29,7 +29,7 @@ def train_model_task(db: Session):
             TrainingSample.actual_price.isnot(None)
         ).order_by(TrainingSample.session_date, TrainingSample.id).all()
 
-        if len(samples) < 10:
+        if len(samples) < MIN_TRAIN_SAMPLES:
             logger.warning(f"Insufficient training samples: {len(samples)}")
             return
 
@@ -57,28 +57,33 @@ def train_model_task(db: Session):
         val_dataset = PriceDataset(val_samples, image_preprocessor)
         test_dataset = PriceDataset(test_samples, image_preprocessor) if test_samples else None
 
+        # Effective hyperparameters: allow a faster "quick mode" for experimentation
+        batch_size = settings.QUICK_BATCH_SIZE if settings.QUICK_MODE else settings.BATCH_SIZE
+        num_workers = settings.DATA_LOADER_WORKERS
+        num_epochs = settings.QUICK_NUM_EPOCHS if settings.QUICK_MODE else settings.NUM_EPOCHS
+
         # Shuffle training set each epoch to avoid memorization; optional seed for reproducibility
         train_generator = (torch.Generator().manual_seed(settings.RANDOM_SEED) if settings.RANDOM_SEED is not None else None)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=settings.BATCH_SIZE,
+            batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=num_workers,
             generator=train_generator,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=settings.BATCH_SIZE,
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=0
+            num_workers=num_workers,
         )
         test_loader = None
         if test_dataset is not None and len(test_samples) > 0:
             test_loader = DataLoader(
                 test_dataset,
-                batch_size=settings.BATCH_SIZE,
+                batch_size=batch_size,
                 shuffle=False,
-                num_workers=0
+                num_workers=num_workers,
             )
 
         # Initialize model and trainer
@@ -90,7 +95,7 @@ def train_model_task(db: Session):
         history = trainer.train(
             train_loader,
             val_loader,
-            settings.NUM_EPOCHS,
+            num_epochs,
             db,
             save_dir,
             test_loader=test_loader,

@@ -10,8 +10,6 @@ from backend.config.settings import settings
 from backend.database.db import SessionLocal
 from backend.services.data_collection.collector import run_collection, run_session_candle_capture
 from backend.services.data_processing.training_data_pipeline import (
-    process_training_data_from_snapshots,
-    process_training_data_from_session_candles,
     process_training_data_from_bars_only,
 )
 
@@ -76,23 +74,18 @@ def _scheduled_session_candle_capture_job() -> None:
 
 
 def _scheduled_process_training_data_job() -> None:
-    """Job run by APScheduler: create training samples from before/after, session candles, and bar-only (Databento)."""
-    logger.info("Scheduled process training data started")
+    """Job run by APScheduler: create training samples from bar-only (Databento SessionMinuteBar)."""
+    logger.info("Scheduled bar-only process_training_data started")
     db = SessionLocal()
     try:
-        result_before_after = process_training_data_from_snapshots(db)
-        result_session = process_training_data_from_session_candles(db)
         result_bars = process_training_data_from_bars_only(db)
         logger.info(
-            "Process training data finished: before/after=%s, session=%s, bars_only=%s",
-            result_before_after["created"],
-            result_session["created"],
+            "Bar-only process_training_data finished: bars_only_created=%s skipped=%s",
             result_bars["created"],
+            result_bars["skipped"],
         )
         for err in (
-            result_before_after.get("errors", [])
-            + result_session.get("errors", [])
-            + result_bars.get("errors", [])
+            result_bars.get("errors", [])
         ):
             logger.warning("Process training data error: %s", err)
     except Exception as e:

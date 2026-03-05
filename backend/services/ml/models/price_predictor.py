@@ -106,7 +106,7 @@ class PricePredictor(nn.Module):
         self,
         images: torch.Tensor,
         features: torch.Tensor = None,
-        use_lstm: bool = False
+        use_lstm: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.

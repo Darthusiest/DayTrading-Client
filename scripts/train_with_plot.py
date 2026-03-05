@@ -12,6 +12,7 @@ from backend.services.data_processing.image_preprocessor import ImagePreprocesso
 from backend.config.settings import settings
 from torch.utils.data import DataLoader
 
+MIN_TRAIN_SAMPLES = 2  # Keep in sync with API training route for early testing
 
 def main():
     db = SessionLocal()
@@ -21,8 +22,8 @@ def main():
             TrainingSample.actual_price.isnot(None)
         ).order_by(TrainingSample.session_date, TrainingSample.id).all()
 
-        if len(samples) < 10:
-            print(f"Insufficient training samples: {len(samples)} (need at least 10)")
+        if len(samples) < MIN_TRAIN_SAMPLES:
+            print(f"Insufficient training samples: {len(samples)} (need at least {MIN_TRAIN_SAMPLES})")
             return
 
         # Time-based split: train / validation / test
@@ -48,25 +49,30 @@ def main():
         val_dataset = PriceDataset(val_samples, image_preprocessor)
         test_dataset = PriceDataset(test_samples, image_preprocessor) if test_samples else None
 
+        # Effective hyperparameters (support QUICK_MODE for fast experiments)
+        batch_size = settings.QUICK_BATCH_SIZE if settings.QUICK_MODE else settings.BATCH_SIZE
+        num_workers = settings.DATA_LOADER_WORKERS
+        num_epochs = settings.QUICK_NUM_EPOCHS if settings.QUICK_MODE else settings.NUM_EPOCHS
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=settings.BATCH_SIZE,
+            batch_size=batch_size,
             shuffle=True,
-            num_workers=0
+            num_workers=num_workers,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=settings.BATCH_SIZE,
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=0
+            num_workers=num_workers,
         )
         test_loader = None
         if test_samples:
             test_loader = DataLoader(
                 test_dataset,
-                batch_size=settings.BATCH_SIZE,
+                batch_size=batch_size,
                 shuffle=False,
-                num_workers=0
+                num_workers=num_workers,
             )
 
         model = PricePredictor(**price_predictor_kwargs_from_settings())
@@ -77,7 +83,7 @@ def main():
         history = trainer.train(
             train_loader,
             val_loader,
-            settings.NUM_EPOCHS,
+            num_epochs,
             db,
             save_dir,
             test_loader=test_loader,

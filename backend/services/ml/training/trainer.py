@@ -32,6 +32,8 @@ class PriceDataset(Dataset):
         self.samples = samples
         self.image_preprocessor = image_preprocessor
         self.device = device
+        # In-memory cache: image_path -> preprocessed numpy array
+        self._image_cache: Dict[Path, Any] = {}
     
     def __len__(self):
         return len(self.samples)
@@ -46,10 +48,18 @@ class PriceDataset(Dataset):
         )
         if image_path is None or not image_path.is_file():
             image_path = Path(settings.PROCESSED_DATA_DIR) / "placeholder_chart.png"
-        image = self.image_preprocessor.preprocess(image_path)
-        
+        # Use cache to avoid re-reading / re-processing the same image
+        image = self._image_cache.get(image_path)
         if image is None:
-            raise ValueError(f"Failed to preprocess image: {image_path}")
+            # For already-processed images, skip expensive chart-region extraction
+            extract_chart_region = not bool(sample.processed_image_path)
+            image = self.image_preprocessor.preprocess(
+                image_path,
+                extract_chart_region=extract_chart_region,
+            )
+            if image is None:
+                raise ValueError(f"Failed to preprocess image: {image_path}")
+            self._image_cache[image_path] = image
         
         # Convert to tensor and change from HWC to CHW
         image_tensor = torch.from_numpy(image).permute(2, 0, 1)
@@ -134,13 +144,12 @@ class Trainer:
         self.criterion_price = nn.MSELoss()
         self.criterion_prob = nn.BCELoss()
         
-        # Learning rate scheduler
+        # Learning rate scheduler (no verbose kwarg for broader PyTorch compatibility)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode="min",
             factor=0.5,
             patience=5,
-            verbose=True
         )
     
     def train_epoch(

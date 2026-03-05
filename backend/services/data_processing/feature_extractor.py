@@ -18,6 +18,8 @@ class FeatureExtractor:
     
     def __init__(self):
         self.timezone = pytz.timezone(settings.TIMEZONE)
+        # Cache for session-level bar features: (session_date, symbol) -> features dict
+        self._session_bar_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
     
     def extract_features(
         self,
@@ -122,6 +124,10 @@ class FeatureExtractor:
         """
         from backend.database.models import SessionMinuteBar
 
+        cache_key = (session_date, symbol)
+        if cache_key in self._session_bar_cache:
+            return self._session_bar_cache[cache_key]
+
         features: Dict[str, Any] = {
             "session_return_pct": 0.0,
             "session_range_pct": 0.0,
@@ -139,6 +145,7 @@ class FeatureExtractor:
                 .all()
             )
             if not bars or len(bars) < 2:
+                self._session_bar_cache[cache_key] = features
                 return features
             features["session_num_bars"] = len(bars)
             first_open = float(bars[0].open_price)
@@ -157,6 +164,7 @@ class FeatureExtractor:
                     returns.append((curr_c - prev_c) / prev_c)
             if returns:
                 features["session_volatility"] = float(np.std(returns))
+            self._session_bar_cache[cache_key] = features
         except Exception as e:
             logger.debug("Could not extract session bar features for %s %s: %s", symbol, session_date, e)
         return features

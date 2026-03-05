@@ -410,51 +410,44 @@ def _plot_training_curves(
     """Plot training and validation metrics across epochs and save to save_path."""
     if not history_epochs or not history_val:
         return
-    n_epochs = len(history_epochs)
     val_price_rmse = [m["price_rmse"] for m in history_val]
     val_price_mae = [m["price_mae"] for m in history_val]
     val_direction_5m = [m["direction_5m_accuracy"] for m in history_val]
     val_volatility_10m = [m["volatility_10m_rmse"] for m in history_val]
     val_breakout_10m = [m["breakout_10m_accuracy"] for m in history_val]
 
+    plt.rcParams["font.size"] = 10
     fig, axes = plt.subplots(2, 3, figsize=(14, 9))
-    fig.suptitle("Next-minute LSTM training curves", fontsize=12)
+    fig.suptitle("Next-minute LSTM — training curves", fontsize=14, fontweight="bold", y=1.02)
 
-    axes[0, 0].plot(history_epochs, history_train_rmse, "b-o", markersize=4)
-    axes[0, 0].set_title("Train RMSE (return)")
-    axes[0, 0].set_xlabel("Epoch")
-    axes[0, 0].grid(True, alpha=0.3)
+    for ax in axes.flat:
+        ax.tick_params(axis="both", labelsize=9)
+        ax.set_xlabel("Epoch", fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle="--")
 
-    axes[0, 1].plot(history_epochs, val_price_rmse, "g-o", markersize=4)
-    axes[0, 1].set_title("Validation price RMSE")
-    axes[0, 1].set_xlabel("Epoch")
-    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 0].plot(history_epochs, history_train_rmse, "b-o", markersize=5, linewidth=1.5)
+    axes[0, 0].set_title("Train RMSE (return)", fontsize=11)
 
-    axes[0, 2].plot(history_epochs, val_price_mae, "g-s", markersize=4)
-    axes[0, 2].set_title("Validation price MAE")
-    axes[0, 2].set_xlabel("Epoch")
-    axes[0, 2].grid(True, alpha=0.3)
+    axes[0, 1].plot(history_epochs, val_price_rmse, "g-o", markersize=5, linewidth=1.5)
+    axes[0, 1].set_title("Validation price RMSE", fontsize=11)
 
-    axes[1, 0].plot(history_epochs, val_direction_5m, "m-o", markersize=4)
-    axes[1, 0].set_title("Validation 5m direction accuracy")
-    axes[1, 0].set_xlabel("Epoch")
+    axes[0, 2].plot(history_epochs, val_price_mae, "g-s", markersize=5, linewidth=1.5)
+    axes[0, 2].set_title("Validation price MAE", fontsize=11)
+
+    axes[1, 0].plot(history_epochs, val_direction_5m, "m-o", markersize=5, linewidth=1.5)
+    axes[1, 0].set_title("Validation 5m direction accuracy", fontsize=11)
     axes[1, 0].set_ylim(0, 1)
-    axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(history_epochs, val_volatility_10m, "c-o", markersize=4)
-    axes[1, 1].set_title("Validation 10m volatility RMSE")
-    axes[1, 1].set_xlabel("Epoch")
-    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].plot(history_epochs, val_volatility_10m, "c-o", markersize=5, linewidth=1.5)
+    axes[1, 1].set_title("Validation 10m volatility RMSE", fontsize=11)
 
-    axes[1, 2].plot(history_epochs, val_breakout_10m, "orange", marker="o", markersize=4)
-    axes[1, 2].set_title("Validation 10m breakout accuracy")
-    axes[1, 2].set_xlabel("Epoch")
+    axes[1, 2].plot(history_epochs, val_breakout_10m, color="darkorange", marker="o", markersize=5, linewidth=1.5)
+    axes[1, 2].set_title("Validation 10m breakout accuracy", fontsize=11)
     axes[1, 2].set_ylim(0, 1)
-    axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close()
     print(f"Saved training curves to: {save_path}")
 
@@ -880,10 +873,34 @@ def main() -> None:
         curves_path = models_dir / "training_curves.png"
         _plot_training_curves(history_epochs, history_train_rmse, history_val, curves_path)
 
-    print(f"Saved next-minute model to: {ckpt_path}")
-    print(f"Saved metrics JSON to: {metrics_path}")
-    print("Validation metrics:", val_summary)
-    print("Test metrics:", test_summary)
+    # Formatted end-of-training summary
+    print()
+    print("=" * 60)
+    print("  TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"  Model checkpoint:  {ckpt_path}")
+    print(f"  Metrics JSON:     {metrics_path}")
+    if history_epochs and history_val:
+        print(f"  Training curves:  {models_dir / 'training_curves.png'}")
+    print()
+    print("  Validation metrics:")
+    if val_summary:
+        print(f"    price_mae:              {val_summary.get('price_mae', float('nan')):.4f}")
+        print(f"    price_rmse:             {val_summary.get('price_rmse', float('nan')):.4f}")
+        print(f"    direction_5m_accuracy:  {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+        print(f"    volatility_10m_rmse:    {val_summary.get('volatility_10m_rmse', float('nan')):.4f}")
+        print(f"    breakout_10m_accuracy:  {val_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
+        print(f"    samples:                {val_summary.get('samples', 0):,}")
+    print()
+    print("  Test metrics:")
+    if test_summary:
+        print(f"    price_mae:              {test_summary.get('price_mae', float('nan')):.4f}")
+        print(f"    price_rmse:             {test_summary.get('price_rmse', float('nan')):.4f}")
+        print(f"    direction_5m_accuracy:  {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+        print(f"    volatility_10m_rmse:    {test_summary.get('volatility_10m_rmse', float('nan')):.4f}")
+        print(f"    breakout_10m_accuracy:  {test_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
+        print(f"    samples:                {test_summary.get('samples', 0):,}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

@@ -50,14 +50,18 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     if n_bars > 1:
         prev_close = closes[:-1].copy()
         curr_close = closes[1:].copy()
-        valid = prev_close > 0
+        # Require both prices to be strictly positive to avoid invalid ratios/logs
+        valid = (prev_close > 0) & (curr_close > 0)
         ret = np.zeros_like(curr_close)
-        ret[valid] = (curr_close[valid] / prev_close[valid]) - 1.0
-        returns[1:] = ret
+        with np.errstate(divide="ignore", invalid="ignore"):
+            safe_ratio = np.zeros_like(curr_close, dtype="float32")
+            safe_ratio[valid] = curr_close[valid] / prev_close[valid]
+            ret[valid] = safe_ratio[valid] - 1.0
+            returns[1:] = ret
 
-        log_ret = np.zeros_like(curr_close)
-        log_ret[valid] = np.log(curr_close[valid] / prev_close[valid])
-        log_returns[1:] = log_ret
+            log_ret = np.zeros_like(curr_close, dtype="float32")
+            log_ret[valid] = np.log(safe_ratio[valid])
+            log_returns[1:] = log_ret
 
     # Rolling volatility of returns (e.g. 20-bar window)
     vol_window = min(20, max(2, n_bars))
@@ -74,7 +78,8 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     cum_pv = np.cumsum(pv)
     cum_v = np.cumsum(vols)
     nonzero = cum_v > 0
-    vwap[nonzero] = cum_pv[nonzero] / cum_v[nonzero]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vwap[nonzero] = cum_pv[nonzero] / cum_v[nonzero]
     if n_bars and not nonzero[0]:
         vwap[0] = closes[0]
 
@@ -120,6 +125,15 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     momentum = np.zeros(n_bars, dtype="float32")
     if n_bars > mom_period:
         momentum[mom_period:] = closes[mom_period:] - closes[:-mom_period]
+
+    # Replace any NaN/inf that might still slip through with safe zeros
+    returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+    log_returns = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0)
+    rolling_vol = np.nan_to_num(rolling_vol, nan=0.0, posinf=0.0, neginf=0.0)
+    vwap = np.nan_to_num(vwap, nan=0.0, posinf=0.0, neginf=0.0)
+    rsi = np.nan_to_num(rsi, nan=50.0, posinf=100.0, neginf=0.0)
+    macd = np.nan_to_num(macd, nan=0.0, posinf=0.0, neginf=0.0)
+    momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
 
     return returns, log_returns, rolling_vol, vwap, rsi, macd, momentum
 
@@ -222,6 +236,12 @@ def build_session_feature_matrix(
     ).astype("float32")
 
     features = np.concatenate([base, derived_cols], axis=1)
+    # Final safety: ensure no NaN/inf reaches the model
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    closes = np.nan_to_num(closes, nan=0.0, posinf=0.0, neginf=0.0)
+    highs = np.nan_to_num(highs, nan=0.0, posinf=0.0, neginf=0.0)
+    lows = np.nan_to_num(lows, nan=0.0, posinf=0.0, neginf=0.0)
+
     return features, closes.astype("float32"), highs.astype("float32"), lows.astype("float32")
 
 

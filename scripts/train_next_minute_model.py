@@ -23,6 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
@@ -98,7 +99,12 @@ def _build_sequences(
     targets_vol10: List[float] = []
     targets_breakout: List[float] = []
 
-    for (symbol, session_date), group in sorted(by_key.items(), key=lambda x: x[0][1]):
+    items = sorted(by_key.items(), key=lambda x: x[0][1])
+    total_sessions = len(items)
+    if total_sessions:
+        print(f"Building sequences across {total_sessions} sessions...")
+
+    for idx, ((symbol, session_date), group) in enumerate(items, start=1):
         if len(group) <= lookback:
             continue
 
@@ -170,12 +176,18 @@ def _build_sequences(
             targets_vol10.append(vol10)
             targets_breakout.append(breakout)
 
+        # Lightweight progress indicator for sequence-building phase
+        if total_sessions and (idx % max(1, total_sessions // 20) == 0 or idx == total_sessions):
+            pct = idx / total_sessions * 100.0
+            print(f"Sequence build progress: {idx}/{total_sessions} sessions ({pct:.1f}%)", end="\r", flush=True)
+
+    if total_sessions:
+        print()  # move to next line after progress output
+
     if not sequences:
         raise RuntimeError(
             f"No sequences built. Check that SessionMinuteBar has data and LOOKBACK={lookback} is not too large."
         )
-
-    import numpy as np
 
     seq_arr = np.stack(sequences).astype("float32")
     tgt_price_arr = np.asarray(targets_price, dtype="float32")
@@ -371,12 +383,17 @@ def main() -> None:
     best_val_rmse = float("inf")
     best_state = None
 
+    num_batches = len(train_loader)
+    total_steps = max(1, EPOCHS * num_batches)
+    global_step = 0
+
     for epoch in range(EPOCHS):
         model.train()
         epoch_loss = 0.0
         n_seen = 0
+        print(f"Epoch {epoch + 1}/{EPOCHS} starting...")
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader, start=1):
             seq = batch["sequence"].to(DEVICE)
             tgt_price = batch["target_price"].to(DEVICE)
             tgt_dir5 = batch["target_dir5"].to(DEVICE)
@@ -398,6 +415,21 @@ def main() -> None:
 
             epoch_loss += loss.item() * tgt_price.numel()
             n_seen += tgt_price.numel()
+
+            # Global training progress across all epochs/batches
+            global_step += 1
+            if num_batches:
+                if batch_idx % max(1, num_batches // 10) == 0 or batch_idx == num_batches:
+                    pct = global_step / total_steps * 100.0
+                    print(
+                        f"Training progress: epoch {epoch + 1}/{EPOCHS}, "
+                        f"batch {batch_idx}/{num_batches} "
+                        f"({pct:.1f}% overall)",
+                        end="\r",
+                        flush=True,
+                    )
+
+        print()  # newline after epoch's batch-level progress
 
         train_mse = epoch_loss / max(1, n_seen)
         train_rmse = math.sqrt(train_mse)

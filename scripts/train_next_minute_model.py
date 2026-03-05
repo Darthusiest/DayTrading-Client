@@ -11,8 +11,9 @@ This script:
   3. Predicts next-bar 1m return (not raw price), plus 5m direction, 10m volatility, and 10m breakout.
   4. Splits chronologically into train/val/test.
   5. Trains an LSTM (NextMinuteBarLSTM) with configurable multi-task loss weights;
-     early stopping on validation return_rmse (reported as price_rmse). Reports
-     return MAE/RMSE, direction_5m_accuracy, volatility_10m_rmse, breakout_10m_accuracy on val and test.
+     early stopping and best checkpoint on validation direction metric (default: direction_5m_macro_f1).
+     Reports return MAE/RMSE, direction_5m_accuracy, direction_5m_macro_f1, direction_5m_balanced_accuracy,
+     volatility_10m_rmse, breakout_10m_accuracy on val and test.
   6. Saves the trained weights and metrics:
        - models/next_minute_lstm.pt
        - models/next_minute_metrics.json
@@ -27,7 +28,7 @@ Lookback: BAR_LOOKBACK (default 30). Shorter lookbacks (15–30) are recommended
 next-minute microstructure; 60 can add noise.
 
 Cache: Set BAR_REBUILD_CACHE=true or delete models/next_minute_dataset.pt to force
-rebuilding sequences after config or data changes.
+rebuilding sequences after config or data changes (e.g. after changing BAR_DIR5_THRESHOLD).
 """
 
 import json
@@ -67,9 +68,87 @@ TEST_RATIO = getattr(settings, "BAR_TEST_SPLIT", 0.1)
 USE_CACHE = getattr(settings, "BAR_CACHE_DATASET", True)
 REBUILD_CACHE = getattr(settings, "BAR_REBUILD_CACHE", False)
 CACHE_PATH = settings.MODELS_DIR / "next_minute_dataset.pt"
+# Bump when bar feature set changes (e.g. ATR + close_zscore) so old caches are invalidated.
+FEATURE_VERSION = 2
 EARLY_STOP_PATIENCE = getattr(settings, "BAR_EARLY_STOP_PATIENCE", 5)
 EARLY_STOP_MIN_DELTA = getattr(settings, "BAR_EARLY_STOP_MIN_DELTA", 0.0)
+EARLY_STOP_METRIC = getattr(settings, "BAR_EARLY_STOP_METRIC", "direction_5m_macro_f1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _direction_predict_with_confidence(
+    logits: torch.Tensor,
+    confidence_threshold: float,
+) -> torch.Tensor:
+    """
+    Predict 3-class direction (0=down, 1=sideways, 2=up). If confidence_threshold > 0 and
+    max(prob) >= threshold and argmax is down or up, predict that; otherwise predict sideways.
+    If threshold <= 0, use raw argmax.
+    """
+    if confidence_threshold <= 0:
+        return torch.argmax(logits, dim=1)
+    probs = torch.softmax(logits, dim=1)
+    max_prob, argmax = torch.max(probs, dim=1)
+    # Predict down/up only when confident; else sideways (1)
+    pred = torch.where(
+        (max_prob >= confidence_threshold) & (argmax != 1),
+        argmax,
+        torch.full_like(argmax, 1, device=logits.device, dtype=argmax.dtype),
+    )
+    return pred
+
+
+class _FocalLoss(nn.Module):
+    """Multi-class focal loss: -alpha_c * (1 - p_t)^gamma * log(p_t). Reduces weight on easy examples."""
+
+    def __init__(
+        self,
+        weight: Optional[torch.Tensor] = None,
+        gamma: float = 2.0,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # logits: [B, C], target: [B] long
+        log_probs = nn.functional.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+        pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)  # [B]
+        focal_weight = (1 - pt) ** self.gamma
+        loss = -focal_weight * log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        if self.weight is not None:
+            w = self.weight[target]  # [B]
+            loss = loss * w
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+def _macro_f1_and_balanced_accuracy(
+    pred: np.ndarray,
+    true: np.ndarray,
+    num_classes: int = 3,
+) -> Tuple[float, float]:
+    """Compute macro-F1 (mean of per-class F1) and balanced accuracy (mean of per-class recall)."""
+    macro_f1 = 0.0
+    balanced_acc = 0.0
+    for c in range(num_classes):
+        tp = ((pred == c) & (true == c)).sum()
+        pred_c = (pred == c).sum()
+        true_c = (true == c).sum()
+        precision = tp / pred_c if pred_c > 0 else 0.0
+        recall = tp / true_c if true_c > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        macro_f1 += f1
+        balanced_acc += recall
+    macro_f1 /= num_classes
+    balanced_acc /= num_classes
+    return float(macro_f1), float(balanced_acc)
 
 
 def _load_bars() -> List[SessionMinuteBar]:
@@ -110,6 +189,8 @@ def _load_cached_sequences(
     expected_normalize_vol: Optional[bool] = None,
     expected_dir5_threshold: Optional[float] = None,
     expected_breakout_atr_k: Optional[float] = None,
+    expected_feature_version: Optional[int] = None,
+    expected_normalize_inputs_expanding: Optional[bool] = None,
 ) -> Optional[
     Tuple[
         torch.Tensor,
@@ -149,6 +230,10 @@ def _load_cached_sequences(
         expected_meta["dir5_threshold"] = expected_dir5_threshold
     if expected_breakout_atr_k is not None:
         expected_meta["breakout_atr_k"] = expected_breakout_atr_k
+    if expected_feature_version is not None:
+        expected_meta["feature_version"] = expected_feature_version
+    if expected_normalize_inputs_expanding is not None:
+        expected_meta["normalize_inputs_expanding"] = expected_normalize_inputs_expanding
     if not _cache_metadata_matches(data, expected_meta):
         return None
     if num_bars_expected is not None and data.get("num_bars") != num_bars_expected:
@@ -181,8 +266,10 @@ def _save_sequences_cache(
     normalize_inputs: bool = False,
     normalize_return: bool = False,
     normalize_vol: bool = False,
+    normalize_inputs_expanding: bool = False,
     dir5_threshold: float = 0.002,
     breakout_atr_k: float = 1.0,
+    feature_version: int = FEATURE_VERSION,
 ) -> None:
     """Save built sequences and metadata to a .pt file for future runs."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,8 +290,10 @@ def _save_sequences_cache(
             "normalize_inputs": normalize_inputs,
             "normalize_return": normalize_return,
             "normalize_vol": normalize_vol,
+            "normalize_inputs_expanding": normalize_inputs_expanding,
             "dir5_threshold": dir5_threshold,
             "breakout_atr_k": breakout_atr_k,
+            "feature_version": feature_version,
         },
         cache_path,
     )
@@ -216,6 +305,7 @@ def _build_sequences(
     normalize_inputs: bool = True,
     normalize_return_target: bool = False,
     normalize_vol_target: bool = False,
+    normalize_inputs_expanding: bool = False,
     dir5_threshold: float = 0.002,
     breakout_atr_k: float = 1.0,
     atr_window: int = 14,
@@ -259,12 +349,18 @@ def _build_sequences(
         all_feat, closes, highs, lows = build_session_feature_matrix(group)
         n_bars = all_feat.shape[0]
 
-        # Per-session input normalization
+        # Per-session input normalization (full-session or expanding-window to avoid lookahead)
         if normalize_inputs and n_bars > 0:
-            feat_mean = all_feat.mean(axis=0)
-            feat_std = all_feat.std(axis=0)
             eps = 1e-8
-            all_feat = (all_feat - feat_mean) / (feat_std + eps)
+            if normalize_inputs_expanding:
+                for j in range(n_bars):
+                    mean_j = all_feat[: j + 1].mean(axis=0)
+                    std_j = all_feat[: j + 1].std(axis=0)
+                    all_feat[j] = (all_feat[j] - mean_j) / (std_j + eps)
+            else:
+                feat_mean = all_feat.mean(axis=0)
+                feat_std = all_feat.std(axis=0)
+                all_feat = (all_feat - feat_mean) / (feat_std + eps)
 
         # Precompute session 1m returns and vol10 for optional z-scoring
         session_returns_1m = np.zeros(n_bars, dtype="float32")
@@ -413,6 +509,7 @@ def _plot_training_curves(
     val_price_rmse = [m["price_rmse"] for m in history_val]
     val_price_mae = [m["price_mae"] for m in history_val]
     val_direction_5m = [m["direction_5m_accuracy"] for m in history_val]
+    val_direction_5m_macro_f1 = [m.get("direction_5m_macro_f1", float("nan")) for m in history_val]
     val_volatility_10m = [m["volatility_10m_rmse"] for m in history_val]
     val_breakout_10m = [m["breakout_10m_accuracy"] for m in history_val]
 
@@ -434,9 +531,11 @@ def _plot_training_curves(
     axes[0, 2].plot(history_epochs, val_price_mae, "g-s", markersize=5, linewidth=1.5)
     axes[0, 2].set_title("Validation price MAE", fontsize=11)
 
-    axes[1, 0].plot(history_epochs, val_direction_5m, "m-o", markersize=5, linewidth=1.5)
-    axes[1, 0].set_title("Validation 5m direction accuracy", fontsize=11)
+    axes[1, 0].plot(history_epochs, val_direction_5m, "m-o", markersize=5, linewidth=1.5, label="accuracy")
+    axes[1, 0].plot(history_epochs, val_direction_5m_macro_f1, "c-s", markersize=5, linewidth=1.5, label="macro-F1")
+    axes[1, 0].set_title("Validation 5m direction (accuracy + macro-F1)", fontsize=11)
     axes[1, 0].set_ylim(0, 1)
+    axes[1, 0].legend(loc="lower right", fontsize=8)
 
     axes[1, 1].plot(history_epochs, val_volatility_10m, "c-o", markersize=5, linewidth=1.5)
     axes[1, 1].set_title("Validation 10m volatility RMSE", fontsize=11)
@@ -469,21 +568,23 @@ def _time_split_indices(n: int, val_ratio: float, test_ratio: float) -> Tuple[ra
 def _evaluate(
     model: nn.Module,
     loader: DataLoader,
+    direction_confidence_threshold: float = 0.0,
 ) -> Dict[str, float]:
     """
     Compute metrics for all tasks on a dataloader:
       - price_mae / price_rmse
-      - direction_5m_accuracy (5m price direction: down/sideways/up)
+      - direction_5m_accuracy, direction_5m_macro_f1, direction_5m_balanced_accuracy
       - volatility_10m_rmse (10m realized volatility)
       - breakout_10m_accuracy (10m ATR breakout)
+    Direction predictions use confidence threshold when direction_confidence_threshold > 0.
     """
     model.eval()
     price_mae_sum = 0.0
     price_mse_sum = 0.0
     price_n = 0
 
-    dir5_correct = 0
-    dir5_total = 0
+    dir5_pred_list: List[torch.Tensor] = []
+    dir5_true_list: List[torch.Tensor] = []
 
     vol10_mse_sum = 0.0
     vol10_n = 0
@@ -508,12 +609,11 @@ def _evaluate(
             price_mse_sum += torch.sum(diff_price * diff_price).item()
             price_n += tgt_price.numel()
 
-            # Direction next 5m accuracy
+            # Direction next 5m: use confidence threshold then accumulate for macro-F1
             logits = outputs["dir5_logits"]
-            pred_dir5 = torch.argmax(logits, dim=1)
-            matches = (pred_dir5 == tgt_dir5).float()
-            dir5_correct += matches.sum().item()
-            dir5_total += matches.numel()
+            pred_dir5 = _direction_predict_with_confidence(logits, direction_confidence_threshold)
+            dir5_pred_list.append(pred_dir5)
+            dir5_true_list.append(tgt_dir5)
 
             # Volatility next 10m RMSE
             pred_vol10 = outputs["vol10"]
@@ -533,6 +633,8 @@ def _evaluate(
             "price_mae": float("nan"),
             "price_rmse": float("nan"),
             "direction_5m_accuracy": float("nan"),
+            "direction_5m_macro_f1": float("nan"),
+            "direction_5m_balanced_accuracy": float("nan"),
             "volatility_10m_rmse": float("nan"),
             "breakout_10m_accuracy": float("nan"),
             "samples": 0,
@@ -541,13 +643,20 @@ def _evaluate(
     price_mae = price_mae_sum / price_n
     price_rmse = math.sqrt(price_mse_sum / price_n)
     vol10_rmse = math.sqrt(vol10_mse_sum / vol10_n) if vol10_n else float("nan")
-    dir5_acc = dir5_correct / dir5_total if dir5_total else float("nan")
     brk_acc = brk_correct / brk_total if brk_total else float("nan")
+
+    # Direction: macro-F1 and balanced accuracy from accumulated preds/targets
+    all_pred = torch.cat(dir5_pred_list, dim=0).cpu().numpy()
+    all_true = torch.cat(dir5_true_list, dim=0).cpu().numpy()
+    dir5_acc = float((all_pred == all_true).mean())
+    macro_f1, balanced_acc = _macro_f1_and_balanced_accuracy(all_pred, all_true, num_classes=3)
 
     return {
         "price_mae": price_mae,
         "price_rmse": price_rmse,
         "direction_5m_accuracy": dir5_acc,
+        "direction_5m_macro_f1": macro_f1,
+        "direction_5m_balanced_accuracy": balanced_acc,
         "volatility_10m_rmse": vol10_rmse,
         "breakout_10m_accuracy": brk_acc,
         "samples": price_n,
@@ -567,7 +676,8 @@ def main() -> None:
     normalize_inputs = getattr(settings, "BAR_NORMALIZE_INPUTS", True)
     normalize_return = getattr(settings, "BAR_NORMALIZE_RETURN_TARGET", False)
     normalize_vol = getattr(settings, "BAR_NORMALIZE_VOL_TARGET", False)
-    dir5_threshold = getattr(settings, "BAR_DIR5_THRESHOLD", 0.002)
+    normalize_inputs_expanding = getattr(settings, "BAR_NORMALIZE_INPUTS_EXPANDING", False)
+    dir5_threshold = getattr(settings, "BAR_DIR5_THRESHOLD", 0.001)
     breakout_atr_k = getattr(settings, "BAR_BREAKOUT_ATR_K", 1.0)
 
     if USE_CACHE and not REBUILD_CACHE and CACHE_PATH.is_file():
@@ -582,6 +692,8 @@ def main() -> None:
             expected_normalize_vol=normalize_vol,
             expected_dir5_threshold=dir5_threshold,
             expected_breakout_atr_k=breakout_atr_k,
+            expected_feature_version=FEATURE_VERSION,
+            expected_normalize_inputs_expanding=normalize_inputs_expanding,
         )
         if cached is not None:
             sequences, targets_price, targets_dir5, targets_vol10, targets_breakout = cached
@@ -610,6 +722,7 @@ def main() -> None:
             normalize_inputs=normalize_inputs,
             normalize_return_target=normalize_return,
             normalize_vol_target=normalize_vol,
+            normalize_inputs_expanding=normalize_inputs_expanding,
             dir5_threshold=dir5_threshold,
             breakout_atr_k=breakout_atr_k,
             atr_window=atr_window,
@@ -635,8 +748,10 @@ def main() -> None:
                 normalize_inputs=normalize_inputs,
                 normalize_return=normalize_return,
                 normalize_vol=normalize_vol,
+                normalize_inputs_expanding=normalize_inputs_expanding,
                 dir5_threshold=dir5_threshold,
                 breakout_atr_k=breakout_atr_k,
+                feature_version=FEATURE_VERSION,
             )
             print(f"Saved dataset cache to {CACHE_PATH}.")
 
@@ -688,11 +803,15 @@ def main() -> None:
         f"5m direction class distribution (train): down={dir5_counts[0]}, sideways={dir5_counts[1]}, up={dir5_counts[2]} "
         f"(total={dir5_total})"
     )
-    # Inverse frequency weights so minority classes get higher weight
+    # Inverse frequency weights; optionally scale up minority classes (down=0, up=2) to improve direction accuracy
     dir5_weights = np.ones(3, dtype="float32")
     for c in range(3):
         if dir5_counts[c] > 0:
             dir5_weights[c] = dir5_total / (3.0 * dir5_counts[c])
+    minority_scale = getattr(settings, "BAR_DIR5_MINORITY_WEIGHT_SCALE", 1.0)
+    if minority_scale != 1.0:
+        dir5_weights[0] *= minority_scale  # down
+        dir5_weights[2] *= minority_scale  # up
     dir5_weight_tensor = torch.from_numpy(dir5_weights).to(DEVICE)
 
     # Breakout class balance (train) and pos_weight for BCE
@@ -712,8 +831,11 @@ def main() -> None:
 
     input_size = sequences.size(2)
     config = NextMinuteModelConfig(input_size=input_size)
+    if getattr(config, "direction_head_hidden", 0) > 0:
+        print(f"5m direction head: 2-layer MLP (hidden={config.direction_head_hidden}) for better accuracy.")
     model = NextMinuteBarLSTM(config).to(DEVICE)
 
+    dir5_first_epochs = getattr(settings, "BAR_DIR5_FIRST_EPOCHS", 3)
     if train_phase == "heads_only":
         for p in model.lstm.parameters():
             p.requires_grad = False
@@ -724,10 +846,39 @@ def main() -> None:
         for p in model.vol10_head.parameters():
             p.requires_grad = False
         print("Staged training: frozen trunk, price_head, vol10_head; training dir5 and breakout heads only.")
+    elif train_phase == "direction_first":
+        for p in model.lstm.parameters():
+            p.requires_grad = False
+        for p in model.trunk.parameters():
+            p.requires_grad = False
+        for p in model.price_head.parameters():
+            p.requires_grad = False
+        for p in model.vol10_head.parameters():
+            p.requires_grad = False
+        for p in model.breakout_head.parameters():
+            p.requires_grad = False
+        print(f"Direction-first: training only direction head for {dir5_first_epochs} epochs, then unfreezing all.")
 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    dir5_label_smoothing = getattr(settings, "BAR_DIR5_LABEL_SMOOTHING", 0.0)
+    dir5_use_focal = getattr(settings, "BAR_DIR5_USE_FOCAL", False)
+    dir5_focal_gamma = getattr(settings, "BAR_DIR5_FOCAL_GAMMA", 2.0)
+    if dir5_use_focal:
+        criterion_dir5 = _FocalLoss(weight=dir5_weight_tensor, gamma=dir5_focal_gamma).to(DEVICE)
+        print(f"5m direction loss: Focal (gamma={dir5_focal_gamma}) with class weights.")
+    else:
+        criterion_dir5 = nn.CrossEntropyLoss(
+            weight=dir5_weight_tensor,
+            label_smoothing=dir5_label_smoothing,
+        )
+    # Optimizer: only direction head params when direction_first (first N epochs)
+    if train_phase == "direction_first":
+        optimizer = optim.Adam(
+            [p for p in model.dir5_head.parameters() if p.requires_grad],
+            lr=LEARNING_RATE,
+        )
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion_price = nn.MSELoss()
-    criterion_dir5 = nn.CrossEntropyLoss(weight=dir5_weight_tensor)
     criterion_vol10 = nn.MSELoss()
     criterion_brk = (
         nn.BCEWithLogitsLoss(pos_weight=brk_pos_weight) if brk_pos_weight is not None else nn.BCEWithLogitsLoss()
@@ -738,9 +889,12 @@ def main() -> None:
         f"(batch_size={BATCH_SIZE}, lr={LEARNING_RATE})"
     )
 
-    best_val_rmse = float("inf")
+    # Early stop and best checkpoint on direction metric (higher is better)
+    best_val_metric = -math.inf
+    best_val_metric_value: Optional[float] = None
     best_state = None
     epochs_without_improve = 0
+    direction_confidence_threshold = getattr(settings, "BAR_DIR5_CONFIDENCE_THRESHOLD", 0.0)
 
     # Per-epoch history for training curves
     history_epochs: List[int] = []
@@ -752,9 +906,17 @@ def main() -> None:
     global_step = 0
 
     for epoch in range(EPOCHS):
+        # After direction_first phase, unfreeze all and switch to full multitask
+        if train_phase == "direction_first" and epoch == dir5_first_epochs:
+            for p in model.parameters():
+                p.requires_grad = True
+            optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+            print(f"Unfrozen all parameters; switching to full multi-task training from epoch {epoch + 1}.")
+
         model.train()
         epoch_loss = 0.0
         n_seen = 0
+        direction_only = train_phase == "direction_first" and epoch < dir5_first_epochs
         print(f"Epoch {epoch + 1}/{EPOCHS} starting...")
 
         for batch_idx, batch in enumerate(train_loader, start=1):
@@ -767,18 +929,19 @@ def main() -> None:
             optimizer.zero_grad()
             outputs = model(seq)
 
-            loss_price = criterion_price(outputs["price"], tgt_price)
             loss_dir5 = criterion_dir5(outputs["dir5_logits"], tgt_dir5)
-            loss_vol10 = criterion_vol10(outputs["vol10"], tgt_vol10)
-            loss_brk = criterion_brk(outputs["breakout"], tgt_brk)
-
-            # Combined multi-task loss with configurable weights
-            loss = (
-                loss_w_price * loss_price
-                + loss_w_dir5 * loss_dir5
-                + loss_w_vol * loss_vol10
-                + loss_w_brk * loss_brk
-            )
+            if direction_only:
+                loss = loss_w_dir5 * loss_dir5
+            else:
+                loss_price = criterion_price(outputs["price"], tgt_price)
+                loss_vol10 = criterion_vol10(outputs["vol10"], tgt_vol10)
+                loss_brk = criterion_brk(outputs["breakout"], tgt_brk)
+                loss = (
+                    loss_w_price * loss_price
+                    + loss_w_dir5 * loss_dir5
+                    + loss_w_vol * loss_vol10
+                    + loss_w_brk * loss_brk
+                )
             loss.backward()
             optimizer.step()
 
@@ -807,19 +970,21 @@ def main() -> None:
             "price_mae": float("nan"),
             "price_rmse": float("nan"),
             "direction_5m_accuracy": float("nan"),
+            "direction_5m_macro_f1": float("nan"),
+            "direction_5m_balanced_accuracy": float("nan"),
             "volatility_10m_rmse": float("nan"),
             "breakout_10m_accuracy": float("nan"),
             "samples": 0,
         }
         if val_loader is not None:
-            val_metrics = _evaluate(model, val_loader)
+            val_metrics = _evaluate(model, val_loader, direction_confidence_threshold)
 
         print(
             f"Epoch {epoch + 1}/{EPOCHS} "
             f"| train_rmse={train_rmse:.5f} "
             f"| val_price_rmse={val_metrics['price_rmse']:.5f} "
-            f"| val_price_mae={val_metrics['price_mae']:.5f} "
             f"| val_direction_5m_acc={val_metrics['direction_5m_accuracy']:.4f} "
+            f"| val_direction_5m_macro_f1={val_metrics['direction_5m_macro_f1']:.4f} "
             f"| val_volatility_10m_rmse={val_metrics['volatility_10m_rmse']:.5f} "
             f"| val_breakout_10m_acc={val_metrics['breakout_10m_accuracy']:.4f}"
         )
@@ -829,10 +994,11 @@ def main() -> None:
         history_train_rmse.append(train_rmse)
         history_val.append(dict(val_metrics))
 
-        # Track best model by validation price RMSE and early stopping
-        val_rmse = val_metrics["price_rmse"]
-        if not math.isnan(val_rmse) and (val_rmse + EARLY_STOP_MIN_DELTA) < best_val_rmse:
-            best_val_rmse = val_rmse
+        # Track best model by validation direction metric (higher is better) and early stopping
+        current_val = val_metrics.get(EARLY_STOP_METRIC, -math.inf)
+        if isinstance(current_val, float) and not math.isnan(current_val) and current_val > best_val_metric:
+            best_val_metric = current_val
+            best_val_metric_value = current_val
             best_state = model.state_dict()
             epochs_without_improve = 0
         else:
@@ -840,7 +1006,7 @@ def main() -> None:
         if epochs_without_improve >= EARLY_STOP_PATIENCE:
             print(
                 f"Early stopping triggered after {epoch + 1} epochs "
-                f"(no improvement in val return_rmse for {EARLY_STOP_PATIENCE} epochs; best={best_val_rmse:.5f})."
+                f"(no improvement in val {EARLY_STOP_METRIC} for {EARLY_STOP_PATIENCE} epochs; best={best_val_metric_value:.4f})."
             )
             break
 
@@ -848,9 +1014,24 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    # Optional: tune confidence threshold on validation for max macro-F1
+    tune_threshold = getattr(settings, "BAR_DIR5_TUNE_THRESHOLD", False)
+    if tune_threshold and val_loader is not None:
+        thresholds = [0.0, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+        best_f1 = -1.0
+        best_th = 0.0
+        for th in thresholds:
+            m = _evaluate(model, val_loader, direction_confidence_threshold=th)
+            f1 = m.get("direction_5m_macro_f1", -1.0)
+            if not math.isnan(f1) and f1 > best_f1:
+                best_f1 = f1
+                best_th = th
+        direction_confidence_threshold = best_th
+        print(f"Tuned confidence threshold on val: {best_th} (macro-F1={best_f1:.4f}).")
+
     print("Evaluating on validation and test sets...")
-    val_summary = _evaluate(model, val_loader) if val_loader is not None else None
-    test_summary = _evaluate(model, test_loader) if test_loader is not None else None
+    val_summary = _evaluate(model, val_loader, direction_confidence_threshold) if val_loader is not None else None
+    test_summary = _evaluate(model, test_loader, direction_confidence_threshold) if test_loader is not None else None
 
     models_dir = settings.MODELS_DIR
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -862,9 +1043,15 @@ def main() -> None:
         "batch_size": BATCH_SIZE,
         "epochs": EPOCHS,
         "learning_rate": LEARNING_RATE,
+        "early_stop_metric": EARLY_STOP_METRIC,
+        "direction_confidence_threshold": direction_confidence_threshold,
         "val": val_summary,
         "test": test_summary,
     }
+    if best_val_metric_value is not None:
+        metrics["best_val_metric_value"] = best_val_metric_value
+    if tune_threshold:
+        metrics["direction_confidence_threshold_tuned"] = True
     metrics_path = models_dir / "next_minute_metrics.json"
     with metrics_path.open("w") as f:
         json.dump(metrics, f, indent=2)
@@ -885,21 +1072,25 @@ def main() -> None:
     print()
     print("  Validation metrics:")
     if val_summary:
-        print(f"    price_mae:              {val_summary.get('price_mae', float('nan')):.4f}")
-        print(f"    price_rmse:             {val_summary.get('price_rmse', float('nan')):.4f}")
-        print(f"    direction_5m_accuracy:  {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
-        print(f"    volatility_10m_rmse:    {val_summary.get('volatility_10m_rmse', float('nan')):.4f}")
-        print(f"    breakout_10m_accuracy:  {val_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
-        print(f"    samples:                {val_summary.get('samples', 0):,}")
+        print(f"    price_mae:                    {val_summary.get('price_mae', float('nan')):.4f}")
+        print(f"    price_rmse:                  {val_summary.get('price_rmse', float('nan')):.4f}")
+        print(f"    direction_5m_accuracy:       {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+        print(f"    direction_5m_macro_f1:       {val_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
+        print(f"    direction_5m_balanced_acc:   {val_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
+        print(f"    volatility_10m_rmse:        {val_summary.get('volatility_10m_rmse', float('nan')):.4f}")
+        print(f"    breakout_10m_accuracy:       {val_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
+        print(f"    samples:                     {val_summary.get('samples', 0):,}")
     print()
     print("  Test metrics:")
     if test_summary:
-        print(f"    price_mae:              {test_summary.get('price_mae', float('nan')):.4f}")
-        print(f"    price_rmse:             {test_summary.get('price_rmse', float('nan')):.4f}")
-        print(f"    direction_5m_accuracy:  {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
-        print(f"    volatility_10m_rmse:    {test_summary.get('volatility_10m_rmse', float('nan')):.4f}")
-        print(f"    breakout_10m_accuracy:  {test_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
-        print(f"    samples:                {test_summary.get('samples', 0):,}")
+        print(f"    price_mae:                    {test_summary.get('price_mae', float('nan')):.4f}")
+        print(f"    price_rmse:                   {test_summary.get('price_rmse', float('nan')):.4f}")
+        print(f"    direction_5m_accuracy:       {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+        print(f"    direction_5m_macro_f1:       {test_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
+        print(f"    direction_5m_balanced_acc:   {test_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
+        print(f"    volatility_10m_rmse:         {test_summary.get('volatility_10m_rmse', float('nan')):.4f}")
+        print(f"    breakout_10m_accuracy:       {test_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
+        print(f"    samples:                     {test_summary.get('samples', 0):,}")
     print("=" * 60)
 
 

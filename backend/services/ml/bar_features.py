@@ -179,6 +179,41 @@ def _time_features(bars: Sequence[SessionMinuteBar]) -> Tuple[np.ndarray, ...]:
     return hours, minutes, day_of_week, minutes_since_open, is_ny_open, is_power_hour
 
 
+def _atr_and_close_zscore(
+    closes: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    atr_window: int = 14,
+    zscore_window: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """ATR (average true range) and rolling z-score of close for volatility/level context."""
+    n_bars = closes.shape[0]
+    atr = np.zeros(n_bars, dtype="float32")
+    tr = np.zeros(n_bars, dtype="float32")
+    for j in range(1, n_bars):
+        hl = highs[j] - lows[j]
+        hc = abs(highs[j] - closes[j - 1])
+        lc = abs(lows[j] - closes[j - 1])
+        tr[j] = max(hl, hc, lc)
+    w = min(atr_window, n_bars)
+    for j in range(n_bars):
+        start = max(0, j - w + 1)
+        atr[j] = float(tr[start : j + 1].mean())
+
+    close_zscore = np.zeros(n_bars, dtype="float32")
+    win = min(zscore_window, n_bars)
+    for j in range(n_bars):
+        start = max(0, j - win + 1)
+        window = closes[start : j + 1]
+        mu = window.mean()
+        sigma = window.std()
+        if sigma and sigma > 1e-8:
+            close_zscore[j] = (closes[j] - mu) / sigma
+        else:
+            close_zscore[j] = 0.0
+    return atr, close_zscore
+
+
 def build_session_feature_matrix(
     bars: Sequence[SessionMinuteBar],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -211,11 +246,14 @@ def build_session_feature_matrix(
         momentum,
     ) = _price_and_volatility_features(closes, vols)
 
+    atr_window = getattr(settings, "BAR_ATR_WINDOW", 14)
+    atr, close_zscore = _atr_and_close_zscore(closes, highs, lows, atr_window=atr_window, zscore_window=20)
+
     hours, minutes, dow, minutes_since_open, is_ny_open, is_power_hour = _time_features(
         ordered
     )
 
-    # Stack all features: OHLCV + derived + time
+    # Stack all features: OHLCV + derived + time + ATR + close_zscore
     derived_cols = np.stack(
         [
             returns,
@@ -225,6 +263,8 @@ def build_session_feature_matrix(
             rsi,
             macd,
             momentum,
+            atr,
+            close_zscore,
             hours,
             minutes,
             dow,

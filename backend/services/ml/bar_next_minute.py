@@ -72,6 +72,8 @@ class NextMinuteModelConfig:
     hidden_size: int = settings.LSTM_HIDDEN_SIZE
     num_layers: int = settings.NUM_LSTM_LAYERS
     dropout: float = 0.1
+    # 5m direction head: 0 = single Linear(hidden, 3); >0 = MLP hidden size (e.g. 128) for better direction accuracy.
+    direction_head_hidden: int = getattr(settings, "BAR_DIR5_HEAD_HIDDEN", 0)
 
 
 class NextMinuteBarLSTM(nn.Module):
@@ -105,7 +107,15 @@ class NextMinuteBarLSTM(nn.Module):
         self.price_head = nn.Linear(config.hidden_size, 1)
 
         # 2) Direction next 5m (3-way classification: 0=down,1=sideways,2=up)
-        self.dir5_head = nn.Linear(config.hidden_size, 3)
+        if getattr(config, "direction_head_hidden", 0) > 0:
+            self.dir5_head = nn.Sequential(
+                nn.Linear(config.hidden_size, config.direction_head_hidden),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.direction_head_hidden, 3),
+            )
+        else:
+            self.dir5_head = nn.Linear(config.hidden_size, 3)
 
         # 3) Volatility next 10m (regression)
         self.vol10_head = nn.Linear(config.hidden_size, 1)

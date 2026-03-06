@@ -126,6 +126,28 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     if n_bars > mom_period:
         momentum[mom_period:] = closes[mom_period:] - closes[:-mom_period]
 
+    # Multi-horizon returns (1m already in returns; add 5m and 10m for direction context)
+    return_5m = np.zeros(n_bars, dtype="float32")
+    for i in range(5, n_bars):
+        if closes[i - 5] > 0:
+            return_5m[i] = (closes[i] - closes[i - 5]) / closes[i - 5]
+    return_10m = np.zeros(n_bars, dtype="float32")
+    for i in range(10, n_bars):
+        if closes[i - 10] > 0:
+            return_10m[i] = (closes[i] - closes[i - 10]) / closes[i - 10]
+
+    # VWAP distance: (close - vwap) / vwap (normalized; positive = above VWAP)
+    vwap_safe = np.where(vwap > 0, vwap, 1.0)
+    vwap_distance = (closes - vwap) / vwap_safe
+
+    # Volume delta: 1-bar relative change (vol[i] - vol[i-1]) / (vol[i-1] + eps)
+    volume_delta = np.zeros(n_bars, dtype="float32")
+    if n_bars > 1:
+        prev_vol = vols[:-1]
+        curr_vol = vols[1:]
+        denom = np.where(prev_vol > 0, prev_vol, 1.0)
+        volume_delta[1:] = (curr_vol - prev_vol) / denom
+
     # Replace any NaN/inf that might still slip through with safe zeros
     returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
     log_returns = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0)
@@ -134,8 +156,24 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     rsi = np.nan_to_num(rsi, nan=50.0, posinf=100.0, neginf=0.0)
     macd = np.nan_to_num(macd, nan=0.0, posinf=0.0, neginf=0.0)
     momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
+    return_5m = np.nan_to_num(return_5m, nan=0.0, posinf=0.0, neginf=0.0)
+    return_10m = np.nan_to_num(return_10m, nan=0.0, posinf=0.0, neginf=0.0)
+    vwap_distance = np.nan_to_num(vwap_distance, nan=0.0, posinf=0.0, neginf=0.0)
+    volume_delta = np.nan_to_num(volume_delta, nan=0.0, posinf=0.0, neginf=0.0)
 
-    return returns, log_returns, rolling_vol, vwap, rsi, macd, momentum
+    return (
+        returns,
+        log_returns,
+        rolling_vol,
+        vwap,
+        rsi,
+        macd,
+        momentum,
+        return_5m,
+        return_10m,
+        vwap_distance,
+        volume_delta,
+    )
 
 
 def _time_features(bars: Sequence[SessionMinuteBar]) -> Tuple[np.ndarray, ...]:
@@ -244,6 +282,10 @@ def build_session_feature_matrix(
         rsi,
         macd,
         momentum,
+        return_5m,
+        return_10m,
+        vwap_distance,
+        volume_delta,
     ) = _price_and_volatility_features(closes, vols)
 
     atr_window = getattr(settings, "BAR_ATR_WINDOW", 14)
@@ -253,12 +295,16 @@ def build_session_feature_matrix(
         ordered
     )
 
-    # Stack all features: OHLCV + derived + time + ATR + close_zscore
+    # Stack all features: OHLCV + returns (1m/5m/10m), rolling_vol, VWAP distance, volume delta, ATR, etc.
     derived_cols = np.stack(
         [
-            returns,
+            returns,        # 1m return
             log_returns,
+            return_5m,
+            return_10m,
             rolling_vol,
+            vwap_distance,
+            volume_delta,
             vwap,
             rsi,
             macd,

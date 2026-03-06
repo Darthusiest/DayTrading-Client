@@ -83,12 +83,14 @@ class Settings(BaseSettings):
     BAR_REBUILD_CACHE: bool = os.getenv("BAR_REBUILD_CACHE", "False").lower() == "true"
     BAR_EARLY_STOP_PATIENCE: int = int(os.getenv("BAR_EARLY_STOP_PATIENCE", "5"))
     BAR_EARLY_STOP_MIN_DELTA: float = float(os.getenv("BAR_EARLY_STOP_MIN_DELTA", "0.0"))
-    # Early stop and best checkpoint: "direction_5m_macro_f1" (default) or "direction_5m_accuracy" (higher is better).
-    BAR_EARLY_STOP_METRIC: str = os.getenv("BAR_EARLY_STOP_METRIC", "direction_5m_macro_f1")
+    # Early stop and best checkpoint. Higher-is-better: direction_5m_macro_f1, direction_5m_accuracy, breakout_10m_accuracy.
+    # Lower-is-better (we negate): price_rmse, volatility_10m_rmse.
+    BAR_EARLY_STOP_METRIC: str = os.getenv("BAR_EARLY_STOP_METRIC", "breakout_10m_accuracy")
     # Lookback window (bars). 15–30 recommended for next-minute; 120–240 for direction-focused runs.
     BAR_LOOKBACK: int = int(os.getenv("BAR_LOOKBACK", "30"))
-    # dir5 (5m direction): threshold for up/down. Sideways if |ret_5m| <= threshold. Smaller = fewer sideways (rarer, cleaner).
-    BAR_DIR5_THRESHOLD: float = float(os.getenv("BAR_DIR5_THRESHOLD", "0.001"))
+    # dir5 (5m direction): threshold for up/down. Sideways if |ret_5m| < threshold. Smaller = fewer sideways (rarer).
+    # 0.0003 = 0.03% (only very small 5m returns count as sideways).
+    BAR_DIR5_THRESHOLD: float = float(os.getenv("BAR_DIR5_THRESHOLD", "0.0003"))
     # 5m direction head: 0 = single linear, >0 = hidden size for 2-layer MLP (e.g. 128).
     BAR_DIR5_HEAD_HIDDEN: int = int(os.getenv("BAR_DIR5_HEAD_HIDDEN", "128"))
     # Label smoothing for direction CrossEntropy (e.g. 0.1); can help 3-class accuracy.
@@ -97,8 +99,8 @@ class Settings(BaseSettings):
     BAR_DIR5_MINORITY_WEIGHT_SCALE: float = float(os.getenv("BAR_DIR5_MINORITY_WEIGHT_SCALE", "1.5"))
     # Confidence threshold for direction: if max(prob) >= this and argmax in {down,up}, use that class; else predict sideways. 0 = raw argmax.
     BAR_DIR5_CONFIDENCE_THRESHOLD: float = float(os.getenv("BAR_DIR5_CONFIDENCE_THRESHOLD", "0.0"))
-    # Focal loss for direction: when True use focal loss instead of CE. Gamma down-weights easy examples.
-    BAR_DIR5_USE_FOCAL: bool = os.getenv("BAR_DIR5_USE_FOCAL", "False").lower() == "true"
+    # Focal loss for direction (recommended for imbalanced down/sideways/up): down-weights easy examples.
+    BAR_DIR5_USE_FOCAL: bool = os.getenv("BAR_DIR5_USE_FOCAL", "True").lower() == "true"
     BAR_DIR5_FOCAL_GAMMA: float = float(os.getenv("BAR_DIR5_FOCAL_GAMMA", "2.0"))
     # Breakout: require move beyond recent range by > k * ATR to count as breakout.
     BAR_BREAKOUT_ATR_K: float = float(os.getenv("BAR_BREAKOUT_ATR_K", "1.0"))
@@ -109,10 +111,10 @@ class Settings(BaseSettings):
     BAR_NORMALIZE_INPUTS_EXPANDING: bool = os.getenv("BAR_NORMALIZE_INPUTS_EXPANDING", "False").lower() == "true"
     BAR_NORMALIZE_RETURN_TARGET: bool = os.getenv("BAR_NORMALIZE_RETURN_TARGET", "False").lower() == "true"
     BAR_NORMALIZE_VOL_TARGET: bool = os.getenv("BAR_NORMALIZE_VOL_TARGET", "False").lower() == "true"
-    # Multi-task loss weights (direction head often needs higher weight to compete with return regression).
-    BAR_LOSS_WEIGHT_PRICE: float = float(os.getenv("BAR_LOSS_WEIGHT_PRICE", "1.0"))
-    BAR_LOSS_WEIGHT_DIR5: float = float(os.getenv("BAR_LOSS_WEIGHT_DIR5", "6.0"))
-    BAR_LOSS_WEIGHT_VOL: float = float(os.getenv("BAR_LOSS_WEIGHT_VOL", "0.5"))
+    # Multi-task loss weights: breakout + volatility as primary; price/direction auxiliary.
+    BAR_LOSS_WEIGHT_PRICE: float = float(os.getenv("BAR_LOSS_WEIGHT_PRICE", "0.3"))
+    BAR_LOSS_WEIGHT_DIR5: float = float(os.getenv("BAR_LOSS_WEIGHT_DIR5", "0.3"))
+    BAR_LOSS_WEIGHT_VOL: float = float(os.getenv("BAR_LOSS_WEIGHT_VOL", "2.0"))
     BAR_LOSS_WEIGHT_BREAKOUT: float = float(os.getenv("BAR_LOSS_WEIGHT_BREAKOUT", "2.0"))
     # Staged training: "all", "heads_only", or "direction_first" (train only direction head for BAR_DIR5_FIRST_EPOCHS then unfreeze all).
     BAR_TRAIN_PHASE: str = os.getenv("BAR_TRAIN_PHASE", "all")
@@ -120,6 +122,8 @@ class Settings(BaseSettings):
     BAR_DIR5_FIRST_EPOCHS: int = int(os.getenv("BAR_DIR5_FIRST_EPOCHS", "3"))
     # After training, tune confidence threshold on val for max macro-F1 and save in metrics (default False).
     BAR_DIR5_TUNE_THRESHOLD: bool = os.getenv("BAR_DIR5_TUNE_THRESHOLD", "False").lower() == "true"
+    # When True, load existing next_minute_lstm.pt (if present) and continue training from it.
+    BAR_RESUME_FROM_CHECKPOINT: bool = os.getenv("BAR_RESUME_FROM_CHECKPOINT", "False").lower() == "true"
     IMAGE_SIZE: tuple[int, int] = (224, 224)
     VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
     TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)

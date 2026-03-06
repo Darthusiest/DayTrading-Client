@@ -68,11 +68,13 @@ TEST_RATIO = getattr(settings, "BAR_TEST_SPLIT", 0.1)
 USE_CACHE = getattr(settings, "BAR_CACHE_DATASET", True)
 REBUILD_CACHE = getattr(settings, "BAR_REBUILD_CACHE", False)
 CACHE_PATH = settings.MODELS_DIR / "next_minute_dataset.pt"
-# Bump when bar feature set changes (e.g. ATR + close_zscore) so old caches are invalidated.
-FEATURE_VERSION = 2
+# Bump when bar feature set changes (e.g. 5m/10m return, VWAP distance, volume delta) so old caches are invalidated.
+FEATURE_VERSION = 3
 EARLY_STOP_PATIENCE = getattr(settings, "BAR_EARLY_STOP_PATIENCE", 5)
 EARLY_STOP_MIN_DELTA = getattr(settings, "BAR_EARLY_STOP_MIN_DELTA", 0.0)
-EARLY_STOP_METRIC = getattr(settings, "BAR_EARLY_STOP_METRIC", "direction_5m_macro_f1")
+EARLY_STOP_METRIC = getattr(settings, "BAR_EARLY_STOP_METRIC", "breakout_10m_accuracy")
+# For these metrics lower is better; we negate so "best" is still max.
+EARLY_STOP_LOWER_IS_BETTER = frozenset({"price_rmse", "volatility_10m_rmse"})
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -835,6 +837,18 @@ def main() -> None:
         print(f"5m direction head: 2-layer MLP (hidden={config.direction_head_hidden}) for better accuracy.")
     model = NextMinuteBarLSTM(config).to(DEVICE)
 
+    # Optional: continue from previous training (load saved checkpoint if present)
+    models_dir = settings.MODELS_DIR
+    ckpt_path = models_dir / "next_minute_lstm.pt"
+    resume_from_checkpoint = getattr(settings, "BAR_RESUME_FROM_CHECKPOINT", False)
+    if resume_from_checkpoint and ckpt_path.is_file():
+        try:
+            state = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+            model.load_state_dict(state, strict=True)
+            print(f"Resumed from checkpoint: {ckpt_path}")
+        except Exception as e:
+            print(f"Could not load checkpoint (architecture may have changed): {e}. Training from scratch.")
+
     dir5_first_epochs = getattr(settings, "BAR_DIR5_FIRST_EPOCHS", 3)
     if train_phase == "heads_only":
         for p in model.lstm.parameters():
@@ -994,19 +1008,26 @@ def main() -> None:
         history_train_rmse.append(train_rmse)
         history_val.append(dict(val_metrics))
 
-        # Track best model by validation direction metric (higher is better) and early stopping
-        current_val = val_metrics.get(EARLY_STOP_METRIC, -math.inf)
-        if isinstance(current_val, float) and not math.isnan(current_val) and current_val > best_val_metric:
-            best_val_metric = current_val
-            best_val_metric_value = current_val
+        # Track best model by validation metric and early stopping (negate lower-is-better metrics so we always maximize)
+        raw_val = val_metrics.get(EARLY_STOP_METRIC)
+        if raw_val is None or (isinstance(raw_val, float) and math.isnan(raw_val)):
+            current_val_compare = -math.inf
+        elif EARLY_STOP_METRIC in EARLY_STOP_LOWER_IS_BETTER:
+            current_val_compare = -float(raw_val)
+        else:
+            current_val_compare = float(raw_val)
+        if current_val_compare > best_val_metric:
+            best_val_metric = current_val_compare
+            best_val_metric_value = raw_val if isinstance(raw_val, (int, float)) else current_val_compare
             best_state = model.state_dict()
             epochs_without_improve = 0
         else:
             epochs_without_improve += 1
         if epochs_without_improve >= EARLY_STOP_PATIENCE:
+            best_str = f"{best_val_metric_value:.4f}" if best_val_metric_value is not None else "n/a"
             print(
                 f"Early stopping triggered after {epoch + 1} epochs "
-                f"(no improvement in val {EARLY_STOP_METRIC} for {EARLY_STOP_PATIENCE} epochs; best={best_val_metric_value:.4f})."
+                f"(no improvement in val {EARLY_STOP_METRIC} for {EARLY_STOP_PATIENCE} epochs; best={best_str})."
             )
             break
 
@@ -1033,9 +1054,7 @@ def main() -> None:
     val_summary = _evaluate(model, val_loader, direction_confidence_threshold) if val_loader is not None else None
     test_summary = _evaluate(model, test_loader, direction_confidence_threshold) if test_loader is not None else None
 
-    models_dir = settings.MODELS_DIR
     models_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = models_dir / "next_minute_lstm.pt"
     torch.save(model.state_dict(), ckpt_path)
 
     metrics = {
@@ -1070,26 +1089,26 @@ def main() -> None:
     if history_epochs and history_val:
         print(f"  Training curves:  {models_dir / 'training_curves.png'}")
     print()
-    print("  Validation metrics:")
+    print("  Validation metrics (breakout + volatility primary):")
     if val_summary:
-        print(f"    price_mae:                    {val_summary.get('price_mae', float('nan')):.4f}")
+        print(f"    breakout_10m_accuracy:       {val_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
+        print(f"    volatility_10m_rmse:         {val_summary.get('volatility_10m_rmse', float('nan')):.4f}")
+        print(f"    price_mae:                   {val_summary.get('price_mae', float('nan')):.4f}")
         print(f"    price_rmse:                  {val_summary.get('price_rmse', float('nan')):.4f}")
         print(f"    direction_5m_accuracy:       {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
         print(f"    direction_5m_macro_f1:       {val_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
         print(f"    direction_5m_balanced_acc:   {val_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
-        print(f"    volatility_10m_rmse:        {val_summary.get('volatility_10m_rmse', float('nan')):.4f}")
-        print(f"    breakout_10m_accuracy:       {val_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
         print(f"    samples:                     {val_summary.get('samples', 0):,}")
     print()
-    print("  Test metrics:")
+    print("  Test metrics (breakout + volatility primary):")
     if test_summary:
-        print(f"    price_mae:                    {test_summary.get('price_mae', float('nan')):.4f}")
-        print(f"    price_rmse:                   {test_summary.get('price_rmse', float('nan')):.4f}")
+        print(f"    breakout_10m_accuracy:       {test_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
+        print(f"    volatility_10m_rmse:         {test_summary.get('volatility_10m_rmse', float('nan')):.4f}")
+        print(f"    price_mae:                   {test_summary.get('price_mae', float('nan')):.4f}")
+        print(f"    price_rmse:                  {test_summary.get('price_rmse', float('nan')):.4f}")
         print(f"    direction_5m_accuracy:       {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
         print(f"    direction_5m_macro_f1:       {test_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
         print(f"    direction_5m_balanced_acc:   {test_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
-        print(f"    volatility_10m_rmse:         {test_summary.get('volatility_10m_rmse', float('nan')):.4f}")
-        print(f"    breakout_10m_accuracy:       {test_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
         print(f"    samples:                     {test_summary.get('samples', 0):,}")
     print("=" * 60)
 

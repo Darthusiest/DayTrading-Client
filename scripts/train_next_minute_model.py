@@ -79,6 +79,15 @@ EARLY_STOP_LOWER_IS_BETTER = frozenset({"price_rmse", "volatility_10m_rmse"})
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _progress_bar(done: int, total: int, width: int = 28) -> str:
+    """Return a compact ASCII progress bar."""
+    if total <= 0:
+        return "[" + ("-" * width) + "]"
+    done = max(0, min(done, total))
+    filled = int(round(width * (done / total)))
+    return "[" + ("=" * filled) + ("-" * (width - filled)) + "]"
+
+
 def _direction_predict_with_confidence(
     logits: torch.Tensor,
     confidence_threshold: float,
@@ -525,7 +534,12 @@ def _build_sequences(
         # Lightweight progress indicator for sequence-building phase
         if total_sessions and (session_idx % max(1, total_sessions // 20) == 0 or session_idx == total_sessions - 1):
             pct = (session_idx + 1) / total_sessions * 100.0
-            print(f"Sequence build progress: {session_idx + 1}/{total_sessions} sessions ({pct:.1f}%)", end="\r", flush=True)
+            bar = _progress_bar(session_idx + 1, total_sessions)
+            print(
+                f"Sequence build {bar} {pct:5.1f}%  ({session_idx + 1}/{total_sessions} sessions)",
+                end="\r",
+                flush=True,
+            )
 
     if total_sessions:
         print()  # move to next line after progress output
@@ -1054,6 +1068,18 @@ def _run_one_fold(
             epoch_loss += loss.item() * tgt_price.numel()
             n_seen += tgt_price.numel()
             global_step += 1
+            # Lightweight progress bar (print ~10x per epoch)
+            if num_batches:
+                if batch_idx % max(1, num_batches // 10) == 0 or batch_idx == num_batches:
+                    pct = global_step / total_steps * 100.0
+                    bar = _progress_bar(global_step, total_steps)
+                    print(
+                        f"Train {bar} {pct:5.1f}%  (epoch {epoch + 1}/{EPOCHS}, batch {batch_idx}/{num_batches})",
+                        end="\r",
+                        flush=True,
+                    )
+        if num_batches:
+            print()  # newline after epoch progress bar
         train_rmse = math.sqrt(epoch_loss / max(1, n_seen))
         val_metrics = _evaluate(model, val_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes) if val_loader is not None else {"direction_5m_accuracy": float("nan")}
         history_epochs.append(epoch + 1)

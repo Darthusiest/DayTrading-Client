@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     BAR_DIR5_OVERSAMPLE_MINORITY: bool = os.getenv("BAR_DIR5_OVERSAMPLE_MINORITY", "True").lower() == "true"
     # When True, assign whole sessions to train/val/test (no leakage across split boundaries).
     BAR_VALIDATION_SPLIT_BY_SESSION: bool = os.getenv("BAR_VALIDATION_SPLIT_BY_SESSION", "True").lower() == "true"
+    # Walk-forward: train on rolling window, test on next period; use best fold for final model.
+    BAR_WALK_FORWARD: bool = os.getenv("BAR_WALK_FORWARD", "False").lower() == "true"
+    BAR_WF_TRAIN_DAYS: int = int(os.getenv("BAR_WF_TRAIN_DAYS", "365"))  # e.g. 1 year
+    BAR_WF_TEST_DAYS: int = int(os.getenv("BAR_WF_TEST_DAYS", "90"))  # e.g. 3 months
+    BAR_WF_SLIDE_DAYS: int = int(os.getenv("BAR_WF_SLIDE_DAYS", "90"))  # slide by this many days each fold
+    BAR_WF_VAL_RATIO: float = float(os.getenv("BAR_WF_VAL_RATIO", "0.1"))  # val = last 10% of train sessions per fold
     # 5m direction head: 0 = single linear, >0 = hidden size for 2-layer MLP (e.g. 128).
     BAR_DIR5_HEAD_HIDDEN: int = int(os.getenv("BAR_DIR5_HEAD_HIDDEN", "128"))
     # Label smoothing for direction CrossEntropy (e.g. 0.1); can help 3-class accuracy.

@@ -35,8 +35,9 @@ import json
 import math
 import sys
 from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -606,6 +607,60 @@ def _plot_training_curves(
     print(f"Saved training curves to: {save_path}")
 
 
+def _plot_walk_forward_summary(
+    fold_results: List[Dict],
+    save_path: Path,
+    metric_key: str = "direction_5m_accuracy",
+) -> None:
+    """Plot per-fold test metrics (e.g. direction accuracy) and summary table for walk-forward."""
+    if not fold_results:
+        return
+    n_folds = len(fold_results)
+    fold_labels = [f"Fold {r['fold_idx']+1}\n{r.get('test_start', '')[:7]}" for r in fold_results]
+    accs = [r.get("test_summary", {}).get(metric_key, float("nan")) for r in fold_results]
+    accs = [a if not math.isnan(a) else 0.0 for a in accs]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle("Walk-forward: per-fold test metrics", fontsize=12, fontweight="bold")
+    axes[0].bar(range(n_folds), accs, color="steelblue", edgecolor="black", linewidth=0.5)
+    axes[0].set_xticks(range(n_folds))
+    axes[0].set_xticklabels(fold_labels, fontsize=8, rotation=15)
+    axes[0].set_ylabel(metric_key)
+    axes[0].set_title(f"Test {metric_key} per fold")
+    axes[0].set_ylim(0, 1.0)
+    axes[0].axhline(y=0.8, color="gray", linestyle="--", alpha=0.7, label="80% target")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    # Table: fold | train_end | test_start | test_end | direction_acc | ...
+    table_data = []
+    for r in fold_results:
+        ts = r.get("test_summary") or {}
+        table_data.append([
+            str(r.get("fold_idx", "") + 1),
+            r.get("train_end", "")[:10],
+            r.get("test_start", "")[:10],
+            r.get("test_end", "")[:10],
+            f"{ts.get('direction_5m_accuracy', float('nan')):.3f}",
+            f"{ts.get('direction_5m_macro_f1', float('nan')):.3f}",
+            f"{ts.get('breakout_10m_accuracy', float('nan')):.3f}",
+        ])
+    axes[1].axis("off")
+    table = axes[1].table(
+        cellText=table_data,
+        colLabels=["Fold", "Train end", "Test start", "Test end", "Dir acc", "Macro F1", "Breakout acc"],
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.2, 1.8)
+    axes[1].set_title("Per-fold test summary")
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"Saved walk-forward summary to: {save_path}")
+
+
 def _time_split_indices(n: int, val_ratio: float, test_ratio: float) -> Tuple[range, range, range]:
     """Return (train_idx, val_idx, test_idx) ranges for chronological split."""
     n_val = max(1, int(n * val_ratio)) if n >= 10 else max(0, int(n * val_ratio))
@@ -617,6 +672,84 @@ def _time_split_indices(n: int, val_ratio: float, test_ratio: float) -> Tuple[ra
     train_idx = range(0, n_train)
     val_idx = range(n_train, n_train + n_val)
     test_idx = range(n_train + n_val, n)
+    return train_idx, val_idx, test_idx
+
+
+def _nan_to_none(obj):
+    """Recursively replace float nan with None for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _nan_to_none(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_nan_to_none(x) for x in obj]
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    return obj
+
+
+def _parse_session_date(s: str):
+    """Parse session_date string YYYY-MM-DD to date."""
+    return datetime.strptime(s.strip()[:10], "%Y-%m-%d").date()
+
+
+def _walk_forward_fold_ranges(
+    sessions: List[Tuple[str, str]],
+    train_days: int,
+    test_days: int,
+    slide_days: int,
+) -> List[Tuple[Set[int], Set[int], str, str, str, str]]:
+    """
+    Return list of (train_session_ids, test_session_ids, train_start, train_end, test_start, test_end) per fold.
+    Sessions are (symbol, session_date_str) in chronological order; session index i = sessions[i].
+    """
+    if not sessions or train_days <= 0 or test_days <= 0 or slide_days <= 0:
+        return []
+    dates = [_parse_session_date(s[1]) for s in sessions]
+    min_date = min(dates)
+    max_date = max(dates)
+    folds: List[Tuple[Set[int], Set[int], str, str, str, str]] = []
+    f = 0
+    while True:
+        train_start = min_date + timedelta(days=f * slide_days)
+        train_end = train_start + timedelta(days=train_days)
+        test_start = train_end
+        test_end = test_start + timedelta(days=test_days)
+        if test_end > max_date:
+            break
+        train_sids = {i for i in range(len(sessions)) if train_start <= dates[i] < train_end}
+        test_sids = {i for i in range(len(sessions)) if test_start <= dates[i] < test_end}
+        if not train_sids or not test_sids:
+            f += 1
+            continue
+        folds.append(
+            (
+                train_sids,
+                test_sids,
+                train_start.isoformat(),
+                train_end.isoformat(),
+                test_start.isoformat(),
+                test_end.isoformat(),
+            )
+        )
+        f += 1
+    return folds
+
+
+def _wf_split_indices(
+    n: int,
+    session_id_per_sample: torch.Tensor,
+    train_session_ids: Set[int],
+    test_session_ids: Set[int],
+    val_ratio: float,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Return train_idx, val_idx, test_idx for one WF fold. Val = last val_ratio of train sessions."""
+    sid = session_id_per_sample.detach().cpu().numpy()
+    ordered_train = sorted(train_session_ids)
+    n_val_sess = max(0, int(round(val_ratio * len(ordered_train))))
+    val_sids = set(ordered_train[-n_val_sess:]) if n_val_sess else set()
+    train_only_sids = set(ordered_train[: len(ordered_train) - n_val_sess]) if n_val_sess else set(ordered_train)
+    train_idx = [i for i in range(n) if sid[i] in train_only_sids]
+    val_idx = [i for i in range(n) if sid[i] in val_sids]
+    test_idx = [i for i in range(n) if sid[i] in test_session_ids]
     return train_idx, val_idx, test_idx
 
 
@@ -759,6 +892,211 @@ def _evaluate(
     }
 
 
+def _run_one_fold(
+    sequences: torch.Tensor,
+    targets_price: torch.Tensor,
+    targets_dir5: torch.Tensor,
+    targets_vol10: torch.Tensor,
+    targets_breakout: torch.Tensor,
+    train_idx: List[int],
+    val_idx: List[int],
+    test_idx: List[int],
+    num_dir_classes: int,
+    resume_state: Optional[dict] = None,
+    fold_label: str = "",
+) -> Tuple[
+    Optional[dict],
+    Optional[Dict[str, float]],
+    Optional[Dict[str, float]],
+    List[int],
+    List[float],
+    List[Dict[str, float]],
+    float,
+    Optional[float],
+]:
+    """Train one fold; return (best_state, val_summary, test_summary, history_epochs, history_train_rmse, history_val, direction_confidence_threshold, best_val_metric_value)."""
+    train_dataset = NextMinuteBarDataset(
+        sequences[train_idx],
+        targets_price[train_idx],
+        targets_dir5[train_idx],
+        targets_vol10[train_idx],
+        targets_breakout[train_idx],
+    )
+    val_dataset = (
+        NextMinuteBarDataset(
+            sequences[val_idx],
+            targets_price[val_idx],
+            targets_dir5[val_idx],
+            targets_vol10[val_idx],
+            targets_breakout[val_idx],
+        )
+        if len(val_idx)
+        else None
+    )
+    test_dataset = (
+        NextMinuteBarDataset(
+            sequences[test_idx],
+            targets_price[test_idx],
+            targets_dir5[test_idx],
+            targets_vol10[test_idx],
+            targets_breakout[test_idx],
+        )
+        if len(test_idx)
+        else None
+    )
+    train_dir5 = targets_dir5[train_idx]
+    train_dir5_np = train_dir5.numpy() if hasattr(train_dir5, "numpy") else np.asarray(train_dir5)
+    dir5_counts = np.bincount(train_dir5_np.astype(int), minlength=num_dir_classes)
+    dir5_total = int(dir5_counts.sum())
+    dir5_weights = np.ones(num_dir_classes, dtype="float32")
+    for c in range(num_dir_classes):
+        if dir5_counts[c] > 0:
+            dir5_weights[c] = dir5_total / (float(num_dir_classes) * dir5_counts[c])
+    minority_scale = getattr(settings, "BAR_DIR5_MINORITY_WEIGHT_SCALE", 1.0)
+    if minority_scale != 1.0:
+        dir5_weights[0] *= minority_scale
+        dir5_weights[num_dir_classes - 1] *= minority_scale
+    dir5_weight_tensor = torch.from_numpy(dir5_weights).to(DEVICE)
+    oversample_minority = getattr(settings, "BAR_DIR5_OVERSAMPLE_MINORITY", False)
+    if oversample_minority:
+        weights_per_class = 1.0 / (dir5_counts.astype(np.float64) + 1e-8)
+        sample_weights = weights_per_class[train_dir5_np.astype(int)]
+        train_sampler = WeightedRandomSampler(
+            torch.from_numpy(sample_weights.astype(np.float32)), num_samples=len(sample_weights)
+        )
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler)
+    else:
+        train_sampler = None
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_brk = targets_breakout[train_idx]
+    train_brk_np = train_brk.numpy() if hasattr(train_brk, "numpy") else np.asarray(train_brk)
+    brk_pos = int((train_brk_np >= 0.5).sum())
+    brk_neg = int(train_brk_np.size - brk_pos)
+    brk_pos_weight = torch.tensor([brk_neg / max(1, brk_pos)], dtype=torch.float32, device=DEVICE) if brk_pos > 0 else None
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False) if val_dataset else None
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False) if test_dataset else None
+    input_size = sequences.size(2)
+    config = NextMinuteModelConfig(input_size=input_size, num_dir_classes=num_dir_classes)
+    model = NextMinuteBarLSTM(config).to(DEVICE)
+    if resume_state is not None:
+        model.load_state_dict(resume_state, strict=True)
+    loss_w_price = getattr(settings, "BAR_LOSS_WEIGHT_PRICE", 1.0)
+    loss_w_dir5 = getattr(settings, "BAR_LOSS_WEIGHT_DIR5", 2.0)
+    loss_w_vol = getattr(settings, "BAR_LOSS_WEIGHT_VOL", 0.5)
+    loss_w_brk = getattr(settings, "BAR_LOSS_WEIGHT_BREAKOUT", 2.0)
+    train_phase = getattr(settings, "BAR_TRAIN_PHASE", "all")
+    dir5_first_epochs = getattr(settings, "BAR_DIR5_FIRST_EPOCHS", 3)
+    if train_phase == "direction_first":
+        for p in model.lstm.parameters():
+            p.requires_grad = False
+        for p in model.trunk.parameters():
+            p.requires_grad = False
+        for p in model.price_head.parameters():
+            p.requires_grad = False
+        for p in model.vol10_head.parameters():
+            p.requires_grad = False
+        for p in model.breakout_head.parameters():
+            p.requires_grad = False
+    dir5_label_smoothing = getattr(settings, "BAR_DIR5_LABEL_SMOOTHING", 0.0)
+    dir5_use_focal = getattr(settings, "BAR_DIR5_USE_FOCAL", False)
+    dir5_focal_gamma = getattr(settings, "BAR_DIR5_FOCAL_GAMMA", 2.0)
+    if dir5_use_focal:
+        criterion_dir5 = _FocalLoss(weight=dir5_weight_tensor, gamma=dir5_focal_gamma).to(DEVICE)
+    else:
+        criterion_dir5 = nn.CrossEntropyLoss(weight=dir5_weight_tensor, label_smoothing=dir5_label_smoothing)
+    if train_phase == "direction_first":
+        optimizer = optim.Adam([p for p in model.dir5_head.parameters() if p.requires_grad], lr=LEARNING_RATE)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion_price = nn.MSELoss()
+    criterion_vol10 = nn.MSELoss()
+    criterion_brk = nn.BCEWithLogitsLoss(pos_weight=brk_pos_weight) if brk_pos_weight is not None else nn.BCEWithLogitsLoss()
+    direction_confidence_threshold = getattr(settings, "BAR_DIR5_CONFIDENCE_THRESHOLD", 0.0)
+    best_val_metric = -math.inf
+    best_val_metric_value = None
+    best_state = None
+    epochs_without_improve = 0
+    history_epochs = []
+    history_train_rmse = []
+    history_val = []
+    num_batches = len(train_loader)
+    total_steps = max(1, EPOCHS * num_batches)
+    global_step = 0
+    for epoch in range(EPOCHS):
+        if train_phase == "direction_first" and epoch == dir5_first_epochs:
+            for p in model.parameters():
+                p.requires_grad = True
+            optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        model.train()
+        epoch_loss = 0.0
+        n_seen = 0
+        direction_only = train_phase == "direction_first" and epoch < dir5_first_epochs
+        for batch_idx, batch in enumerate(train_loader, start=1):
+            seq = batch["sequence"].to(DEVICE)
+            tgt_price = batch["target_price"].to(DEVICE)
+            tgt_dir5 = batch["target_dir5"].to(DEVICE)
+            tgt_vol10 = batch["target_vol10"].to(DEVICE)
+            tgt_brk = batch["target_breakout"].to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(seq)
+            loss_dir5 = criterion_dir5(outputs["dir5_logits"], tgt_dir5)
+            if direction_only:
+                loss = loss_w_dir5 * loss_dir5
+            else:
+                loss_price = criterion_price(outputs["price"], tgt_price)
+                loss_vol10 = criterion_vol10(outputs["vol10"], tgt_vol10)
+                loss_brk = criterion_brk(outputs["breakout"], tgt_brk)
+                loss = loss_w_price * loss_price + loss_w_dir5 * loss_dir5 + loss_w_vol * loss_vol10 + loss_w_brk * loss_brk
+            loss.backward()
+            if getattr(settings, "BAR_GRADIENT_CLIP_NORM", 0.0) > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), settings.BAR_GRADIENT_CLIP_NORM)
+            optimizer.step()
+            epoch_loss += loss.item() * tgt_price.numel()
+            n_seen += tgt_price.numel()
+            global_step += 1
+        train_rmse = math.sqrt(epoch_loss / max(1, n_seen))
+        val_metrics = _evaluate(model, val_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes) if val_loader is not None else {"direction_5m_accuracy": float("nan")}
+        history_epochs.append(epoch + 1)
+        history_train_rmse.append(train_rmse)
+        history_val.append(dict(val_metrics))
+        if val_loader is None:
+            raw_val = -train_rmse  # use negated train RMSE so lower is better
+            current_val_compare = -train_rmse
+        else:
+            raw_val = val_metrics.get(EARLY_STOP_METRIC)
+            if raw_val is None or (isinstance(raw_val, float) and math.isnan(raw_val)):
+                current_val_compare = -math.inf
+            elif EARLY_STOP_METRIC in EARLY_STOP_LOWER_IS_BETTER:
+                current_val_compare = -float(raw_val)
+            else:
+                current_val_compare = float(raw_val)
+        if current_val_compare > best_val_metric:
+            best_val_metric = current_val_compare
+            best_val_metric_value = raw_val
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+        if epochs_without_improve >= EARLY_STOP_PATIENCE:
+            break
+    if best_state is not None:
+        model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()}, strict=True)
+    tune_threshold = getattr(settings, "BAR_DIR5_TUNE_THRESHOLD", False)
+    if tune_threshold and val_loader is not None:
+        best_f1 = -1.0
+        best_th = 0.0
+        for th in [0.0, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]:
+            m = _evaluate(model, val_loader, direction_confidence_threshold=th, num_dir_classes=num_dir_classes)
+            f1 = m.get("direction_5m_macro_f1", -1.0)
+            if not math.isnan(f1) and f1 > best_f1:
+                best_f1 = f1
+                best_th = th
+        direction_confidence_threshold = best_th
+    val_summary = _evaluate(model, val_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes) if val_loader else None
+    test_summary = _evaluate(model, test_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes) if test_loader else None
+    return (best_state, val_summary, test_summary, history_epochs, history_train_rmse, history_val, direction_confidence_threshold, best_val_metric_value)
+
+
 def main() -> None:
     print("Loading SessionMinuteBar data...")
     bars = _load_bars()
@@ -878,6 +1216,144 @@ def main() -> None:
             )
             print(f"Saved dataset cache to {CACHE_PATH}.")
 
+    walk_forward = getattr(settings, "BAR_WALK_FORWARD", False)
+    wf_train_days = getattr(settings, "BAR_WF_TRAIN_DAYS", 365)
+    wf_test_days = getattr(settings, "BAR_WF_TEST_DAYS", 90)
+    wf_slide_days = getattr(settings, "BAR_WF_SLIDE_DAYS", 90)
+    wf_val_ratio = getattr(settings, "BAR_WF_VAL_RATIO", 0.1)
+
+    if walk_forward and session_id_per_sample is not None and sessions is not None:
+        folds = _walk_forward_fold_ranges(sessions, wf_train_days, wf_test_days, wf_slide_days)
+        if not folds:
+            print("Walk-forward: no folds generated (need enough calendar range). Falling back to single split.")
+            walk_forward = False
+        else:
+            print(
+                f"Walk-forward: {len(folds)} folds (train={wf_train_days}d, test={wf_test_days}d, slide={wf_slide_days}d)"
+            )
+
+    if walk_forward and session_id_per_sample is not None and sessions is not None and folds:
+        # --- Walk-forward: train one fold at a time, keep best by test direction accuracy ---
+        models_dir = settings.MODELS_DIR
+        models_dir.mkdir(parents=True, exist_ok=True)
+        wf_results: List[Dict] = []
+        for fold_idx, (train_sids, test_sids, train_start, train_end, test_start, test_end) in enumerate(folds):
+            print()
+            print("=" * 60)
+            print(f"  WF Fold {fold_idx + 1}/{len(folds)}  train {train_start} -> {train_end}  test {test_start} -> {test_end}")
+            print("=" * 60)
+            train_idx, val_idx, test_idx = _wf_split_indices(
+                n, session_id_per_sample, train_sids, test_sids, wf_val_ratio
+            )
+            if len(train_idx) < BATCH_SIZE or len(test_idx) == 0:
+                print(f"Skipping fold {fold_idx + 1}: too few train or test samples.")
+                continue
+            # Single-fold training (no resume)
+            best_state, val_summary, test_summary, history_epochs, history_train_rmse, history_val, dct, _ = _run_one_fold(
+                sequences,
+                targets_price,
+                targets_dir5,
+                targets_vol10,
+                targets_breakout,
+                train_idx,
+                val_idx,
+                test_idx,
+                num_dir_classes,
+                resume_state=None,
+                fold_label=f"Fold {fold_idx+1}/{len(folds)}",
+            )
+            fold_ckpt = models_dir / f"wf_fold_{fold_idx}.pt"
+            if best_state is not None:
+                torch.save(best_state, fold_ckpt)
+            wf_results.append({
+                "fold_idx": fold_idx,
+                "train_start": train_start,
+                "train_end": train_end,
+                "test_start": test_start,
+                "test_end": test_end,
+                "val_summary": val_summary,
+                "test_summary": test_summary,
+                "history_epochs": history_epochs,
+                "history_train_rmse": history_train_rmse,
+                "history_val": history_val,
+                "direction_confidence_threshold": dct,
+            })
+        if not wf_results:
+            print("No walk-forward folds completed. Exiting.")
+            return
+        best_fold_idx = max(
+            range(len(wf_results)),
+            key=lambda i: (wf_results[i].get("test_summary") or {}).get("direction_5m_accuracy", -1.0)
+            if wf_results[i].get("test_summary") else -1.0,
+        )
+        print()
+        print(f"Best fold by test direction_5m_accuracy: Fold {best_fold_idx + 1} (of {len(wf_results)})")
+        fold_ckpt = models_dir / f"wf_fold_{best_fold_idx}.pt"
+        if fold_ckpt.is_file():
+            state = torch.load(fold_ckpt, map_location=DEVICE, weights_only=True)
+            input_size = sequences.size(2)
+            config = NextMinuteModelConfig(input_size=input_size, num_dir_classes=num_dir_classes)
+            model = NextMinuteBarLSTM(config).to(DEVICE)
+            model.load_state_dict(state, strict=True)
+            ckpt_path = models_dir / "next_minute_lstm.pt"
+            torch.save(model.state_dict(), ckpt_path)
+        r = wf_results[best_fold_idx]
+        val_summary = r.get("val_summary")
+        test_summary = r.get("test_summary")
+        direction_confidence_threshold = r.get("direction_confidence_threshold", 0.0)
+        metrics = {
+            "lookback": LOOKBACK,
+            "batch_size": BATCH_SIZE,
+            "epochs": EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            "early_stop_metric": EARLY_STOP_METRIC,
+            "direction_confidence_threshold": direction_confidence_threshold,
+            "val": val_summary,
+            "test": test_summary,
+            "walk_forward": True,
+            "wf_train_days": wf_train_days,
+            "wf_test_days": wf_test_days,
+            "wf_slide_days": wf_slide_days,
+            "wf_folds": [
+                {
+                    "fold_idx": x["fold_idx"],
+                    "train_end": x["train_end"],
+                    "test_start": x["test_start"],
+                    "test_end": x["test_end"],
+                    "test_direction_5m_accuracy": (x.get("test_summary") or {}).get("direction_5m_accuracy"),
+                    "test_direction_5m_macro_f1": (x.get("test_summary") or {}).get("direction_5m_macro_f1"),
+                    "test_breakout_10m_accuracy": (x.get("test_summary") or {}).get("breakout_10m_accuracy"),
+                }
+                for x in wf_results
+            ],
+            "best_fold": best_fold_idx,
+        }
+        metrics_path = models_dir / "next_minute_metrics.json"
+        with metrics_path.open("w") as f:
+            json.dump(_nan_to_none(metrics), f, indent=2)
+        if r.get("history_epochs") and r.get("history_val"):
+            _plot_training_curves(
+                r["history_epochs"],
+                r["history_train_rmse"],
+                r["history_val"],
+                models_dir / "training_curves.png",
+            )
+        _plot_walk_forward_summary(
+            [{"fold_idx": x["fold_idx"], "test_start": x["test_start"], "test_end": x["test_end"], "train_end": x["train_end"], "test_summary": x.get("test_summary")} for x in wf_results],
+            models_dir / "wf_summary.png",
+        )
+        print("  Validation metrics (best fold, direction primary):")
+        if val_summary:
+            print(f"    direction_5m_accuracy:       {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+            print(f"    direction_5m_macro_f1:       {val_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
+        print("  Test metrics (best fold):")
+        if test_summary:
+            print(f"    direction_5m_accuracy:       {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+            print(f"    direction_5m_macro_f1:       {test_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
+        print(f"  WF summary plot: {models_dir / 'wf_summary.png'}")
+        print("=" * 60)
+        return
+    # --- Single split (non-WF) ---
     split_by_session = getattr(settings, "BAR_VALIDATION_SPLIT_BY_SESSION", True)
     if split_by_session and session_id_per_sample is not None and sessions is not None:
         train_idx, val_idx, test_idx = _session_split_indices(
@@ -894,336 +1370,31 @@ def main() -> None:
             f"(VAL_RATIO={VAL_RATIO}, TEST_RATIO={TEST_RATIO})"
         )
 
-    train_dataset = NextMinuteBarDataset(
-        sequences[train_idx],
-        targets_price[train_idx],
-        targets_dir5[train_idx],
-        targets_vol10[train_idx],
-        targets_breakout[train_idx],
-    )
-    val_dataset = (
-        NextMinuteBarDataset(
-            sequences[val_idx],
-            targets_price[val_idx],
-            targets_dir5[val_idx],
-            targets_vol10[val_idx],
-            targets_breakout[val_idx],
-        )
-        if len(val_idx)
-        else None
-    )
-    test_dataset = (
-        NextMinuteBarDataset(
-            sequences[test_idx],
-            targets_price[test_idx],
-            targets_dir5[test_idx],
-            targets_vol10[test_idx],
-            targets_breakout[test_idx],
-        )
-        if len(test_idx)
-        else None
-    )
-
-    # 5m direction class distribution (train) and balanced weights
-    train_dir5 = targets_dir5[train_idx]
-    if hasattr(train_dir5, "numpy"):
-        train_dir5_np = train_dir5.numpy()
-    else:
-        train_dir5_np = np.asarray(train_dir5)
-    dir5_counts = np.bincount(train_dir5_np.astype(int), minlength=num_dir_classes)
-    dir5_total = int(dir5_counts.sum())
-    if num_dir_classes == 2:
-        print(
-            f"5m direction class distribution (train): down={dir5_counts[0]}, up={dir5_counts[1]} "
-            f"(total={dir5_total}, 2-class)"
-        )
-    else:
-        print(
-            f"5m direction class distribution (train): down={dir5_counts[0]}, sideways={dir5_counts[1]}, up={dir5_counts[2]} "
-            f"(total={dir5_total})"
-        )
-    # Inverse frequency weights; optionally scale up minority (down=0, up=1 or 2)
-    dir5_weights = np.ones(num_dir_classes, dtype="float32")
-    for c in range(num_dir_classes):
-        if dir5_counts[c] > 0:
-            dir5_weights[c] = dir5_total / (float(num_dir_classes) * dir5_counts[c])
-    minority_scale = getattr(settings, "BAR_DIR5_MINORITY_WEIGHT_SCALE", 1.0)
-    if minority_scale != 1.0:
-        dir5_weights[0] *= minority_scale  # down
-        dir5_weights[num_dir_classes - 1] *= minority_scale  # up
-    dir5_weight_tensor = torch.from_numpy(dir5_weights).to(DEVICE)
-
-    # Optional: oversample minority direction classes in training
-    oversample_minority = getattr(settings, "BAR_DIR5_OVERSAMPLE_MINORITY", False)
-    if oversample_minority:
-        weights_per_class = 1.0 / (dir5_counts.astype(np.float64) + 1e-8)
-        sample_weights = weights_per_class[train_dir5_np.astype(int)]
-        train_sampler = WeightedRandomSampler(
-            torch.from_numpy(sample_weights.astype(np.float32)),
-            num_samples=len(sample_weights),
-        )
-        train_loader = DataLoader(
-            train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler
-        )
-        print("Training with WeightedRandomSampler (oversampling minority direction classes).")
-    else:
-        train_sampler = None
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-    # Breakout class balance (train) and pos_weight for BCE
-    train_brk = targets_breakout[train_idx]
-    if hasattr(train_brk, "numpy"):
-        train_brk_np = train_brk.numpy()
-    else:
-        train_brk_np = np.asarray(train_brk)
-    brk_pos = int((train_brk_np >= 0.5).sum())
-    brk_neg = int(train_brk_np.size - brk_pos)
-    print(f"10m breakout class balance (train): pos={brk_pos}, neg={brk_neg} (pos_rate={brk_pos / max(1, train_brk_np.size):.3f})")
-    brk_pos_weight = torch.tensor([brk_neg / max(1, brk_pos)], dtype=torch.float32, device=DEVICE) if brk_pos > 0 else None
-
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False) if val_dataset else None
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False) if test_dataset else None
-
-    input_size = sequences.size(2)
-    config = NextMinuteModelConfig(input_size=input_size, num_dir_classes=num_dir_classes)
-    if getattr(config, "direction_head_hidden", 0) > 0:
-        print(
-            f"5m direction head: 2-layer MLP (hidden={config.direction_head_hidden}, "
-            f"num_classes={num_dir_classes}) for better accuracy."
-        )
-    model = NextMinuteBarLSTM(config).to(DEVICE)
-
-    # Optional: continue from previous training (load saved checkpoint if present)
     models_dir = settings.MODELS_DIR
     ckpt_path = models_dir / "next_minute_lstm.pt"
-    resume_from_checkpoint = getattr(settings, "BAR_RESUME_FROM_CHECKPOINT", False)
-    if resume_from_checkpoint and ckpt_path.is_file():
+    resume_state = None
+    if getattr(settings, "BAR_RESUME_FROM_CHECKPOINT", False) and ckpt_path.is_file():
         try:
-            state = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
-            model.load_state_dict(state, strict=True)
-            print(f"Resumed from checkpoint: {ckpt_path}")
+            resume_state = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+            print(f"Resuming from checkpoint: {ckpt_path}")
         except Exception as e:
-            print(f"Could not load checkpoint (architecture may have changed): {e}. Training from scratch.")
-
-    dir5_first_epochs = getattr(settings, "BAR_DIR5_FIRST_EPOCHS", 3)
-    if train_phase == "heads_only":
-        for p in model.lstm.parameters():
-            p.requires_grad = False
-        for p in model.trunk.parameters():
-            p.requires_grad = False
-        for p in model.price_head.parameters():
-            p.requires_grad = False
-        for p in model.vol10_head.parameters():
-            p.requires_grad = False
-        print("Staged training: frozen trunk, price_head, vol10_head; training dir5 and breakout heads only.")
-    elif train_phase == "direction_first":
-        for p in model.lstm.parameters():
-            p.requires_grad = False
-        for p in model.trunk.parameters():
-            p.requires_grad = False
-        for p in model.price_head.parameters():
-            p.requires_grad = False
-        for p in model.vol10_head.parameters():
-            p.requires_grad = False
-        for p in model.breakout_head.parameters():
-            p.requires_grad = False
-        print(f"Direction-first: training only direction head for {dir5_first_epochs} epochs, then unfreezing all.")
-
-    dir5_label_smoothing = getattr(settings, "BAR_DIR5_LABEL_SMOOTHING", 0.0)
-    dir5_use_focal = getattr(settings, "BAR_DIR5_USE_FOCAL", False)
-    dir5_focal_gamma = getattr(settings, "BAR_DIR5_FOCAL_GAMMA", 2.0)
-    if dir5_use_focal:
-        criterion_dir5 = _FocalLoss(weight=dir5_weight_tensor, gamma=dir5_focal_gamma).to(DEVICE)
-        print(f"5m direction loss: Focal (gamma={dir5_focal_gamma}) with class weights.")
-    else:
-        criterion_dir5 = nn.CrossEntropyLoss(
-            weight=dir5_weight_tensor,
-            label_smoothing=dir5_label_smoothing,
-        )
-    # Optimizer: only direction head params when direction_first (first N epochs)
-    if train_phase == "direction_first":
-        optimizer = optim.Adam(
-            [p for p in model.dir5_head.parameters() if p.requires_grad],
-            lr=LEARNING_RATE,
-        )
-    else:
-        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion_price = nn.MSELoss()
-    criterion_vol10 = nn.MSELoss()
-    criterion_brk = (
-        nn.BCEWithLogitsLoss(pos_weight=brk_pos_weight) if brk_pos_weight is not None else nn.BCEWithLogitsLoss()
+            print(f"Could not load checkpoint: {e}. Training from scratch.")
+    best_state, val_summary, test_summary, history_epochs, history_train_rmse, history_val, direction_confidence_threshold, best_val_metric_value = _run_one_fold(
+        sequences,
+        targets_price,
+        targets_dir5,
+        targets_vol10,
+        targets_breakout,
+        train_idx,
+        val_idx,
+        test_idx,
+        num_dir_classes,
+        resume_state=resume_state,
+        fold_label="",
     )
-
-    print(
-        f"Training NextMinuteBarLSTM on device={DEVICE} for {EPOCHS} epochs "
-        f"(batch_size={BATCH_SIZE}, lr={LEARNING_RATE})"
-    )
-
-    # Early stop and best checkpoint on direction metric (higher is better)
-    best_val_metric = -math.inf
-    best_val_metric_value: Optional[float] = None
-    best_state = None
-    epochs_without_improve = 0
-    direction_confidence_threshold = getattr(settings, "BAR_DIR5_CONFIDENCE_THRESHOLD", 0.0)
-
-    # Per-epoch history for training curves
-    history_epochs: List[int] = []
-    history_train_rmse: List[float] = []
-    history_val: List[Dict[str, float]] = []
-
-    num_batches = len(train_loader)
-    total_steps = max(1, EPOCHS * num_batches)
-    global_step = 0
-
-    for epoch in range(EPOCHS):
-        # After direction_first phase, unfreeze all and switch to full multitask
-        if train_phase == "direction_first" and epoch == dir5_first_epochs:
-            for p in model.parameters():
-                p.requires_grad = True
-            optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-            print(f"Unfrozen all parameters; switching to full multi-task training from epoch {epoch + 1}.")
-
-        model.train()
-        epoch_loss = 0.0
-        n_seen = 0
-        direction_only = train_phase == "direction_first" and epoch < dir5_first_epochs
-        print(f"Epoch {epoch + 1}/{EPOCHS} starting...")
-
-        for batch_idx, batch in enumerate(train_loader, start=1):
-            seq = batch["sequence"].to(DEVICE)
-            tgt_price = batch["target_price"].to(DEVICE)
-            tgt_dir5 = batch["target_dir5"].to(DEVICE)
-            tgt_vol10 = batch["target_vol10"].to(DEVICE)
-            tgt_brk = batch["target_breakout"].to(DEVICE)
-
-            optimizer.zero_grad()
-            outputs = model(seq)
-
-            loss_dir5 = criterion_dir5(outputs["dir5_logits"], tgt_dir5)
-            if direction_only:
-                loss = loss_w_dir5 * loss_dir5
-            else:
-                loss_price = criterion_price(outputs["price"], tgt_price)
-                loss_vol10 = criterion_vol10(outputs["vol10"], tgt_vol10)
-                loss_brk = criterion_brk(outputs["breakout"], tgt_brk)
-                loss = (
-                    loss_w_price * loss_price
-                    + loss_w_dir5 * loss_dir5
-                    + loss_w_vol * loss_vol10
-                    + loss_w_brk * loss_brk
-                )
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item() * tgt_price.numel()
-            n_seen += tgt_price.numel()
-
-            # Global training progress across all epochs/batches
-            global_step += 1
-            if num_batches:
-                if batch_idx % max(1, num_batches // 10) == 0 or batch_idx == num_batches:
-                    pct = global_step / total_steps * 100.0
-                    print(
-                        f"Training progress: epoch {epoch + 1}/{EPOCHS}, "
-                        f"batch {batch_idx}/{num_batches} "
-                        f"({pct:.1f}% overall)",
-                        end="\r",
-                        flush=True,
-                    )
-
-        print()  # newline after epoch's batch-level progress
-
-        train_mse = epoch_loss / max(1, n_seen)
-        train_rmse = math.sqrt(train_mse)
-
-        val_metrics = {
-            "price_mae": float("nan"),
-            "price_rmse": float("nan"),
-            "direction_5m_accuracy": float("nan"),
-            "direction_5m_macro_f1": float("nan"),
-            "direction_5m_balanced_accuracy": float("nan"),
-            "volatility_10m_rmse": float("nan"),
-            "breakout_10m_accuracy": float("nan"),
-            "samples": 0,
-        }
-        if val_loader is not None:
-            val_metrics = _evaluate(
-                model, val_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes
-            )
-
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS} "
-            f"| train_rmse={train_rmse:.5f} "
-            f"| val_price_rmse={val_metrics['price_rmse']:.5f} "
-            f"| val_direction_5m_acc={val_metrics['direction_5m_accuracy']:.4f} "
-            f"| val_direction_5m_macro_f1={val_metrics['direction_5m_macro_f1']:.4f} "
-            f"| val_volatility_10m_rmse={val_metrics['volatility_10m_rmse']:.5f} "
-            f"| val_breakout_10m_acc={val_metrics['breakout_10m_accuracy']:.4f}"
-        )
-
-        # Record history for plots
-        history_epochs.append(epoch + 1)
-        history_train_rmse.append(train_rmse)
-        history_val.append(dict(val_metrics))
-
-        # Track best model by validation metric and early stopping (negate lower-is-better metrics so we always maximize)
-        raw_val = val_metrics.get(EARLY_STOP_METRIC)
-        if raw_val is None or (isinstance(raw_val, float) and math.isnan(raw_val)):
-            current_val_compare = -math.inf
-        elif EARLY_STOP_METRIC in EARLY_STOP_LOWER_IS_BETTER:
-            current_val_compare = -float(raw_val)
-        else:
-            current_val_compare = float(raw_val)
-        if current_val_compare > best_val_metric:
-            best_val_metric = current_val_compare
-            best_val_metric_value = raw_val if isinstance(raw_val, (int, float)) else current_val_compare
-            best_state = model.state_dict()
-            epochs_without_improve = 0
-        else:
-            epochs_without_improve += 1
-        if epochs_without_improve >= EARLY_STOP_PATIENCE:
-            best_str = f"{best_val_metric_value:.4f}" if best_val_metric_value is not None else "n/a"
-            print(
-                f"Early stopping triggered after {epoch + 1} epochs "
-                f"(no improvement in val {EARLY_STOP_METRIC} for {EARLY_STOP_PATIENCE} epochs; best={best_str})."
-            )
-            break
-
-    # Use best validation model (if we found one)
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    # Optional: tune confidence threshold on validation for max macro-F1
-    tune_threshold = getattr(settings, "BAR_DIR5_TUNE_THRESHOLD", False)
-    if tune_threshold and val_loader is not None:
-        thresholds = [0.0, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
-        best_f1 = -1.0
-        best_th = 0.0
-        for th in thresholds:
-            m = _evaluate(
-                model, val_loader, direction_confidence_threshold=th, num_dir_classes=num_dir_classes
-            )
-            f1 = m.get("direction_5m_macro_f1", -1.0)
-            if not math.isnan(f1) and f1 > best_f1:
-                best_f1 = f1
-                best_th = th
-        direction_confidence_threshold = best_th
-        print(f"Tuned confidence threshold on val: {best_th} (macro-F1={best_f1:.4f}).")
-
-    print("Evaluating on validation and test sets...")
-    val_summary = (
-        _evaluate(model, val_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes)
-        if val_loader is not None
-        else None
-    )
-    test_summary = (
-        _evaluate(model, test_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes)
-        if test_loader is not None
-        else None
-    )
-
     models_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), ckpt_path)
+    if best_state is not None:
+        torch.save(best_state, ckpt_path)
 
     metrics = {
         "lookback": LOOKBACK,
@@ -1237,11 +1408,11 @@ def main() -> None:
     }
     if best_val_metric_value is not None:
         metrics["best_val_metric_value"] = best_val_metric_value
-    if tune_threshold:
+    if getattr(settings, "BAR_DIR5_TUNE_THRESHOLD", False):
         metrics["direction_confidence_threshold_tuned"] = True
     metrics_path = models_dir / "next_minute_metrics.json"
     with metrics_path.open("w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(_nan_to_none(metrics), f, indent=2)
 
     if history_epochs and history_val:
         curves_path = models_dir / "training_curves.png"

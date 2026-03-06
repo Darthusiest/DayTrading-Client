@@ -1,43 +1,46 @@
-# Build/install
+# DayTrade – install everything for server (clone + pip install -r requirements.txt)
+# Python 3.10+ recommended (3.13 compatible)
+
+# Build
 setuptools>=60,<82
 
-# FastAPI and web server
+# API & server
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
-pydantic>=2.9.0  # Updated for Python 3.13 compatibility
+pydantic>=2.9.0
 pydantic-settings>=2.5.0
 
-# Database
-sqlalchemy>=2.0.36  # 2.0.36+ required for Python 3.13
-psycopg[binary]>=3.2.2  # Updated for Python 3.13 compatibility
+# Database (PostgreSQL)
+sqlalchemy>=2.0.36
+psycopg[binary]>=3.2.2
 alembic==1.12.1
 
-# Machine Learning
-torch>=2.6.0  # Updated for Python 3.13 compatibility
+# ML & training (next-minute LSTM, price predictor, curves)
+torch>=2.6.0
 torchvision>=0.21.0
-numpy>=1.26.0,<2  # 1.x required for opencv-python 4.8 ABI compatibility
-matplotlib>=3.7.0  # Validation curves (loss / accuracy)
-Pillow>=10.4.0  # Updated for Python 3.13 compatibility
+numpy>=1.26.0,<2
+matplotlib>=3.7.0
+Pillow>=10.4.0
 opencv-python==4.8.1.78
 
-# Data processing
+# Data & time
 pytz==2023.3
 python-dateutil==2.8.2
 
-# Web scraping / screenshot capture
+# Screenshot / scraping (optional for data collection)
 selenium==4.15.2
 webdriver-manager==4.0.1
 
-# Databento (batch .dbn.zst ingestion; includes zstandard)
+# Databento (OHLCV ingestion; includes zstandard)
 databento>=0.71.0
 
-# Utilities
+# Scheduler & env
 python-dotenv==1.0.0
 requests==2.31.0
-APScheduler>=3.10.0  # Scheduled data collection (6:30 / 8:00 AM PST)
+APScheduler>=3.10.0
 
-# Development and testing
+# Dev & tests (optional on server; needed for pytest)
 pytest==7.4.3
 pytest-asyncio==0.21.1
 httpx>=0.25.0,<0.28.0

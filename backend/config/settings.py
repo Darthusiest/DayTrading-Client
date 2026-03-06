@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     BAR_EARLY_STOP_MIN_DELTA: float = float(os.getenv("BAR_EARLY_STOP_MIN_DELTA", "0.0"))
     # Early stop and best checkpoint. Higher-is-better: direction_5m_macro_f1, direction_5m_accuracy, breakout_10m_accuracy.
     # Lower-is-better (we negate): price_rmse, volatility_10m_rmse.
-    BAR_EARLY_STOP_METRIC: str = os.getenv("BAR_EARLY_STOP_METRIC", "breakout_10m_accuracy")
+    BAR_EARLY_STOP_METRIC: str = os.getenv("BAR_EARLY_STOP_METRIC", "direction_5m_accuracy")
     # Lookback window (bars). 15–30 recommended for next-minute; 120–240 for direction-focused runs.
     BAR_LOOKBACK: int = int(os.getenv("BAR_LOOKBACK", "30"))
     # dir5 (5m direction): threshold for up/down. Sideways if |ret_5m| < threshold. Smaller = fewer sideways (rarer).
@@ -94,10 +94,10 @@ class Settings(BaseSettings):
     # Volatility-adjusted band: when > 0, sideways iff |ret_5m| < max(BAR_DIR5_MIN_BAND, BAR_DIR5_THRESHOLD_ATR_K * ATR_i/close_i).
     BAR_DIR5_THRESHOLD_ATR_K: float = float(os.getenv("BAR_DIR5_THRESHOLD_ATR_K", "0.0"))
     BAR_DIR5_MIN_BAND: float = float(os.getenv("BAR_DIR5_MIN_BAND", "0.0001"))
-    # When True, drop sideways samples and train binary up vs down (0=down, 1=up); direction head has 2 outputs.
-    BAR_DIR5_TWO_CLASS: bool = os.getenv("BAR_DIR5_TWO_CLASS", "False").lower() == "true"
+    # When True, drop sideways samples and train binary up vs down (0=down, 1=up); direction head has 2 outputs. Recommended for ~80% direction accuracy.
+    BAR_DIR5_TWO_CLASS: bool = os.getenv("BAR_DIR5_TWO_CLASS", "True").lower() == "true"
     # When True, oversample minority direction classes (down/up) in training via WeightedRandomSampler.
-    BAR_DIR5_OVERSAMPLE_MINORITY: bool = os.getenv("BAR_DIR5_OVERSAMPLE_MINORITY", "False").lower() == "true"
+    BAR_DIR5_OVERSAMPLE_MINORITY: bool = os.getenv("BAR_DIR5_OVERSAMPLE_MINORITY", "True").lower() == "true"
     # When True, assign whole sessions to train/val/test (no leakage across split boundaries).
     BAR_VALIDATION_SPLIT_BY_SESSION: bool = os.getenv("BAR_VALIDATION_SPLIT_BY_SESSION", "True").lower() == "true"
     # 5m direction head: 0 = single linear, >0 = hidden size for 2-layer MLP (e.g. 128).
@@ -121,15 +121,15 @@ class Settings(BaseSettings):
     BAR_NORMALIZE_INPUTS_EXPANDING: bool = os.getenv("BAR_NORMALIZE_INPUTS_EXPANDING", "False").lower() == "true"
     BAR_NORMALIZE_RETURN_TARGET: bool = os.getenv("BAR_NORMALIZE_RETURN_TARGET", "False").lower() == "true"
     BAR_NORMALIZE_VOL_TARGET: bool = os.getenv("BAR_NORMALIZE_VOL_TARGET", "False").lower() == "true"
-    # Multi-task loss weights: breakout + volatility as primary; price/direction auxiliary.
+    # Multi-task loss weights: direction-focused default for ~80% direction accuracy; increase DIR5, decrease others.
     BAR_LOSS_WEIGHT_PRICE: float = float(os.getenv("BAR_LOSS_WEIGHT_PRICE", "0.3"))
-    BAR_LOSS_WEIGHT_DIR5: float = float(os.getenv("BAR_LOSS_WEIGHT_DIR5", "0.3"))
+    BAR_LOSS_WEIGHT_DIR5: float = float(os.getenv("BAR_LOSS_WEIGHT_DIR5", "2.0"))
     BAR_LOSS_WEIGHT_VOL: float = float(os.getenv("BAR_LOSS_WEIGHT_VOL", "2.0"))
     BAR_LOSS_WEIGHT_BREAKOUT: float = float(os.getenv("BAR_LOSS_WEIGHT_BREAKOUT", "2.0"))
     # Staged training: "all", "heads_only", or "direction_first" (train only direction head for BAR_DIR5_FIRST_EPOCHS then unfreeze all).
-    BAR_TRAIN_PHASE: str = os.getenv("BAR_TRAIN_PHASE", "all")
+    BAR_TRAIN_PHASE: str = os.getenv("BAR_TRAIN_PHASE", "direction_first")
     # When BAR_TRAIN_PHASE=direction_first, number of epochs to train only the direction head before unfreezing.
-    BAR_DIR5_FIRST_EPOCHS: int = int(os.getenv("BAR_DIR5_FIRST_EPOCHS", "3"))
+    BAR_DIR5_FIRST_EPOCHS: int = int(os.getenv("BAR_DIR5_FIRST_EPOCHS", "5"))
     # After training, tune confidence threshold on val for max macro-F1 and save in metrics (default False).
     BAR_DIR5_TUNE_THRESHOLD: bool = os.getenv("BAR_DIR5_TUNE_THRESHOLD", "False").lower() == "true"
     # When True, load existing next_minute_lstm.pt (if present) and continue training from it.

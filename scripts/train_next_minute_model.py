@@ -72,7 +72,7 @@ CACHE_PATH = settings.MODELS_DIR / "next_minute_dataset.pt"
 FEATURE_VERSION = 4
 EARLY_STOP_PATIENCE = getattr(settings, "BAR_EARLY_STOP_PATIENCE", 5)
 EARLY_STOP_MIN_DELTA = getattr(settings, "BAR_EARLY_STOP_MIN_DELTA", 0.0)
-EARLY_STOP_METRIC = getattr(settings, "BAR_EARLY_STOP_METRIC", "breakout_10m_accuracy")
+EARLY_STOP_METRIC = getattr(settings, "BAR_EARLY_STOP_METRIC", "direction_5m_accuracy")
 # For these metrics lower is better; we negate so "best" is still max.
 EARLY_STOP_LOWER_IS_BETTER = frozenset({"price_rmse", "volatility_10m_rmse"})
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1257,15 +1257,15 @@ def main() -> None:
     if history_epochs and history_val:
         print(f"  Training curves:  {models_dir / 'training_curves.png'}")
     print()
-    print("  Validation metrics (breakout + volatility primary):")
+    print("  Validation metrics (direction primary, target ~80%):")
     if val_summary:
+        print(f"    direction_5m_accuracy:       {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+        print(f"    direction_5m_macro_f1:       {val_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
+        print(f"    direction_5m_balanced_acc:   {val_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
         print(f"    breakout_10m_accuracy:       {val_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
         print(f"    volatility_10m_rmse:         {val_summary.get('volatility_10m_rmse', float('nan')):.4f}")
         print(f"    price_mae:                   {val_summary.get('price_mae', float('nan')):.4f}")
         print(f"    price_rmse:                  {val_summary.get('price_rmse', float('nan')):.4f}")
-        print(f"    direction_5m_accuracy:       {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
-        print(f"    direction_5m_macro_f1:       {val_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
-        print(f"    direction_5m_balanced_acc:   {val_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
         dir_names = ["down", "up"] if num_dir_classes == 2 else ["down", "sideways", "up"]
         for name, prec, rec, f1 in zip(
             dir_names,
@@ -1276,15 +1276,15 @@ def main() -> None:
             print(f"      {name}: P={prec:.4f} R={rec:.4f} F1={f1:.4f}")
         print(f"    samples:                     {val_summary.get('samples', 0):,}")
     print()
-    print("  Test metrics (breakout + volatility primary):")
+    print("  Test metrics (direction primary, target ~80%):")
     if test_summary:
+        print(f"    direction_5m_accuracy:       {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
+        print(f"    direction_5m_macro_f1:       {test_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
+        print(f"    direction_5m_balanced_acc:   {test_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
         print(f"    breakout_10m_accuracy:       {test_summary.get('breakout_10m_accuracy', float('nan')):.4f}")
         print(f"    volatility_10m_rmse:         {test_summary.get('volatility_10m_rmse', float('nan')):.4f}")
         print(f"    price_mae:                   {test_summary.get('price_mae', float('nan')):.4f}")
         print(f"    price_rmse:                  {test_summary.get('price_rmse', float('nan')):.4f}")
-        print(f"    direction_5m_accuracy:       {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
-        print(f"    direction_5m_macro_f1:       {test_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
-        print(f"    direction_5m_balanced_acc:   {test_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
         dir_names = ["down", "up"] if num_dir_classes == 2 else ["down", "sideways", "up"]
         for name, prec, rec, f1 in zip(
             dir_names,
@@ -1294,6 +1294,13 @@ def main() -> None:
         ):
             print(f"      {name}: P={prec:.4f} R={rec:.4f} F1={f1:.4f}")
         print(f"    samples:                     {test_summary.get('samples', 0):,}")
+        # Direction accuracy target (~80% for trading focus)
+        dir_acc = test_summary.get("direction_5m_accuracy", float("nan"))
+        target = 0.80
+        if not math.isnan(dir_acc):
+            met = "YES" if dir_acc >= target else "no"
+            print()
+            print(f"  Direction accuracy target: {target:.0%}  ->  test={dir_acc:.2%}  ({met})")
     print("=" * 60)
 
 

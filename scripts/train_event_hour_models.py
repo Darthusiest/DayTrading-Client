@@ -47,8 +47,8 @@ from backend.services.ml.event_hour import EventHourDataset, EventHourLSTM, Even
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Bump when event input feature set changes (e.g. enabling SMT columns) to avoid stale caches.
-EVENT_FEATURE_VERSION = 1
+# Bump when event input/labeling changes to avoid stale caches.
+EVENT_FEATURE_VERSION = 2
 
 
 def _nan_to_none(obj):
@@ -296,7 +296,8 @@ def _compute_binary_metrics(probs: np.ndarray, y: np.ndarray, threshold: float =
     }
 
 
-def _evaluate(model: nn.Module, loader: DataLoader) -> Dict[str, float]:
+def _predict_probs_and_targets(model: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Return (probs, y, avg_loss) for a loader."""
     model.eval()
     probs_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
@@ -315,12 +316,35 @@ def _evaluate(model: nn.Module, loader: DataLoader) -> Dict[str, float]:
             probs_list.append(probs)
             y_list.append(y.detach().cpu().numpy())
     if n == 0:
-        return {"loss": float("nan"), "accuracy": float("nan"), "f1": float("nan"), "samples": 0.0}
+        return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32), float("nan")
     probs = np.concatenate(probs_list, axis=0)
     y = np.concatenate(y_list, axis=0)
-    m = _compute_binary_metrics(probs, y, threshold=0.5)
-    m["loss"] = float(loss_sum / max(1, n))
+    return probs, y, float(loss_sum / max(1, n))
+
+
+def _evaluate(model: nn.Module, loader: DataLoader, threshold: float = 0.5) -> Dict[str, float]:
+    probs, y, avg_loss = _predict_probs_and_targets(model, loader)
+    if y.size == 0:
+        return {"loss": float("nan"), "accuracy": float("nan"), "f1": float("nan"), "samples": 0.0}
+    m = _compute_binary_metrics(probs, y, threshold=threshold)
+    m["loss"] = float(avg_loss)
+    m["threshold"] = float(threshold)
     return m
+
+
+def _tune_threshold_for_f1(probs: np.ndarray, y: np.ndarray) -> Tuple[float, Dict[str, float]]:
+    """Pick threshold that maximizes F1 on provided probs/y."""
+    best_th = 0.5
+    best = {"f1": -1.0}
+    if y.size == 0:
+        return best_th, best
+    for th in [x / 100.0 for x in range(5, 96, 5)]:  # 0.05..0.95
+        m = _compute_binary_metrics(probs, y, threshold=th)
+        f1 = m.get("f1", -1.0)
+        if not math.isnan(f1) and f1 > best.get("f1", -1.0):
+            best_th = th
+            best = m
+    return float(best_th), best
 
 
 def _plot_curves(history: List[Dict[str, float]], save_path: Path, title: str) -> None:
@@ -376,8 +400,13 @@ def _build_event_dataset(
     range_atr_k = float(getattr(settings, "EVENT_RANGE_ATR_K", 1.5))
     impulse_range_k = float(getattr(settings, "EVENT_IMPULSE_RANGE_ATR_K", 1.5))
     impulse_vol_z = float(getattr(settings, "EVENT_IMPULSE_VOL_Z", 2.0))
-    label_band_k = float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.8))
-    label_min_band = float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0006))
+    label_band_k = float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.5))
+    label_min_band = float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0003))
+
+    # Continuation filter settings
+    cont_require_orb_bos = bool(getattr(settings, "EVENT_CONT_REQUIRE_ORB_AND_BOS", True))
+    cont_max_minutes = int(getattr(settings, "EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", 60))
+    cont_require_no_smt = bool(getattr(settings, "EVENT_CONT_REQUIRE_NO_SMT", True))
 
     # Triggers enabled
     enable_pdh = bool(getattr(settings, "EVENT_ENABLE_PDH_PDL", True))
@@ -399,6 +428,7 @@ def _build_event_dataset(
     seqs: List[np.ndarray] = []
     y_cont: List[float] = []
     y_rev: List[float] = []
+    cont_eligible_list: List[int] = []
     event_dir_list: List[int] = []
     event_type_list: List[int] = []
     session_id_list: List[int] = []
@@ -548,6 +578,31 @@ def _build_event_dataset(
             orb_high = float(np.max(highs[orb_idx])) if orb_idx else float("nan")
             orb_low = float(np.min(lows[orb_idx])) if orb_idx else float("nan")
 
+            # Precompute ORB/BOS first occurrences per direction for continuation setup filter
+            orb_up_idx_first: Optional[int] = None
+            orb_dn_idx_first: Optional[int] = None
+            if enable_orb and orb_idx:
+                for j in range(max(1, orb_idx[-1] + 1), n):
+                    if orb_up_idx_first is None and closes[j] > orb_high and closes[j - 1] <= orb_high:
+                        orb_up_idx_first = j
+                    if orb_dn_idx_first is None and closes[j] < orb_low and closes[j - 1] >= orb_low:
+                        orb_dn_idx_first = j
+                    if orb_up_idx_first is not None and orb_dn_idx_first is not None:
+                        break
+
+            bos_up_idx_first: Optional[int] = None
+            bos_dn_idx_first: Optional[int] = None
+            if enable_bos and bos_lookback > 1:
+                for j in range(bos_lookback, n):
+                    prev_swing_high = float(np.max(highs[j - bos_lookback : j]))
+                    prev_swing_low = float(np.min(lows[j - bos_lookback : j]))
+                    if bos_up_idx_first is None and closes[j] > prev_swing_high and closes[j - 1] <= prev_swing_high:
+                        bos_up_idx_first = j
+                    if bos_dn_idx_first is None and closes[j] < prev_swing_low and closes[j - 1] >= prev_swing_low:
+                        bos_dn_idx_first = j
+                    if bos_up_idx_first is not None and bos_dn_idx_first is not None:
+                        break
+
             fired = set()  # per-session dedupe keys
 
             prev_high, prev_low = prev_day_range.get(symbol, (float("nan"), float("nan")))
@@ -634,9 +689,32 @@ def _build_event_dataset(
                 for etype, edir in events:
                     cont = 1.0 if (sign != 0 and sign == edir) else 0.0
                     rev = 1.0 if (sign != 0 and sign == -edir) else 0.0
+                    # Continuation setup filter: require ORB+BOS same direction occurred within window
+                    cont_ok = True
+                    if cont_require_orb_bos:
+                        if edir > 0:
+                            oidx, bidx = orb_up_idx_first, bos_up_idx_first
+                        else:
+                            oidx, bidx = orb_dn_idx_first, bos_dn_idx_first
+                        if oidx is None or bidx is None:
+                            cont_ok = False
+                        else:
+                            if bidx < oidx:
+                                cont_ok = False
+                            elif (bidx - oidx) > cont_max_minutes:
+                                cont_ok = False
+                            elif i < bidx:
+                                cont_ok = False  # event must occur after BOS
+                    if cont_require_no_smt and enable_smt:
+                        # smt_cols last two columns are divergence flags
+                        if smt_cols[i, 4] > 0.5 or smt_cols[i, 5] > 0.5:
+                            cont_ok = False
                     seqs.append(window.astype("float32"))
-                    y_cont.append(cont)
+                    # If setup not eligible, drop the continuation label to 0 by construction.
+                    # Training will further filter by eligibility when building the continuation dataset.
+                    y_cont.append(cont if cont_ok else 0.0)
                     y_rev.append(rev)
+                    cont_eligible_list.append(1 if cont_ok else 0)
                     event_dir_list.append(1 if edir > 0 else 0)  # 1=up,0=down
                     event_type_list.append(int(etype))
                     session_id_list.append(int(session_idx))
@@ -650,6 +728,7 @@ def _build_event_dataset(
     sequences = torch.from_numpy(np.stack(seqs).astype("float32"))
     t_cont = torch.from_numpy(np.asarray(y_cont, dtype="float32"))
     t_rev = torch.from_numpy(np.asarray(y_rev, dtype="float32"))
+    cont_eligible = torch.from_numpy(np.asarray(cont_eligible_list, dtype="int64"))
     event_dir = torch.from_numpy(np.asarray(event_dir_list, dtype="int64"))
     event_type = torch.from_numpy(np.asarray(event_type_list, dtype="int64"))
     session_id = torch.from_numpy(np.asarray(session_id_list, dtype="int64"))
@@ -659,6 +738,7 @@ def _build_event_dataset(
         "sequences": sequences,
         "targets_cont": t_cont,
         "targets_rev": t_rev,
+        "cont_eligible": cont_eligible,
         "event_dir": event_dir,
         "event_type": event_type,
         "session_id": session_id,
@@ -671,6 +751,11 @@ def _build_event_dataset(
             "event_feature_version": EVENT_FEATURE_VERSION,
             "enable_smt": bool(enable_smt),
             "smt_lookback": int(smt_lookback),
+            "label_band_atr_k": float(label_band_k),
+            "label_min_band": float(label_min_band),
+            "cont_require_orb_bos": bool(cont_require_orb_bos),
+            "cont_max_minutes": int(cont_max_minutes),
+            "cont_require_no_smt": bool(cont_require_no_smt),
         },
     }
 
@@ -789,7 +874,11 @@ def _train_one(
             n_seen += int(t.numel())
         train_loss = loss_sum / max(1, n_seen)
 
-        val_metrics = _evaluate(model, val_loader) if val_loader is not None else {"f1": float("nan"), "accuracy": float("nan"), "loss": float("nan")}
+        val_metrics = (
+            _evaluate(model, val_loader, threshold=0.5)
+            if val_loader is not None
+            else {"f1": float("nan"), "accuracy": float("nan"), "loss": float("nan")}
+        )
         val_score = float(val_metrics.get(getattr(settings, "EVENT_EARLY_STOP_METRIC", "f1"), float("nan")))
         if not math.isnan(val_score) and val_score > best_val:
             best_val = val_score
@@ -819,8 +908,15 @@ def _train_one(
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
 
-    val_summary = _evaluate(model, val_loader) if val_loader is not None else None
-    test_summary = _evaluate(model, test_loader) if test_loader is not None else None
+    # Threshold tuning on validation to maximize F1 (for this model)
+    best_threshold = 0.5
+    val_at_0_5 = _evaluate(model, val_loader, threshold=0.5) if val_loader is not None else None
+    test_at_0_5 = _evaluate(model, test_loader, threshold=0.5) if test_loader is not None else None
+    if val_loader is not None:
+        probs_v, y_v, _ = _predict_probs_and_targets(model, val_loader)
+        best_threshold, _ = _tune_threshold_for_f1(probs_v, y_v)
+    val_summary = _evaluate(model, val_loader, threshold=best_threshold) if val_loader is not None else None
+    test_summary = _evaluate(model, test_loader, threshold=best_threshold) if test_loader is not None else None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / f"{model_name}.pt"
@@ -834,6 +930,10 @@ def _train_one(
         "lr": lr,
         "epochs": epochs,
         "early_stop_metric": getattr(settings, "EVENT_EARLY_STOP_METRIC", "f1"),
+        "threshold_tuned": True,
+        "best_threshold": float(best_threshold),
+        "val_at_0_5": val_at_0_5,
+        "test_at_0_5": test_at_0_5,
         "val": val_summary,
         "test": test_summary,
         "history": history,
@@ -864,6 +964,7 @@ def main() -> None:
         sequences = data["sequences"]
         targets_cont = data["targets_cont"]
         targets_rev = data["targets_rev"]
+        cont_eligible = data.get("cont_eligible")
         event_type = data["event_type"]
         event_dir = data["event_dir"]
         session_id = data["session_id"]
@@ -876,6 +977,22 @@ def main() -> None:
         if bool(meta.get("enable_smt")) != bool(getattr(settings, "EVENT_ENABLE_SMT", True)):
             print("Event dataset cache SMT setting mismatch; rebuilding.")
             rebuild = True
+        # Rebuild if label-band or continuation filter settings changed
+        if float(meta.get("label_band_atr_k", -1.0)) != float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.5)):
+            print("Event dataset cache label band mismatch; rebuilding.")
+            rebuild = True
+        if float(meta.get("label_min_band", -1.0)) != float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0003)):
+            print("Event dataset cache min band mismatch; rebuilding.")
+            rebuild = True
+        if bool(meta.get("cont_require_orb_bos", True)) != bool(getattr(settings, "EVENT_CONT_REQUIRE_ORB_AND_BOS", True)):
+            print("Event dataset cache continuation ORB+BOS setting mismatch; rebuilding.")
+            rebuild = True
+        if int(meta.get("cont_max_minutes", -1)) != int(getattr(settings, "EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", 60)):
+            print("Event dataset cache continuation window mismatch; rebuilding.")
+            rebuild = True
+        if bool(meta.get("cont_require_no_smt", True)) != bool(getattr(settings, "EVENT_CONT_REQUIRE_NO_SMT", True)):
+            print("Event dataset cache continuation SMT filter mismatch; rebuilding.")
+            rebuild = True
         print(f"Using cached event dataset: {cache_path} (N={sequences.size(0)})")
     if not cache_path.is_file() or rebuild:
         print(f"Building event dataset (lookback={lookback})...")
@@ -883,6 +1000,7 @@ def main() -> None:
         sequences = built["sequences"]
         targets_cont = built["targets_cont"]
         targets_rev = built["targets_rev"]
+        cont_eligible = built.get("cont_eligible")
         event_type = built["event_type"]
         event_dir = built["event_dir"]
         session_id = built["session_id"]
@@ -894,6 +1012,7 @@ def main() -> None:
                 "sequences": sequences,
                 "targets_cont": targets_cont,
                 "targets_rev": targets_rev,
+                "cont_eligible": cont_eligible,
                 "event_type": event_type,
                 "event_dir": event_dir,
                 "session_id": session_id,
@@ -907,6 +1026,8 @@ def main() -> None:
 
     if symbol_id is None:
         symbol_id = torch.zeros_like(session_id)
+    if cont_eligible is None:
+        cont_eligible = torch.ones_like(session_id)
     n_sessions = len(sessions) if isinstance(sessions, list) else int(session_id.max().item() + 1)
     val_ratio = float(getattr(settings, "EVENT_VAL_RATIO", 0.1))
     test_ratio = float(getattr(settings, "EVENT_TEST_RATIO", 0.1))
@@ -953,9 +1074,9 @@ def main() -> None:
                 event_dir,
                 session_id,
                 symbol_id,
-                train_idx,
-                val_idx,
-                test_idx,
+                [i for i in train_idx if int(cont_eligible[i].item()) == 1],
+                [i for i in val_idx if int(cont_eligible[i].item()) == 1],
+                [i for i in test_idx if int(cont_eligible[i].item()) == 1],
                 fold_out,
             )
             rev_metrics, rev_paths = _train_one(
@@ -1075,6 +1196,14 @@ def main() -> None:
     train_idx, val_idx, test_idx = _session_split(session_id, n_sessions, val_ratio=val_ratio, test_ratio=test_ratio)
     print(f"Split by session -> train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
+    # Continuation setup-specific filter: restrict continuation training to eligible subset
+    cont_train_idx = [i for i in train_idx if int(cont_eligible[i].item()) == 1]
+    cont_val_idx = [i for i in val_idx if int(cont_eligible[i].item()) == 1]
+    cont_test_idx = [i for i in test_idx if int(cont_eligible[i].item()) == 1]
+    print(
+        f"Continuation eligible -> train={len(cont_train_idx)}, val={len(cont_val_idx)}, test={len(cont_test_idx)}"
+    )
+
     print()
     print("=" * 60)
     print("Training continuation model...")
@@ -1087,9 +1216,9 @@ def main() -> None:
         event_dir,
         session_id,
         symbol_id,
-        train_idx,
-        val_idx,
-        test_idx,
+        cont_train_idx,
+        cont_val_idx,
+        cont_test_idx,
         out_dir,
     )
     print()

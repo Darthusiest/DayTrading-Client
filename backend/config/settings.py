@@ -144,9 +144,14 @@ class Settings(BaseSettings):
     EVENT_IMPULSE_RANGE_ATR_K: float = float(os.getenv("EVENT_IMPULSE_RANGE_ATR_K", "1.5"))
     EVENT_IMPULSE_VOL_Z: float = float(os.getenv("EVENT_IMPULSE_VOL_Z", "2.0"))
 
-    # Labeling band (avoid tiny 1-hour moves; makes targets less noisy)
-    EVENT_LABEL_BAND_ATR_K: float = float(os.getenv("EVENT_LABEL_BAND_ATR_K", "0.8"))
-    EVENT_LABEL_MIN_BAND: float = float(os.getenv("EVENT_LABEL_MIN_BAND", "0.0006"))
+    # Labeling band (avoid tiny 1-hour moves; makes targets less noisy). Lower = more positives.
+    EVENT_LABEL_BAND_ATR_K: float = float(os.getenv("EVENT_LABEL_BAND_ATR_K", "0.5"))
+    EVENT_LABEL_MIN_BAND: float = float(os.getenv("EVENT_LABEL_MIN_BAND", "0.0003"))
+
+    # Continuation setup filter (to reduce noise): require ORB+BOS same direction and no SMT divergence.
+    EVENT_CONT_REQUIRE_ORB_AND_BOS: bool = os.getenv("EVENT_CONT_REQUIRE_ORB_AND_BOS", "True").lower() == "true"
+    EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS: int = int(os.getenv("EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", "60"))
+    EVENT_CONT_REQUIRE_NO_SMT: bool = os.getenv("EVENT_CONT_REQUIRE_NO_SMT", "True").lower() == "true"
 
     # London session range (for fib scaling features). Times in session TZ (default America/New_York).
     EVENT_LONDON_START: str = os.getenv("EVENT_LONDON_START", "03:00")

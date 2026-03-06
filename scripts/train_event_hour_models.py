@@ -48,7 +48,7 @@ from backend.services.ml.event_hour import EventHourDataset, EventHourLSTM, Even
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Bump when event input/labeling changes to avoid stale caches.
-EVENT_FEATURE_VERSION = 2
+EVENT_FEATURE_VERSION = 3
 
 
 def _nan_to_none(obj):
@@ -59,6 +59,29 @@ def _nan_to_none(obj):
     if isinstance(obj, float) and math.isnan(obj):
         return None
     return obj
+
+
+class _BinaryFocalLoss(nn.Module):
+    """Binary focal loss: down-weights easy examples. alpha from pos_weight for imbalance."""
+
+    def __init__(self, pos_weight: Optional[torch.Tensor] = None, gamma: float = 2.0):
+        super().__init__()
+        self.pos_weight = float(pos_weight.item()) if pos_weight is not None else 1.0
+        self.gamma = gamma
+        self.alpha_pos = self.pos_weight / (1.0 + self.pos_weight)
+        self.alpha_neg = 1.0 - self.alpha_pos
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        eps = 1e-7
+        p = probs.clamp(eps, 1.0 - eps)
+        log_p = torch.log(p)
+        log_1mp = torch.log(1.0 - p)
+        pt = torch.where(targets >= 0.5, p, 1.0 - p)
+        focal_weight = (1.0 - pt) ** self.gamma
+        bce = -torch.where(targets >= 0.5, log_p, log_1mp)
+        alpha = torch.where(targets >= 0.5, self.alpha_pos, self.alpha_neg)
+        return (alpha * focal_weight * bce).mean()
 
 
 def _parse_hm(s: str) -> Tuple[int, int]:
@@ -298,9 +321,18 @@ def _compute_binary_metrics(probs: np.ndarray, y: np.ndarray, threshold: float =
 
 def _predict_probs_and_targets(model: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray, float]:
     """Return (probs, y, avg_loss) for a loader."""
+    probs, y, et, loss = _predict_probs_targets_event_type(model, loader)
+    return probs, y, loss
+
+
+def _predict_probs_targets_event_type(
+    model: nn.Module, loader: DataLoader
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], float]:
+    """Return (probs, y, event_type, avg_loss) for a loader. event_type is None if not in batch."""
     model.eval()
     probs_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
+    et_list: List[np.ndarray] = []
     loss_sum = 0.0
     n = 0
     criterion = nn.BCEWithLogitsLoss()
@@ -308,18 +340,28 @@ def _predict_probs_and_targets(model: nn.Module, loader: DataLoader) -> Tuple[np
         for batch in loader:
             x = batch["sequence"].to(DEVICE)
             y = batch["target"].to(DEVICE)
-            logits = model(x)
+            et = batch.get("event_type")
+            et = et.to(DEVICE) if et is not None else None
+            logits = model(x, event_type=et)
             loss = criterion(logits, y)
             loss_sum += float(loss.item()) * y.numel()
             n += int(y.numel())
             probs = torch.sigmoid(logits).detach().cpu().numpy()
             probs_list.append(probs)
             y_list.append(y.detach().cpu().numpy())
+            if et is not None:
+                et_list.append(et.detach().cpu().numpy())
     if n == 0:
-        return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32), float("nan")
+        return (
+            np.asarray([], dtype=np.float32),
+            np.asarray([], dtype=np.float32),
+            None,
+            float("nan"),
+        )
     probs = np.concatenate(probs_list, axis=0)
     y = np.concatenate(y_list, axis=0)
-    return probs, y, float(loss_sum / max(1, n))
+    event_type = np.concatenate(et_list, axis=0) if et_list else None
+    return probs, y, event_type, float(loss_sum / max(1, n))
 
 
 def _evaluate(model: nn.Module, loader: DataLoader, threshold: float = 0.5) -> Dict[str, float]:
@@ -345,6 +387,96 @@ def _tune_threshold_for_f1(probs: np.ndarray, y: np.ndarray) -> Tuple[float, Dic
             best_th = th
             best = m
     return float(best_th), best
+
+
+# Event type id -> metric group for per-event-type reporting (PDH/PDL, ORB, BOS, ATR, IMP)
+EVENT_TYPE_TO_METRIC_GROUP = {
+    1: "PDH_PDL",
+    2: "PDH_PDL",
+    3: "ORB",
+    4: "ORB",
+    5: "ATR",
+    6: "ATR",
+    7: "IMP",
+    8: "IMP",
+    9: "BOS",
+    10: "BOS",
+}
+MIN_SAMPLES_PER_EVENT_GROUP = 10
+
+
+def _compute_binary_metrics_by_event_type(
+    probs: np.ndarray,
+    y: np.ndarray,
+    event_type: Optional[np.ndarray],
+    threshold: float = 0.5,
+) -> Dict[str, Dict[str, float]]:
+    """Compute precision, recall, F1 per event group. Returns {} if event_type is None or group has < MIN_SAMPLES."""
+    if event_type is None or event_type.size != y.size:
+        return {}
+    result: Dict[str, Dict[str, float]] = {}
+    for grp_name in ("PDH_PDL", "ORB", "BOS", "ATR", "IMP"):
+        mask = np.zeros(event_type.size, dtype=bool)
+        for eid, g in EVENT_TYPE_TO_METRIC_GROUP.items():
+            if g == grp_name:
+                mask |= event_type == eid
+        if mask.sum() < MIN_SAMPLES_PER_EVENT_GROUP:
+            continue
+        p_grp = probs[mask]
+        y_grp = y[mask]
+        m = _compute_binary_metrics(p_grp, y_grp, threshold=threshold)
+        result[grp_name] = {
+            "precision": m["precision"],
+            "recall": m["recall"],
+            "f1": m["f1"],
+            "samples": m["samples"],
+            "pos_rate": m["pos_rate"],
+        }
+    return result
+
+
+def _predict_logits_targets_event_type(
+    model: nn.Module, loader: DataLoader
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Return (logits, y, event_type) for calibration. event_type is None if not in batch."""
+    model.eval()
+    logits_list: List[np.ndarray] = []
+    y_list: List[np.ndarray] = []
+    et_list: List[np.ndarray] = []
+    with torch.no_grad():
+        for batch in loader:
+            x = batch["sequence"].to(DEVICE)
+            y = batch["target"].to(DEVICE)
+            et = batch.get("event_type")
+            et = et.to(DEVICE) if et is not None else None
+            logits = model(x, event_type=et)
+            logits_list.append(logits.detach().cpu().numpy())
+            y_list.append(y.detach().cpu().numpy())
+            if et is not None:
+                et_list.append(et.detach().cpu().numpy())
+    if not logits_list:
+        return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32), None
+    logits_arr = np.concatenate(logits_list, axis=0)
+    y_arr = np.concatenate(y_list, axis=0)
+    et_arr = np.concatenate(et_list, axis=0) if et_list else None
+    return logits_arr, y_arr, et_arr
+
+
+def _calibrate_temperature(logits: np.ndarray, y: np.ndarray) -> float:
+    """Fit temperature T to minimize NLL of sigmoid(logits/T) vs y. Grid search (no scipy)."""
+    if logits.size == 0:
+        return 1.0
+    y_ = y.astype(np.float64)
+    best_t = 1.0
+    best_nll = float("inf")
+    for t in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]:
+        p = 1.0 / (1.0 + np.exp(-logits.astype(np.float64) / t))
+        p = np.clip(p, 1e-7, 1.0 - 1e-7)
+        nll = -np.mean(y_ * np.log(p) + (1.0 - y_) * np.log(1.0 - p))
+        if nll < best_nll:
+            best_nll = nll
+            best_t = t
+    return float(best_t)
 
 
 def _plot_curves(history: List[Dict[str, float]], save_path: Path, title: str) -> None:
@@ -400,13 +532,20 @@ def _build_event_dataset(
     range_atr_k = float(getattr(settings, "EVENT_RANGE_ATR_K", 1.5))
     impulse_range_k = float(getattr(settings, "EVENT_IMPULSE_RANGE_ATR_K", 1.5))
     impulse_vol_z = float(getattr(settings, "EVENT_IMPULSE_VOL_Z", 2.0))
-    label_band_k = float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.5))
-    label_min_band = float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0003))
+    label_band_k = float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.35))
+    label_min_band = float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0002))
 
     # Continuation filter settings
     cont_require_orb_bos = bool(getattr(settings, "EVENT_CONT_REQUIRE_ORB_AND_BOS", True))
-    cont_max_minutes = int(getattr(settings, "EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", 60))
+    cont_max_minutes = int(getattr(settings, "EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", 90))
     cont_require_no_smt = bool(getattr(settings, "EVENT_CONT_REQUIRE_NO_SMT", True))
+    cont_event_types_str = str(getattr(settings, "EVENT_CONT_EVENT_TYPES", "ORB_BOS,PDH_PDL"))
+    cont_allowed = set(x.strip().upper() for x in cont_event_types_str.split(",") if x.strip())
+    # Map event type id -> group: PDH/PDL, ORB/BOS, OTHER
+    EVENT_TYPE_TO_GROUP = {
+        1: "PDH_PDL", 2: "PDH_PDL", 3: "ORB_BOS", 4: "ORB_BOS",
+        5: "OTHER", 6: "OTHER", 7: "OTHER", 8: "OTHER", 9: "ORB_BOS", 10: "ORB_BOS",
+    }
 
     # Triggers enabled
     enable_pdh = bool(getattr(settings, "EVENT_ENABLE_PDH_PDL", True))
@@ -604,6 +743,8 @@ def _build_event_dataset(
                         break
 
             fired = set()  # per-session dedupe keys
+            pdh_idx_first: Optional[int] = None
+            pdl_idx_first: Optional[int] = None
 
             prev_high, prev_low = prev_day_range.get(symbol, (float("nan"), float("nan")))
             for i in range(lookback - 1, n - horizon_minutes - 1):
@@ -624,9 +765,13 @@ def _build_event_dataset(
                     if "PDH" not in fired and highs[i] >= prev_high and (i == 0 or highs[i - 1] < prev_high):
                         events.append((EVENT_TYPES["PDH"], +1))
                         fired.add("PDH")
+                        if pdh_idx_first is None:
+                            pdh_idx_first = i
                     if "PDL" not in fired and lows[i] <= prev_low and (i == 0 or lows[i - 1] > prev_low):
                         events.append((EVENT_TYPES["PDL"], -1))
                         fired.add("PDL")
+                        if pdl_idx_first is None:
+                            pdl_idx_first = i
 
                 # ORB breakout (only after ORB window)
                 if enable_orb and orb_idx:
@@ -677,10 +822,25 @@ def _build_event_dataset(
                 if not events:
                     continue
 
+                # Event-specific features at bar i (bars since ORB/BOS/PDH-PDL, normalized by 60)
+                norm_bars = 60.0
+                bs_orb_up = min(1.0, (i - orb_up_idx_first) / norm_bars) if orb_up_idx_first is not None and i >= orb_up_idx_first else 0.0
+                bs_orb_dn = min(1.0, (i - orb_dn_idx_first) / norm_bars) if orb_dn_idx_first is not None and i >= orb_dn_idx_first else 0.0
+                bs_bos_up = min(1.0, (i - bos_up_idx_first) / norm_bars) if bos_up_idx_first is not None and i >= bos_up_idx_first else 0.0
+                bs_bos_dn = min(1.0, (i - bos_dn_idx_first) / norm_bars) if bos_dn_idx_first is not None and i >= bos_dn_idx_first else 0.0
+                bs_pdh = min(1.0, (i - pdh_idx_first) / norm_bars) if pdh_idx_first is not None and i >= pdh_idx_first else 0.0
+                bs_pdl = min(1.0, (i - pdl_idx_first) / norm_bars) if pdl_idx_first is not None and i >= pdl_idx_first else 0.0
+                event_feat_row = np.array(
+                    [bs_orb_up, bs_orb_dn, (bs_bos_up + bs_bos_dn) / 2.0, max(bs_pdh, bs_pdl)],
+                    dtype="float32",
+                )
+                event_feat_window = np.tile(event_feat_row, (lookback, 1))
+
                 # For each event at i, create one sample. (Dedup rules above keep this small.)
                 window = all_feat_aug[i - lookback + 1 : i + 1]
                 if window.shape[0] != lookback:
                     continue
+                window = np.concatenate([window, event_feat_window], axis=1).astype("float32")
 
                 sign = 0
                 if abs(ret_60) > band:
@@ -709,12 +869,18 @@ def _build_event_dataset(
                         # smt_cols last two columns are divergence flags
                         if smt_cols[i, 4] > 0.5 or smt_cols[i, 5] > 0.5:
                             cont_ok = False
+                    # Event-type filter: only ORB_BOS, PDH_PDL, or ALL
+                    cont_event_type_ok = True
+                    if cont_allowed and "ALL" not in cont_allowed:
+                        grp = EVENT_TYPE_TO_GROUP.get(etype, "OTHER")
+                        cont_event_type_ok = grp in cont_allowed
+                    cont_eligible_final = cont_ok and cont_event_type_ok
                     seqs.append(window.astype("float32"))
                     # If setup not eligible, drop the continuation label to 0 by construction.
                     # Training will further filter by eligibility when building the continuation dataset.
                     y_cont.append(cont if cont_ok else 0.0)
                     y_rev.append(rev)
-                    cont_eligible_list.append(1 if cont_ok else 0)
+                    cont_eligible_list.append(1 if cont_eligible_final else 0)
                     event_dir_list.append(1 if edir > 0 else 0)  # 1=up,0=down
                     event_type_list.append(int(etype))
                     session_id_list.append(int(session_idx))
@@ -756,6 +922,8 @@ def _build_event_dataset(
             "cont_require_orb_bos": bool(cont_require_orb_bos),
             "cont_max_minutes": int(cont_max_minutes),
             "cont_require_no_smt": bool(cont_require_no_smt),
+            "event_cont_types": cont_event_types_str,
+            "session_phase": True,
         },
     }
 
@@ -796,9 +964,9 @@ def _train_one(
     out_dir: Path,
 ) -> Tuple[dict, dict]:
     batch_size = int(getattr(settings, "EVENT_BATCH_SIZE", 256))
-    lr = float(getattr(settings, "EVENT_LR", 1e-4))
-    epochs = int(getattr(settings, "EVENT_EPOCHS", 15))
-    patience = int(getattr(settings, "EVENT_EARLY_STOP_PATIENCE", 5))
+    lr = float(getattr(settings, "EVENT_LR", 3e-4))
+    epochs = int(getattr(settings, "EVENT_EPOCHS", 25))
+    patience = int(getattr(settings, "EVENT_EARLY_STOP_PATIENCE", 8))
 
     train_ds = EventHourDataset(
         sequences[train_idx],
@@ -841,14 +1009,40 @@ def _train_one(
     config = EventHourModelConfig(input_size=input_size)
     model = EventHourLSTM(config).to(DEVICE)
 
-    # pos_weight for imbalance
+    # pos_weight for imbalance; scale by EVENT_POS_WEIGHT_SCALE
     y = targets[train_idx].detach().cpu().numpy()
     pos = float((y >= 0.5).sum())
     neg = float(y.size - pos)
-    pos_weight = torch.tensor([neg / max(1.0, pos)], dtype=torch.float32, device=DEVICE) if pos > 0 else None
+    pos_weight_raw = (neg / max(1.0, pos)) if pos > 0 else None
+    pos_weight_scale = float(getattr(settings, "EVENT_POS_WEIGHT_SCALE", 1.5))
+    pos_weight = (
+        torch.tensor([pos_weight_raw * pos_weight_scale], dtype=torch.float32, device=DEVICE)
+        if pos_weight_raw is not None and pos_weight_scale > 0
+        else None
+    )
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) if pos_weight is not None else nn.BCEWithLogitsLoss()
+    use_focal = bool(getattr(settings, "EVENT_USE_FOCAL", True))
+    focal_gamma = float(getattr(settings, "EVENT_FOCAL_GAMMA", 2.0))
+    if use_focal:
+        criterion = _BinaryFocalLoss(pos_weight=pos_weight, gamma=focal_gamma).to(DEVICE)
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) if pos_weight is not None else nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=float(getattr(settings, "EVENT_WEIGHT_DECAY", 1e-5)))
+
+    # LR scheduler: cosine_warmup, cosine, or none
+    lr_scheduler_name = str(getattr(settings, "EVENT_LR_SCHEDULER", "cosine_warmup"))
+    warmup_epochs = int(getattr(settings, "EVENT_LR_WARMUP_EPOCHS", 2))
+    if lr_scheduler_name == "cosine_warmup" and warmup_epochs > 0:
+        def _warmup_cosine(ep: int) -> float:
+            if ep < warmup_epochs:
+                return (ep + 1) / warmup_epochs
+            progress = (ep - warmup_epochs) / max(1, epochs - warmup_epochs)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_warmup_cosine)
+    elif lr_scheduler_name == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    else:
+        scheduler = None
 
     best_state = None
     best_val = -math.inf
@@ -862,8 +1056,10 @@ def _train_one(
         for batch in train_loader:
             x = batch["sequence"].to(DEVICE)
             t = batch["target"].to(DEVICE)
+            et = batch.get("event_type")
+            et = et.to(DEVICE) if et is not None else None
             optimizer.zero_grad()
-            logits = model(x)
+            logits = model(x, event_type=et)
             loss = criterion(logits, t)
             loss.backward()
             clip = float(getattr(settings, "EVENT_GRAD_CLIP_NORM", 0.0))
@@ -901,6 +1097,8 @@ def _train_one(
             f"| val_acc={val_metrics.get('accuracy', float('nan')):.4f} "
             f"| val_f1={val_metrics.get('f1', float('nan')):.4f}"
         )
+        if scheduler is not None:
+            scheduler.step()
         if no_improve >= patience:
             print(f"{model_name}: early stop after {epoch} epochs (best {best_val:.4f}).")
             break
@@ -918,11 +1116,47 @@ def _train_one(
     val_summary = _evaluate(model, val_loader, threshold=best_threshold) if val_loader is not None else None
     test_summary = _evaluate(model, test_loader, threshold=best_threshold) if test_loader is not None else None
 
+    # Per-event-type metrics (val and test)
+    per_event_val: Dict[str, Dict[str, float]] = {}
+    per_event_test: Dict[str, Dict[str, float]] = {}
+    if val_loader is not None:
+        probs_v, y_v, et_v, _ = _predict_probs_targets_event_type(model, val_loader)
+        if et_v is not None:
+            per_event_val = _compute_binary_metrics_by_event_type(
+                probs_v, y_v, et_v, threshold=best_threshold
+            )
+    if test_loader is not None:
+        probs_t, y_t, et_t, _ = _predict_probs_targets_event_type(model, test_loader)
+        if et_t is not None:
+            per_event_test = _compute_binary_metrics_by_event_type(
+                probs_t, y_t, et_t, threshold=best_threshold
+            )
+
+    # Temperature calibration on validation logits
+    temperature = 1.0
+    if val_loader is not None:
+        logits_v, y_cal, _ = _predict_logits_targets_event_type(model, val_loader)
+        if logits_v.size > 0 and y_cal.size > 0:
+            temperature = _calibrate_temperature(logits_v, y_cal)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / f"{model_name}.pt"
     torch.save(model.state_dict(), ckpt_path)
     curves_path = out_dir / f"{model_name}_curves.png"
     _plot_curves(history, curves_path, title=f"{model_name} — training curves")
+
+    # Save calibration JSON for inference (API usage: apply sigmoid(logits / temperature) for calibrated probs)
+    calibration_path = out_dir / f"{model_name}_calibration.json"
+    with calibration_path.open("w") as f:
+        json.dump(
+            {
+                "temperature": float(temperature),
+                "usage": "At inference: probs = 1 / (1 + exp(-logits / temperature))",
+            },
+            f,
+            indent=2,
+        )
+
     metrics = {
         "model_name": model_name,
         "config": asdict(config),
@@ -932,10 +1166,13 @@ def _train_one(
         "early_stop_metric": getattr(settings, "EVENT_EARLY_STOP_METRIC", "f1"),
         "threshold_tuned": True,
         "best_threshold": float(best_threshold),
+        "temperature": float(temperature),
         "val_at_0_5": val_at_0_5,
         "test_at_0_5": test_at_0_5,
         "val": val_summary,
         "test": test_summary,
+        "per_event_type_val": per_event_val,
+        "per_event_type_test": per_event_test,
         "history": history,
         "train_pos_rate": float(y.mean()) if y.size else float("nan"),
         "train_pos_weight": float(pos_weight.item()) if pos_weight is not None else None,
@@ -943,7 +1180,12 @@ def _train_one(
     metrics_path = out_dir / f"{model_name}_metrics.json"
     with metrics_path.open("w") as f:
         json.dump(_nan_to_none(metrics), f, indent=2)
-    return metrics, {"ckpt": str(ckpt_path), "curves": str(curves_path), "metrics": str(metrics_path)}
+    return metrics, {
+        "ckpt": str(ckpt_path),
+        "curves": str(curves_path),
+        "metrics": str(metrics_path),
+        "calibration": str(calibration_path),
+    }
 
 
 def main() -> None:
@@ -978,20 +1220,26 @@ def main() -> None:
             print("Event dataset cache SMT setting mismatch; rebuilding.")
             rebuild = True
         # Rebuild if label-band or continuation filter settings changed
-        if float(meta.get("label_band_atr_k", -1.0)) != float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.5)):
+        if float(meta.get("label_band_atr_k", -1.0)) != float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.35)):
             print("Event dataset cache label band mismatch; rebuilding.")
             rebuild = True
-        if float(meta.get("label_min_band", -1.0)) != float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0003)):
+        if float(meta.get("label_min_band", -1.0)) != float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0002)):
             print("Event dataset cache min band mismatch; rebuilding.")
             rebuild = True
         if bool(meta.get("cont_require_orb_bos", True)) != bool(getattr(settings, "EVENT_CONT_REQUIRE_ORB_AND_BOS", True)):
             print("Event dataset cache continuation ORB+BOS setting mismatch; rebuilding.")
             rebuild = True
-        if int(meta.get("cont_max_minutes", -1)) != int(getattr(settings, "EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", 60)):
+        if int(meta.get("cont_max_minutes", -1)) != int(getattr(settings, "EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", 90)):
             print("Event dataset cache continuation window mismatch; rebuilding.")
             rebuild = True
         if bool(meta.get("cont_require_no_smt", True)) != bool(getattr(settings, "EVENT_CONT_REQUIRE_NO_SMT", True)):
             print("Event dataset cache continuation SMT filter mismatch; rebuilding.")
+            rebuild = True
+        if meta.get("event_cont_types", "") != str(getattr(settings, "EVENT_CONT_EVENT_TYPES", "ORB_BOS,PDH_PDL")):
+            print("Event dataset cache event_cont_types mismatch; rebuilding.")
+            rebuild = True
+        if not meta.get("session_phase", False):
+            print("Event dataset cache missing session_phase; rebuilding.")
             rebuild = True
         print(f"Using cached event dataset: {cache_path} (N={sequences.size(0)})")
     if not cache_path.is_file() or rebuild:

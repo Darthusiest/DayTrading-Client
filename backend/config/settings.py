@@ -112,15 +112,28 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # Event-driven 1-hour direction models (continuation / reversal)
     # ---------------------------------------------------------------------
-    EVENT_LOOKBACK: int = int(os.getenv("EVENT_LOOKBACK", "60"))
+    EVENT_LOOKBACK: int = int(os.getenv("EVENT_LOOKBACK", "90"))
     EVENT_BATCH_SIZE: int = int(os.getenv("EVENT_BATCH_SIZE", "256"))
-    EVENT_LR: float = float(os.getenv("EVENT_LR", "1e-4"))
-    EVENT_EPOCHS: int = int(os.getenv("EVENT_EPOCHS", "15"))
+    EVENT_LR: float = float(os.getenv("EVENT_LR", "3e-4"))
+    EVENT_EPOCHS: int = int(os.getenv("EVENT_EPOCHS", "25"))
     EVENT_EARLY_STOP_METRIC: str = os.getenv("EVENT_EARLY_STOP_METRIC", "f1")
-    EVENT_EARLY_STOP_PATIENCE: int = int(os.getenv("EVENT_EARLY_STOP_PATIENCE", "5"))
+    EVENT_EARLY_STOP_PATIENCE: int = int(os.getenv("EVENT_EARLY_STOP_PATIENCE", "8"))
     EVENT_WEIGHT_DECAY: float = float(os.getenv("EVENT_WEIGHT_DECAY", "1e-5"))
-    EVENT_GRAD_CLIP_NORM: float = float(os.getenv("EVENT_GRAD_CLIP_NORM", "0.0"))
+    EVENT_GRAD_CLIP_NORM: float = float(os.getenv("EVENT_GRAD_CLIP_NORM", "1.0"))
     EVENT_DROPOUT: float = float(os.getenv("EVENT_DROPOUT", "0.1"))
+
+    # Event model architecture (overrides global LSTM settings)
+    EVENT_LSTM_HIDDEN_SIZE: int = int(os.getenv("EVENT_LSTM_HIDDEN_SIZE", "256"))
+    EVENT_NUM_LSTM_LAYERS: int = int(os.getenv("EVENT_NUM_LSTM_LAYERS", "3"))
+
+    # Imbalance handling: scale pos_weight, use focal loss
+    EVENT_POS_WEIGHT_SCALE: float = float(os.getenv("EVENT_POS_WEIGHT_SCALE", "1.5"))
+    EVENT_USE_FOCAL: bool = os.getenv("EVENT_USE_FOCAL", "True").lower() == "true"
+    EVENT_FOCAL_GAMMA: float = float(os.getenv("EVENT_FOCAL_GAMMA", "2.0"))
+
+    # LR scheduler: none, cosine, cosine_warmup
+    EVENT_LR_SCHEDULER: str = os.getenv("EVENT_LR_SCHEDULER", "cosine_warmup")
+    EVENT_LR_WARMUP_EPOCHS: int = int(os.getenv("EVENT_LR_WARMUP_EPOCHS", "2"))
 
     # Dataset caching
     EVENT_REBUILD_CACHE: bool = os.getenv("EVENT_REBUILD_CACHE", "True").lower() == "true"
@@ -145,13 +158,15 @@ class Settings(BaseSettings):
     EVENT_IMPULSE_VOL_Z: float = float(os.getenv("EVENT_IMPULSE_VOL_Z", "2.0"))
 
     # Labeling band (avoid tiny 1-hour moves; makes targets less noisy). Lower = more positives.
-    EVENT_LABEL_BAND_ATR_K: float = float(os.getenv("EVENT_LABEL_BAND_ATR_K", "0.5"))
-    EVENT_LABEL_MIN_BAND: float = float(os.getenv("EVENT_LABEL_MIN_BAND", "0.0003"))
+    EVENT_LABEL_BAND_ATR_K: float = float(os.getenv("EVENT_LABEL_BAND_ATR_K", "0.35"))
+    EVENT_LABEL_MIN_BAND: float = float(os.getenv("EVENT_LABEL_MIN_BAND", "0.0002"))
 
     # Continuation setup filter (to reduce noise): require ORB+BOS same direction and no SMT divergence.
     EVENT_CONT_REQUIRE_ORB_AND_BOS: bool = os.getenv("EVENT_CONT_REQUIRE_ORB_AND_BOS", "True").lower() == "true"
-    EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS: int = int(os.getenv("EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", "60"))
+    EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS: int = int(os.getenv("EVENT_CONT_MAX_MINUTES_BETWEEN_ORB_BOS", "90"))
     EVENT_CONT_REQUIRE_NO_SMT: bool = os.getenv("EVENT_CONT_REQUIRE_NO_SMT", "True").lower() == "true"
+    # Event types for continuation: ORB_BOS, PDH_PDL, or ALL (comma-separated; default both ORB+BOS and PDH/PDL)
+    EVENT_CONT_EVENT_TYPES: str = os.getenv("EVENT_CONT_EVENT_TYPES", "ORB_BOS,PDH_PDL")
 
     # London session range (for fib scaling features). Times in session TZ (default America/New_York).
     EVENT_LONDON_START: str = os.getenv("EVENT_LONDON_START", "03:00")
@@ -162,7 +177,7 @@ class Settings(BaseSettings):
     EVENT_SMT_LOOKBACK: int = int(os.getenv("EVENT_SMT_LOOKBACK", "30"))
 
     # Optional walk-forward for event models (rolling train/test windows)
-    EVENT_WALK_FORWARD: bool = os.getenv("EVENT_WALK_FORWARD", "False").lower() == "true"
+    EVENT_WALK_FORWARD: bool = os.getenv("EVENT_WALK_FORWARD", "True").lower() == "true"
     EVENT_WF_TRAIN_DAYS: int = int(os.getenv("EVENT_WF_TRAIN_DAYS", "365"))
     EVENT_WF_TEST_DAYS: int = int(os.getenv("EVENT_WF_TEST_DAYS", "90"))
     EVENT_WF_SLIDE_DAYS: int = int(os.getenv("EVENT_WF_SLIDE_DAYS", "90"))

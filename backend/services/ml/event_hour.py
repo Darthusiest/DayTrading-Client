@@ -87,9 +87,12 @@ class EventHourDataset(Dataset):
 @dataclass
 class EventHourModelConfig:
     input_size: int
-    hidden_size: int = settings.LSTM_HIDDEN_SIZE
-    num_layers: int = settings.NUM_LSTM_LAYERS
+    hidden_size: int = int(getattr(settings, "EVENT_LSTM_HIDDEN_SIZE", settings.LSTM_HIDDEN_SIZE))
+    num_layers: int = int(getattr(settings, "EVENT_NUM_LSTM_LAYERS", settings.NUM_LSTM_LAYERS))
     dropout: float = float(getattr(settings, "EVENT_DROPOUT", 0.1))
+    num_event_types: int = 11  # 0 padding + 1-10 event types
+    event_embed_dim: int = 16
+    use_attention: bool = True
 
 
 class EventHourLSTM(nn.Module):
@@ -106,17 +109,32 @@ class EventHourLSTM(nn.Module):
             batch_first=True,
             dropout=config.dropout if config.num_layers > 1 else 0.0,
         )
+        self.event_embed = nn.Embedding(config.num_event_types, config.event_embed_dim, padding_idx=0)
+        trunk_in = config.hidden_size + config.event_embed_dim
+        self.attn = nn.Linear(config.hidden_size, 1) if config.use_attention else None
         self.trunk = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.Linear(trunk_in, config.hidden_size),
             nn.ReLU(),
             nn.Dropout(config.dropout),
         )
         self.head = nn.Linear(config.hidden_size, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, event_type: torch.Tensor | None = None) -> torch.Tensor:
         out, _ = self.lstm(x)  # [B, T, H]
-        last = out[:, -1, :]  # [B, H]
-        h = self.trunk(last)
+        if self.attn is not None:
+            scores = self.attn(out).squeeze(-1)  # [B, T]
+            weights = torch.softmax(scores, dim=1)
+            context = (out * weights.unsqueeze(-1)).sum(1)  # [B, H]
+        else:
+            context = out[:, -1, :]  # [B, H]
+        if event_type is not None:
+            et = event_type.clamp(0, self.config.num_event_types - 1)
+            emb = self.event_embed(et)  # [B, E]
+            context = torch.cat([context, emb], dim=1)  # [B, H+E]
+        else:
+            emb = torch.zeros(x.size(0), self.config.event_embed_dim, device=x.device, dtype=x.dtype)
+            context = torch.cat([context, emb], dim=1)
+        h = self.trunk(context)
         logits = self.head(h).squeeze(-1)  # [B]
         return logits
 

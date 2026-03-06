@@ -191,6 +191,7 @@ def _time_features(bars: Sequence[SessionMinuteBar]) -> Tuple[np.ndarray, ...]:
     minutes_since_open = np.zeros(n_bars, dtype="float32")
     is_ny_open = np.zeros(n_bars, dtype="float32")
     is_power_hour = np.zeros(n_bars, dtype="float32")
+    session_phase = np.zeros(n_bars, dtype="float32")
 
     def _parse_hm(s: str) -> tuple[int, int]:
         parts = s.strip().split(":")
@@ -202,6 +203,7 @@ def _time_features(bars: Sequence[SessionMinuteBar]) -> Tuple[np.ndarray, ...]:
     end_h, end_m = _parse_hm(settings.SESSION_END_TIME)
     start_total = start_h * 60 + start_m
     end_total = end_h * 60 + end_m
+    session_duration = max(1, end_total - start_total)
 
     for i, g in enumerate(bars):
         bt = g.bar_time  # naive datetime in session TZ
@@ -215,12 +217,15 @@ def _time_features(bars: Sequence[SessionMinuteBar]) -> Tuple[np.ndarray, ...]:
         ms_open = max(0, total_min - start_total)
         minutes_since_open[i] = float(ms_open)
 
+        # Session phase: 0=open, 0.5=mid, 1=close
+        session_phase[i] = float(np.clip(ms_open / session_duration, 0.0, 1.0))
+
         # Example flags: first 60 minutes of session as \"NY open\", last 60 as \"power hour\"
         is_ny_open[i] = 1.0 if 0 <= ms_open <= 60 else 0.0
         mins_to_close = end_total - total_min
         is_power_hour[i] = 1.0 if 0 <= mins_to_close <= 60 else 0.0
 
-    return hours, minutes, day_of_week, minutes_since_open, is_ny_open, is_power_hour
+    return hours, minutes, day_of_week, minutes_since_open, is_ny_open, is_power_hour, session_phase
 
 
 def _regime_and_microstructure(
@@ -394,7 +399,7 @@ def build_session_feature_matrix(
     volume_zscore = np.nan_to_num(volume_zscore, nan=0.0, posinf=0.0, neginf=0.0)
     gap_flag = np.nan_to_num(gap_flag, nan=0.0, posinf=1.0, neginf=0.0)
 
-    hours, minutes, dow, minutes_since_open, is_ny_open, is_power_hour = _time_features(
+    hours, minutes, dow, minutes_since_open, is_ny_open, is_power_hour, session_phase = _time_features(
         ordered
     )
 
@@ -430,6 +435,7 @@ def build_session_feature_matrix(
             minutes_since_open,
             is_ny_open,
             is_power_hour,
+            session_phase,
         ],
         axis=1,
     ).astype("float32")

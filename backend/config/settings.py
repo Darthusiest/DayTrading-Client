@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     EVENT_LONDON_START: str = os.getenv("EVENT_LONDON_START", "03:00")
     EVENT_LONDON_END: str = os.getenv("EVENT_LONDON_END", "05:00")
 
+    # SMT divergence (cross-market): compare MNQ vs MES (NQ vs ES proxy) within same session_date.
+    EVENT_ENABLE_SMT: bool = os.getenv("EVENT_ENABLE_SMT", "True").lower() == "true"
+    EVENT_SMT_LOOKBACK: int = int(os.getenv("EVENT_SMT_LOOKBACK", "30"))
+
     # Optional walk-forward for event models (rolling train/test windows)
     EVENT_WALK_FORWARD: bool = os.getenv("EVENT_WALK_FORWARD", "False").lower() == "true"
     EVENT_WF_TRAIN_DAYS: int = int(os.getenv("EVENT_WF_TRAIN_DAYS", "365"))

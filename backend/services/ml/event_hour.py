@@ -26,6 +26,7 @@ class EventHourDataset(Dataset):
       - event_type:[N]       int64   (optional, for analysis)
       - event_dir: [N]       int64   (+1/-1 encoded as 1/0 or stored separately)
       - session_id:[N]       int64   (optional, for splits)
+      - symbol_id:[N]        int64   (optional, for analysis; e.g. 0=MNQ, 1=MES)
     """
 
     def __init__(
@@ -35,6 +36,7 @@ class EventHourDataset(Dataset):
         event_type: torch.Tensor | None = None,
         event_dir: torch.Tensor | None = None,
         session_id: torch.Tensor | None = None,
+        symbol_id: torch.Tensor | None = None,
     ) -> None:
         if sequences.ndim != 3:
             raise ValueError(f"sequences must be [N, T, F], got shape={sequences.shape}")
@@ -47,6 +49,7 @@ class EventHourDataset(Dataset):
             ("event_type", event_type),
             ("event_dir", event_dir),
             ("session_id", session_id),
+            ("symbol_id", symbol_id),
         ]:
             if t is None:
                 continue
@@ -60,6 +63,7 @@ class EventHourDataset(Dataset):
         self.event_type = event_type
         self.event_dir = event_dir
         self.session_id = session_id
+        self.symbol_id = symbol_id
 
     def __len__(self) -> int:
         return self.sequences.size(0)
@@ -75,6 +79,8 @@ class EventHourDataset(Dataset):
             out["event_dir"] = self.event_dir[idx]
         if self.session_id is not None:
             out["session_id"] = self.session_id[idx]
+        if self.symbol_id is not None:
+            out["symbol_id"] = self.symbol_id[idx]
         return out
 
 

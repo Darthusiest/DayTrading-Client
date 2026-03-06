@@ -47,6 +47,9 @@ from backend.services.ml.event_hour import EventHourDataset, EventHourLSTM, Even
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Bump when event input feature set changes (e.g. enabling SMT columns) to avoid stale caches.
+EVENT_FEATURE_VERSION = 1
+
 
 def _nan_to_none(obj):
     if isinstance(obj, dict):
@@ -357,11 +360,13 @@ def _build_event_dataset(
     horizon_minutes: int = 60,
 ) -> Dict[str, torch.Tensor | List[Tuple[str, str]] | Dict]:
     """Build event windows and labels for continuation + reversal."""
-    by_key: Dict[Tuple[str, str], List[SessionMinuteBar]] = defaultdict(list)
+    # Group by session_date then symbol, so we can compute cross-market (SMT) features.
+    by_date: Dict[str, Dict[str, List[SessionMinuteBar]]] = defaultdict(lambda: defaultdict(list))
     for b in bars:
-        by_key[(b.symbol, b.session_date)].append(b)
-    items = sorted(by_key.items(), key=lambda x: x[0][1])
-    sessions_list: List[Tuple[str, str]] = [k for k, _ in items]
+        by_date[b.session_date][b.symbol].append(b)
+    session_dates = sorted(by_date.keys())
+    # session id is per session_date (shared across symbols)
+    sessions_list: List[Tuple[str, str]] = [("ALL", sd) for sd in session_dates]
 
     # Event config
     atr_window = int(getattr(settings, "BAR_ATR_WINDOW", 14))
@@ -380,6 +385,8 @@ def _build_event_dataset(
     enable_atr = bool(getattr(settings, "EVENT_ENABLE_ATR_EXPANSION", True))
     enable_impulse = bool(getattr(settings, "EVENT_ENABLE_IMPULSE_VOLUME", True))
     enable_bos = bool(getattr(settings, "EVENT_ENABLE_BOS", True))
+    enable_smt = bool(getattr(settings, "EVENT_ENABLE_SMT", True))
+    smt_lookback = int(getattr(settings, "EVENT_SMT_LOOKBACK", 30))
 
     # Session start for ORB
     session_start = getattr(settings, "SESSION_START_TIME", "09:30")
@@ -395,6 +402,7 @@ def _build_event_dataset(
     event_dir_list: List[int] = []
     event_type_list: List[int] = []
     session_id_list: List[int] = []
+    symbol_id_list: List[int] = []
 
     EVENT_TYPES = {
         "PDH": 1,
@@ -409,126 +417,232 @@ def _build_event_dataset(
         "BOS_DN": 10,
     }
 
-    for session_idx, ((symbol, session_date), group) in enumerate(items):
-        ordered = sorted(group, key=lambda b: b.bar_time)
-        all_feat, closes, highs, lows = build_session_feature_matrix(ordered)
-        n = closes.size
-        if n < lookback + horizon_minutes + 1:
-            # Too short to label within session
-            prev_day_range[symbol] = (float(highs.max()), float(lows.min()))
+    symbols = list(settings.SYMBOLS)
+    sym_to_id = {s: i for i, s in enumerate(symbols)}
+
+    for session_idx, session_date in enumerate(session_dates):
+        sym_groups = by_date[session_date]
+        # Require both symbols for SMT features; if missing, we still build per-symbol events without SMT
+        per_sym = {}
+        for symbol, group in sym_groups.items():
+            ordered = sorted(group, key=lambda b: b.bar_time)
+            all_feat, closes, highs, lows = build_session_feature_matrix(ordered)
+            per_sym[symbol] = {
+                "ordered": ordered,
+                "feat": all_feat,
+                "closes": closes,
+                "highs": highs,
+                "lows": lows,
+            }
+        if not per_sym:
             continue
-        # Compute additional arrays for triggers/labels
-        opens = all_feat[:, 0].astype("float32")  # base open is first col in base OHLCV
-        atr = _compute_atr(highs, lows, closes, atr_window)
-        ret_1m = np.zeros(n, dtype="float32")
-        ret_1m[1:] = np.where(closes[:-1] > 0, (closes[1:] - closes[:-1]) / closes[:-1], 0.0)
-        bar_range = highs - lows
-        range_over_atr = bar_range / (atr + 1e-8)
-        vol = all_feat[:, 4].astype("float32")
-        vol_z = _rolling_zscore(vol, 20)
-        fib_cols, london_meta = _london_fib_features(ordered, highs, lows, closes)
-        all_feat_aug = np.concatenate([all_feat, fib_cols], axis=1).astype("float32")
 
-        # ORB range (within session start+orb_minutes)
-        orb_end_min = ss_min + orb_minutes
-        orb_idx = [i for i, b in enumerate(ordered) if ss_min <= (b.bar_time.hour * 60 + b.bar_time.minute) < orb_end_min]
-        orb_high = float(np.max(highs[orb_idx])) if orb_idx else float("nan")
-        orb_low = float(np.min(lows[orb_idx])) if orb_idx else float("nan")
+        # Build time alignment maps for SMT: intersection of timestamps across available symbols.
+        if enable_smt and len(per_sym) >= 2:
+            time_sets = []
+            for symbol, d in per_sym.items():
+                time_sets.append({b.bar_time for b in d["ordered"]})
+            common_times = sorted(set.intersection(*time_sets))
+        else:
+            common_times = []
 
-        fired = set()  # per-session dedupe keys
+        # Precompute aligned arrays for each symbol (if SMT enabled and we have common times)
+        for symbol, d in per_sym.items():
+            ordered = d["ordered"]
+            all_feat = d["feat"]
+            closes = d["closes"]
+            highs = d["highs"]
+            lows = d["lows"]
+            n = closes.size
+            if n < lookback + horizon_minutes + 1:
+                prev_day_range[symbol] = (float(highs.max()), float(lows.min()))
+                continue
 
-        prev_high, prev_low = prev_day_range.get(symbol, (float("nan"), float("nan")))
-        for i in range(lookback - 1, n - horizon_minutes - 1):
-            # Label band (vol-adjusted)
-            c0 = float(closes[i]) if closes[i] > 0 else 0.0
-            atr_pct = float(atr[i]) / c0 if c0 > 0 else 0.0
-            band = max(label_min_band, label_band_k * atr_pct)
+            if enable_smt and common_times:
+                idx_map = {b.bar_time: i for i, b in enumerate(ordered)}
+                idxs = np.array([idx_map[t] for t in common_times if t in idx_map], dtype=np.int64)
+                if idxs.size < lookback + horizon_minutes + 1:
+                    # Not enough common minutes; fall back to local indexing without SMT
+                    idxs = None
+            else:
+                idxs = None
 
-            # Compute 60m return
-            c1 = float(closes[i + horizon_minutes])
-            ret_60 = (c1 - c0) / c0 if c0 > 0 else 0.0
-            if abs(ret_60) <= band:
-                # still allow event, but labels will be 0/0 (neutral)
-                pass
-            # Determine event(s) at i
-            events: List[Tuple[int, int]] = []  # (event_type_id, event_dir +1/-1)
+            if idxs is not None:
+                ordered = [ordered[i] for i in idxs.tolist()]
+                all_feat = all_feat[idxs]
+                closes = closes[idxs]
+                highs = highs[idxs]
+                lows = lows[idxs]
+                n = closes.size
 
-            # PDH/PDL sweep
-            if enable_pdh and not math.isnan(prev_high) and not math.isnan(prev_low):
-                if "PDH" not in fired and highs[i] >= prev_high and (i == 0 or highs[i - 1] < prev_high):
-                    events.append((EVENT_TYPES["PDH"], +1))
-                    fired.add("PDH")
-                if "PDL" not in fired and lows[i] <= prev_low and (i == 0 or lows[i - 1] > prev_low):
-                    events.append((EVENT_TYPES["PDL"], -1))
-                    fired.add("PDL")
+            # Compute arrays for triggers/labels
+            opens = all_feat[:, 0].astype("float32")
+            atr = _compute_atr(highs, lows, closes, atr_window)
+            ret_1m = np.zeros(n, dtype="float32")
+            ret_1m[1:] = np.where(closes[:-1] > 0, (closes[1:] - closes[:-1]) / closes[:-1], 0.0)
+            bar_range = highs - lows
+            range_over_atr = bar_range / (atr + 1e-8)
+            vol = all_feat[:, 4].astype("float32")
+            vol_z = _rolling_zscore(vol, 20)
+            fib_cols, _ = _london_fib_features(ordered, highs, lows, closes)
 
-            # ORB breakout (only after ORB window)
-            if enable_orb and orb_idx:
-                tmin = ordered[i].bar_time.hour * 60 + ordered[i].bar_time.minute
-                if tmin >= orb_end_min:
-                    if "ORB_UP" not in fired and closes[i] > orb_high and closes[i - 1] <= orb_high:
-                        events.append((EVENT_TYPES["ORB_UP"], +1))
-                        fired.add("ORB_UP")
-                    if "ORB_DN" not in fired and closes[i] < orb_low and closes[i - 1] >= orb_low:
-                        events.append((EVENT_TYPES["ORB_DN"], -1))
-                        fired.add("ORB_DN")
+            # SMT cross-market features (if available for this session_date)
+            smt_cols = np.zeros((n, 6), dtype="float32")
+            if enable_smt and len(per_sym) >= 2:
+                # pick one other symbol (for now assume exactly two: MNQ1! and MES1!)
+                other = [s for s in per_sym.keys() if s != symbol]
+                if other:
+                    other_symbol = other[0]
+                    od = per_sym[other_symbol]
+                    other_ordered = sorted(od["ordered"], key=lambda b: b.bar_time)
+                    other_feat, other_closes, other_highs, other_lows = build_session_feature_matrix(other_ordered)
+                    if idxs is not None:
+                        idx_map2 = {b.bar_time: i for i, b in enumerate(other_ordered)}
+                        idxs2 = np.array([idx_map2[b.bar_time] for b in ordered if b.bar_time in idx_map2], dtype=np.int64)
+                        if idxs2.size == n:
+                            other_feat = other_feat[idxs2]
+                            other_closes = other_closes[idxs2]
+                            other_highs = other_highs[idxs2]
+                            other_lows = other_lows[idxs2]
+                    other_atr = _compute_atr(other_highs, other_lows, other_closes, atr_window)
+                    other_ret_1m = np.zeros(n, dtype="float32")
+                    other_ret_1m[1:] = np.where(other_closes[:-1] > 0, (other_closes[1:] - other_closes[:-1]) / other_closes[:-1], 0.0)
 
-            # ATR expansion / volatility shock
-            if enable_atr:
-                if "ATR_UP" not in fired and ret_1m[i] > atr_k * atr_pct:
-                    events.append((EVENT_TYPES["ATR_UP"], +1))
-                    fired.add("ATR_UP")
-                if "ATR_DN" not in fired and ret_1m[i] < -atr_k * atr_pct:
-                    events.append((EVENT_TYPES["ATR_DN"], -1))
-                    fired.add("ATR_DN")
-                # Range/ATR spike: direction by close-open
-                if range_over_atr[i] > range_atr_k:
+                    spread_ret_1m = ret_1m - other_ret_1m
+                    # SMT divergence: HH/LL break mismatch over smt_lookback window
+                    smt_hh = np.zeros(n, dtype="float32")
+                    smt_ll = np.zeros(n, dtype="float32")
+                    for i2 in range(n):
+                        start = max(0, i2 - smt_lookback)
+                        if i2 <= start:
+                            continue
+                        sym_hh = closes[i2] > np.max(closes[start:i2])
+                        oth_hh = other_closes[i2] > np.max(other_closes[start:i2])
+                        sym_ll = closes[i2] < np.min(closes[start:i2])
+                        oth_ll = other_closes[i2] < np.min(other_closes[start:i2])
+                        smt_hh[i2] = 1.0 if (sym_hh != oth_hh) else 0.0
+                        smt_ll[i2] = 1.0 if (sym_ll != oth_ll) else 0.0
+
+                    # Normalize ATR as pct for both
+                    atr_pct = np.where(closes > 0, atr / (closes + 1e-8), 0.0).astype("float32")
+                    other_atr_pct = np.where(other_closes > 0, other_atr / (other_closes + 1e-8), 0.0).astype("float32")
+                    smt_cols = np.stack(
+                        [
+                            other_ret_1m.astype("float32"),
+                            spread_ret_1m.astype("float32"),
+                            other_atr_pct.astype("float32"),
+                            atr_pct.astype("float32"),
+                            smt_hh.astype("float32"),
+                            smt_ll.astype("float32"),
+                        ],
+                        axis=1,
+                    ).astype("float32")
+
+            all_feat_aug = np.concatenate([all_feat, fib_cols, smt_cols], axis=1).astype("float32")
+
+            # ORB range (within session start+orb_minutes)
+            orb_end_min = ss_min + orb_minutes
+            orb_idx = [
+                i for i, b in enumerate(ordered) if ss_min <= (b.bar_time.hour * 60 + b.bar_time.minute) < orb_end_min
+            ]
+            orb_high = float(np.max(highs[orb_idx])) if orb_idx else float("nan")
+            orb_low = float(np.min(lows[orb_idx])) if orb_idx else float("nan")
+
+            fired = set()  # per-session dedupe keys
+
+            prev_high, prev_low = prev_day_range.get(symbol, (float("nan"), float("nan")))
+            for i in range(lookback - 1, n - horizon_minutes - 1):
+                # Label band (vol-adjusted)
+                c0 = float(closes[i]) if closes[i] > 0 else 0.0
+                atr_pct_i = float(atr[i]) / c0 if c0 > 0 else 0.0
+                band = max(label_min_band, label_band_k * atr_pct_i)
+
+                # Compute 60m return
+                c1 = float(closes[i + horizon_minutes])
+                ret_60 = (c1 - c0) / c0 if c0 > 0 else 0.0
+
+                # Determine event(s) at i
+                events: List[Tuple[int, int]] = []  # (event_type_id, event_dir +1/-1)
+
+                # PDH/PDL sweep
+                if enable_pdh and not math.isnan(prev_high) and not math.isnan(prev_low):
+                    if "PDH" not in fired and highs[i] >= prev_high and (i == 0 or highs[i - 1] < prev_high):
+                        events.append((EVENT_TYPES["PDH"], +1))
+                        fired.add("PDH")
+                    if "PDL" not in fired and lows[i] <= prev_low and (i == 0 or lows[i - 1] > prev_low):
+                        events.append((EVENT_TYPES["PDL"], -1))
+                        fired.add("PDL")
+
+                # ORB breakout (only after ORB window)
+                if enable_orb and orb_idx:
+                    tmin = ordered[i].bar_time.hour * 60 + ordered[i].bar_time.minute
+                    if tmin >= orb_end_min:
+                        if "ORB_UP" not in fired and closes[i] > orb_high and closes[i - 1] <= orb_high:
+                            events.append((EVENT_TYPES["ORB_UP"], +1))
+                            fired.add("ORB_UP")
+                        if "ORB_DN" not in fired and closes[i] < orb_low and closes[i - 1] >= orb_low:
+                            events.append((EVENT_TYPES["ORB_DN"], -1))
+                            fired.add("ORB_DN")
+
+                # ATR expansion / volatility shock
+                if enable_atr:
+                    if "ATR_UP" not in fired and ret_1m[i] > atr_k * atr_pct_i:
+                        events.append((EVENT_TYPES["ATR_UP"], +1))
+                        fired.add("ATR_UP")
+                    if "ATR_DN" not in fired and ret_1m[i] < -atr_k * atr_pct_i:
+                        events.append((EVENT_TYPES["ATR_DN"], -1))
+                        fired.add("ATR_DN")
+                    # Range/ATR spike: direction by close-open
+                    if range_over_atr[i] > range_atr_k:
+                        d = +1 if closes[i] >= opens[i] else -1
+                        key = f"RANGE_{d}"
+                        if key not in fired:
+                            events.append((EVENT_TYPES["ATR_UP"] if d > 0 else EVENT_TYPES["ATR_DN"], d))
+                            fired.add(key)
+
+                # Impulse candle + volume
+                if enable_impulse and range_over_atr[i] > impulse_range_k and vol_z[i] > impulse_vol_z:
                     d = +1 if closes[i] >= opens[i] else -1
-                    key = f"RANGE_{d}"
+                    key = f"IMP_{d}"
                     if key not in fired:
-                        events.append((EVENT_TYPES["ATR_UP"] if d > 0 else EVENT_TYPES["ATR_DN"], d))
+                        events.append((EVENT_TYPES["IMP_UP"] if d > 0 else EVENT_TYPES["IMP_DN"], d))
                         fired.add(key)
 
-            # Impulse candle + volume
-            if enable_impulse and range_over_atr[i] > impulse_range_k and vol_z[i] > impulse_vol_z:
-                d = +1 if closes[i] >= opens[i] else -1
-                key = f"IMP_{d}"
-                if key not in fired:
-                    events.append((EVENT_TYPES["IMP_UP"] if d > 0 else EVENT_TYPES["IMP_DN"], d))
-                    fired.add(key)
+                # Break of structure (swing high/low)
+                if enable_bos and i >= bos_lookback:
+                    prev_swing_high = float(np.max(highs[i - bos_lookback : i]))
+                    prev_swing_low = float(np.min(lows[i - bos_lookback : i]))
+                    if "BOS_UP" not in fired and closes[i] > prev_swing_high and closes[i - 1] <= prev_swing_high:
+                        events.append((EVENT_TYPES["BOS_UP"], +1))
+                        fired.add("BOS_UP")
+                    if "BOS_DN" not in fired and closes[i] < prev_swing_low and closes[i - 1] >= prev_swing_low:
+                        events.append((EVENT_TYPES["BOS_DN"], -1))
+                        fired.add("BOS_DN")
 
-            # Break of structure (swing high/low)
-            if enable_bos and i >= bos_lookback:
-                prev_swing_high = float(np.max(highs[i - bos_lookback : i]))
-                prev_swing_low = float(np.min(lows[i - bos_lookback : i]))
-                if "BOS_UP" not in fired and closes[i] > prev_swing_high and closes[i - 1] <= prev_swing_high:
-                    events.append((EVENT_TYPES["BOS_UP"], +1))
-                    fired.add("BOS_UP")
-                if "BOS_DN" not in fired and closes[i] < prev_swing_low and closes[i - 1] >= prev_swing_low:
-                    events.append((EVENT_TYPES["BOS_DN"], -1))
-                    fired.add("BOS_DN")
+                if not events:
+                    continue
 
-            if not events:
-                continue
+                # For each event at i, create one sample. (Dedup rules above keep this small.)
+                window = all_feat_aug[i - lookback + 1 : i + 1]
+                if window.shape[0] != lookback:
+                    continue
 
-            # For each event at i, create one sample. (Dedup rules above keep this small.)
-            window = all_feat_aug[i - lookback + 1 : i + 1]
-            if window.shape[0] != lookback:
-                continue
-            sign = 0
-            if abs(ret_60) > band:
-                sign = +1 if ret_60 > 0 else -1
-            for etype, edir in events:
-                cont = 1.0 if (sign != 0 and sign == edir) else 0.0
-                rev = 1.0 if (sign != 0 and sign == -edir) else 0.0
-                seqs.append(window.astype("float32"))
-                y_cont.append(cont)
-                y_rev.append(rev)
-                event_dir_list.append(1 if edir > 0 else 0)  # store as 1=up,0=down for compactness
-                event_type_list.append(int(etype))
-                session_id_list.append(int(session_idx))
+                sign = 0
+                if abs(ret_60) > band:
+                    sign = +1 if ret_60 > 0 else -1
 
-        prev_day_range[symbol] = (float(highs.max()), float(lows.min()))
+                for etype, edir in events:
+                    cont = 1.0 if (sign != 0 and sign == edir) else 0.0
+                    rev = 1.0 if (sign != 0 and sign == -edir) else 0.0
+                    seqs.append(window.astype("float32"))
+                    y_cont.append(cont)
+                    y_rev.append(rev)
+                    event_dir_list.append(1 if edir > 0 else 0)  # 1=up,0=down
+                    event_type_list.append(int(etype))
+                    session_id_list.append(int(session_idx))
+                    symbol_id_list.append(int(sym_to_id.get(symbol, 0)))
+
+            prev_day_range[symbol] = (float(highs.max()), float(lows.min()))
 
     if not seqs:
         raise RuntimeError("No event samples were built. Check trigger thresholds or data coverage.")
@@ -539,6 +653,7 @@ def _build_event_dataset(
     event_dir = torch.from_numpy(np.asarray(event_dir_list, dtype="int64"))
     event_type = torch.from_numpy(np.asarray(event_type_list, dtype="int64"))
     session_id = torch.from_numpy(np.asarray(session_id_list, dtype="int64"))
+    symbol_id = torch.from_numpy(np.asarray(symbol_id_list, dtype="int64"))
 
     return {
         "sequences": sequences,
@@ -547,11 +662,15 @@ def _build_event_dataset(
         "event_dir": event_dir,
         "event_type": event_type,
         "session_id": session_id,
+        "symbol_id": symbol_id,
         "sessions": sessions_list,
         "meta": {
             "lookback": lookback,
             "horizon_minutes": horizon_minutes,
             "symbols": list(settings.SYMBOLS),
+            "event_feature_version": EVENT_FEATURE_VERSION,
+            "enable_smt": bool(enable_smt),
+            "smt_lookback": int(smt_lookback),
         },
     }
 
@@ -585,6 +704,7 @@ def _train_one(
     event_type: torch.Tensor,
     event_dir: torch.Tensor,
     session_id: torch.Tensor,
+    symbol_id: torch.Tensor,
     train_idx: List[int],
     val_idx: List[int],
     test_idx: List[int],
@@ -595,9 +715,38 @@ def _train_one(
     epochs = int(getattr(settings, "EVENT_EPOCHS", 15))
     patience = int(getattr(settings, "EVENT_EARLY_STOP_PATIENCE", 5))
 
-    train_ds = EventHourDataset(sequences[train_idx], targets[train_idx], event_type[train_idx], event_dir[train_idx], session_id[train_idx])
-    val_ds = EventHourDataset(sequences[val_idx], targets[val_idx], event_type[val_idx], event_dir[val_idx], session_id[val_idx]) if val_idx else None
-    test_ds = EventHourDataset(sequences[test_idx], targets[test_idx], event_type[test_idx], event_dir[test_idx], session_id[test_idx]) if test_idx else None
+    train_ds = EventHourDataset(
+        sequences[train_idx],
+        targets[train_idx],
+        event_type[train_idx],
+        event_dir[train_idx],
+        session_id[train_idx],
+        symbol_id[train_idx],
+    )
+    val_ds = (
+        EventHourDataset(
+            sequences[val_idx],
+            targets[val_idx],
+            event_type[val_idx],
+            event_dir[val_idx],
+            session_id[val_idx],
+            symbol_id[val_idx],
+        )
+        if val_idx
+        else None
+    )
+    test_ds = (
+        EventHourDataset(
+            sequences[test_idx],
+            targets[test_idx],
+            event_type[test_idx],
+            event_dir[test_idx],
+            session_id[test_idx],
+            symbol_id[test_idx],
+        )
+        if test_idx
+        else None
+    )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_ds else None
@@ -718,9 +867,17 @@ def main() -> None:
         event_type = data["event_type"]
         event_dir = data["event_dir"]
         session_id = data["session_id"]
+        symbol_id = data.get("symbol_id")
         sessions = data.get("sessions", [])
+        meta = data.get("meta", {})
+        if meta.get("event_feature_version") != EVENT_FEATURE_VERSION:
+            print("Event dataset cache feature_version mismatch; rebuilding.")
+            rebuild = True
+        if bool(meta.get("enable_smt")) != bool(getattr(settings, "EVENT_ENABLE_SMT", True)):
+            print("Event dataset cache SMT setting mismatch; rebuilding.")
+            rebuild = True
         print(f"Using cached event dataset: {cache_path} (N={sequences.size(0)})")
-    else:
+    if not cache_path.is_file() or rebuild:
         print(f"Building event dataset (lookback={lookback})...")
         built = _build_event_dataset(bars, lookback=lookback, horizon_minutes=60)
         sequences = built["sequences"]
@@ -729,6 +886,7 @@ def main() -> None:
         event_type = built["event_type"]
         event_dir = built["event_dir"]
         session_id = built["session_id"]
+        symbol_id = built.get("symbol_id")
         sessions = built["sessions"]
         out_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -739,6 +897,7 @@ def main() -> None:
                 "event_type": event_type,
                 "event_dir": event_dir,
                 "session_id": session_id,
+                "symbol_id": symbol_id,
                 "sessions": sessions,
                 "meta": built.get("meta", {}),
             },
@@ -746,6 +905,8 @@ def main() -> None:
         )
         print(f"Saved event dataset cache: {cache_path} (N={sequences.size(0)})")
 
+    if symbol_id is None:
+        symbol_id = torch.zeros_like(session_id)
     n_sessions = len(sessions) if isinstance(sessions, list) else int(session_id.max().item() + 1)
     val_ratio = float(getattr(settings, "EVENT_VAL_RATIO", 0.1))
     test_ratio = float(getattr(settings, "EVENT_TEST_RATIO", 0.1))
@@ -791,6 +952,7 @@ def main() -> None:
                 event_type,
                 event_dir,
                 session_id,
+                symbol_id,
                 train_idx,
                 val_idx,
                 test_idx,
@@ -803,6 +965,7 @@ def main() -> None:
                 event_type,
                 event_dir,
                 session_id,
+                symbol_id,
                 train_idx,
                 val_idx,
                 test_idx,
@@ -923,6 +1086,7 @@ def main() -> None:
         event_type,
         event_dir,
         session_id,
+        symbol_id,
         train_idx,
         val_idx,
         test_idx,
@@ -939,6 +1103,7 @@ def main() -> None:
         event_type,
         event_dir,
         session_id,
+        symbol_id,
         train_idx,
         val_idx,
         test_idx,

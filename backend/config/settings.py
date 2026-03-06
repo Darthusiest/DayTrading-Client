@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     # dir5 (5m direction): threshold for up/down. Sideways if |ret_5m| < threshold. Smaller = fewer sideways (rarer).
     # 0.0003 = 0.03% (only very small 5m returns count as sideways).
     BAR_DIR5_THRESHOLD: float = float(os.getenv("BAR_DIR5_THRESHOLD", "0.0003"))
+    # Volatility-adjusted band: when > 0, sideways iff |ret_5m| < max(BAR_DIR5_MIN_BAND, BAR_DIR5_THRESHOLD_ATR_K * ATR_i/close_i).
+    BAR_DIR5_THRESHOLD_ATR_K: float = float(os.getenv("BAR_DIR5_THRESHOLD_ATR_K", "0.0"))
+    BAR_DIR5_MIN_BAND: float = float(os.getenv("BAR_DIR5_MIN_BAND", "0.0001"))
+    # When True, drop sideways samples and train binary up vs down (0=down, 1=up); direction head has 2 outputs.
+    BAR_DIR5_TWO_CLASS: bool = os.getenv("BAR_DIR5_TWO_CLASS", "False").lower() == "true"
+    # When True, oversample minority direction classes (down/up) in training via WeightedRandomSampler.
+    BAR_DIR5_OVERSAMPLE_MINORITY: bool = os.getenv("BAR_DIR5_OVERSAMPLE_MINORITY", "False").lower() == "true"
+    # When True, assign whole sessions to train/val/test (no leakage across split boundaries).
+    BAR_VALIDATION_SPLIT_BY_SESSION: bool = os.getenv("BAR_VALIDATION_SPLIT_BY_SESSION", "True").lower() == "true"
     # 5m direction head: 0 = single linear, >0 = hidden size for 2-layer MLP (e.g. 128).
     BAR_DIR5_HEAD_HIDDEN: int = int(os.getenv("BAR_DIR5_HEAD_HIDDEN", "128"))
     # Label smoothing for direction CrossEntropy (e.g. 0.1); can help 3-class accuracy.
@@ -105,6 +114,7 @@ class Settings(BaseSettings):
     # Breakout: require move beyond recent range by > k * ATR to count as breakout.
     BAR_BREAKOUT_ATR_K: float = float(os.getenv("BAR_BREAKOUT_ATR_K", "1.0"))
     BAR_ATR_WINDOW: int = int(os.getenv("BAR_ATR_WINDOW", "14"))
+    BAR_DROPOUT: float = float(os.getenv("BAR_DROPOUT", "0.1"))
     # Per-session normalization (inputs and optionally return/vol targets).
     BAR_NORMALIZE_INPUTS: bool = os.getenv("BAR_NORMALIZE_INPUTS", "True").lower() == "true"
     # When True, normalize each bar using only past bars (expanding window); avoids lookahead. Default False.
@@ -124,6 +134,13 @@ class Settings(BaseSettings):
     BAR_DIR5_TUNE_THRESHOLD: bool = os.getenv("BAR_DIR5_TUNE_THRESHOLD", "False").lower() == "true"
     # When True, load existing next_minute_lstm.pt (if present) and continue training from it.
     BAR_RESUME_FROM_CHECKPOINT: bool = os.getenv("BAR_RESUME_FROM_CHECKPOINT", "False").lower() == "true"
+    # Regularization and training
+    BAR_WEIGHT_DECAY: float = float(os.getenv("BAR_WEIGHT_DECAY", "1e-5"))
+    BAR_GRADIENT_CLIP_NORM: float = float(os.getenv("BAR_GRADIENT_CLIP_NORM", "0.0"))  # 0 = no clip; 1.0 typical
+    BAR_LEARNING_RATE: float = float(os.getenv("BAR_LEARNING_RATE", "1e-4"))
+    BAR_LR_SCHEDULER: str = os.getenv("BAR_LR_SCHEDULER", "none")  # none, cosine, cosine_warmup, step
+    BAR_LR_WARMUP_EPOCHS: int = int(os.getenv("BAR_LR_WARMUP_EPOCHS", "1"))
+    BAR_LR_MIN: float = float(os.getenv("BAR_LR_MIN", "1e-6"))
     IMAGE_SIZE: tuple[int, int] = (224, 224)
     VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
     TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)

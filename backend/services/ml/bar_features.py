@@ -135,6 +135,10 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     for i in range(10, n_bars):
         if closes[i - 10] > 0:
             return_10m[i] = (closes[i] - closes[i - 10]) / closes[i - 10]
+    return_15m = np.zeros(n_bars, dtype="float32")
+    for i in range(15, n_bars):
+        if closes[i - 15] > 0:
+            return_15m[i] = (closes[i] - closes[i - 15]) / closes[i - 15]
 
     # VWAP distance: (close - vwap) / vwap (normalized; positive = above VWAP)
     vwap_safe = np.where(vwap > 0, vwap, 1.0)
@@ -158,6 +162,7 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     momentum = np.nan_to_num(momentum, nan=0.0, posinf=0.0, neginf=0.0)
     return_5m = np.nan_to_num(return_5m, nan=0.0, posinf=0.0, neginf=0.0)
     return_10m = np.nan_to_num(return_10m, nan=0.0, posinf=0.0, neginf=0.0)
+    return_15m = np.nan_to_num(return_15m, nan=0.0, posinf=0.0, neginf=0.0)
     vwap_distance = np.nan_to_num(vwap_distance, nan=0.0, posinf=0.0, neginf=0.0)
     volume_delta = np.nan_to_num(volume_delta, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -171,6 +176,7 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
         momentum,
         return_5m,
         return_10m,
+        return_15m,
         vwap_distance,
         volume_delta,
     )
@@ -215,6 +221,82 @@ def _time_features(bars: Sequence[SessionMinuteBar]) -> Tuple[np.ndarray, ...]:
         is_power_hour[i] = 1.0 if 0 <= mins_to_close <= 60 else 0.0
 
     return hours, minutes, day_of_week, minutes_since_open, is_ny_open, is_power_hour
+
+
+def _regime_and_microstructure(
+    opens: np.ndarray,
+    closes: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    vols: np.ndarray,
+    rolling_vol: np.ndarray,
+    atr: np.ndarray,
+    vol_window: int = 20,
+    gap_pct_threshold: float = 1e-6,
+) -> Tuple[np.ndarray, ...]:
+    """Volatility regime, trend strength, wick/body ratios, range/ATR, volume z-score, gap flag."""
+    n_bars = len(closes)
+    eps = 1e-8
+
+    # Volatility regime: tertiles of rolling_vol (0, 0.5, 1) or single float by percentile
+    vol_regime = np.zeros(n_bars, dtype="float32")
+    if n_bars >= 3 and np.any(rolling_vol > 0):
+        p33 = np.nanpercentile(rolling_vol[rolling_vol > 0], 33.33)
+        p66 = np.nanpercentile(rolling_vol[rolling_vol > 0], 66.66)
+        vol_regime[:] = 0.5
+        vol_regime[rolling_vol <= p33] = 0.0
+        vol_regime[rolling_vol >= p66] = 1.0
+
+    # Trend strength: |close - SMA(20)| / (ATR + eps)
+    sma_period = min(20, max(1, n_bars))
+    sma = np.zeros(n_bars, dtype="float32")
+    for i in range(n_bars):
+        start = max(0, i - sma_period + 1)
+        sma[i] = float(closes[start : i + 1].mean())
+    trend_strength = np.abs(closes - sma) / (atr + eps)
+
+    # Wick/body ratios: upper_wick, lower_wick, body over range
+    bar_range = highs - lows
+    bar_range_safe = np.where(bar_range > 0, bar_range, 1.0)
+    body = np.abs(closes - opens)
+    upper_wick = highs - np.maximum(opens, closes)
+    lower_wick = np.minimum(opens, closes) - lows
+    upper_wick_ratio = np.clip(upper_wick / bar_range_safe, 0.0, 1.0)
+    lower_wick_ratio = np.clip(lower_wick / bar_range_safe, 0.0, 1.0)
+    body_ratio = np.clip(body / bar_range_safe, 0.0, 1.0)
+
+    # Range / ATR
+    range_over_atr = bar_range / (atr + eps)
+
+    # Volume z-score (rolling window)
+    vol_win = min(vol_window, n_bars)
+    volume_zscore = np.zeros(n_bars, dtype="float32")
+    for i in range(n_bars):
+        start = max(0, i - vol_win + 1)
+        w = vols[start : i + 1]
+        if w.size >= 2 and w.std() > 0:
+            volume_zscore[i] = float((vols[i] - w.mean()) / (w.std() + eps))
+        else:
+            volume_zscore[i] = 0.0
+
+    # Gap flag: 1 if |open - prev_close|/prev_close > threshold
+    gap_flag = np.zeros(n_bars, dtype="float32")
+    if n_bars > 1:
+        prev_close = closes[:-1]
+        curr_open = opens[1:]
+        gap_pct = np.abs(curr_open - prev_close) / (prev_close + eps)
+        gap_flag[1:] = (gap_pct > gap_pct_threshold).astype("float32")
+
+    return (
+        vol_regime,
+        trend_strength,
+        upper_wick_ratio,
+        lower_wick_ratio,
+        body_ratio,
+        range_over_atr,
+        volume_zscore,
+        gap_flag,
+    )
 
 
 def _atr_and_close_zscore(
@@ -284,6 +366,7 @@ def build_session_feature_matrix(
         momentum,
         return_5m,
         return_10m,
+        return_15m,
         vwap_distance,
         volume_delta,
     ) = _price_and_volatility_features(closes, vols)
@@ -291,17 +374,39 @@ def build_session_feature_matrix(
     atr_window = getattr(settings, "BAR_ATR_WINDOW", 14)
     atr, close_zscore = _atr_and_close_zscore(closes, highs, lows, atr_window=atr_window, zscore_window=20)
 
+    opens = base[:, 0].copy()
+    (
+        vol_regime,
+        trend_strength,
+        upper_wick_ratio,
+        lower_wick_ratio,
+        body_ratio,
+        range_over_atr,
+        volume_zscore,
+        gap_flag,
+    ) = _regime_and_microstructure(opens, closes, highs, lows, vols, rolling_vol, atr)
+    vol_regime = np.nan_to_num(vol_regime, nan=0.5, posinf=1.0, neginf=0.0)
+    trend_strength = np.nan_to_num(trend_strength, nan=0.0, posinf=0.0, neginf=0.0)
+    upper_wick_ratio = np.nan_to_num(upper_wick_ratio, nan=0.0, posinf=1.0, neginf=0.0)
+    lower_wick_ratio = np.nan_to_num(lower_wick_ratio, nan=0.0, posinf=1.0, neginf=0.0)
+    body_ratio = np.nan_to_num(body_ratio, nan=0.0, posinf=1.0, neginf=0.0)
+    range_over_atr = np.nan_to_num(range_over_atr, nan=0.0, posinf=0.0, neginf=0.0)
+    volume_zscore = np.nan_to_num(volume_zscore, nan=0.0, posinf=0.0, neginf=0.0)
+    gap_flag = np.nan_to_num(gap_flag, nan=0.0, posinf=1.0, neginf=0.0)
+
     hours, minutes, dow, minutes_since_open, is_ny_open, is_power_hour = _time_features(
         ordered
     )
 
-    # Stack all features: OHLCV + returns (1m/5m/10m), rolling_vol, VWAP distance, volume delta, ATR, etc.
+    # Stack all features: OHLCV + returns (1m/5m/10m/15m), rolling_vol, VWAP distance, volume delta,
+    # ATR, close_zscore, regime + microstructure (vol_regime, trend_strength, wick/body, range/ATR, vol_zscore, gap), time
     derived_cols = np.stack(
         [
             returns,        # 1m return
             log_returns,
             return_5m,
             return_10m,
+            return_15m,
             rolling_vol,
             vwap_distance,
             volume_delta,
@@ -311,6 +416,14 @@ def build_session_feature_matrix(
             momentum,
             atr,
             close_zscore,
+            vol_regime,
+            trend_strength,
+            upper_wick_ratio,
+            lower_wick_ratio,
+            body_ratio,
+            range_over_atr,
+            volume_zscore,
+            gap_flag,
             hours,
             minutes,
             dow,

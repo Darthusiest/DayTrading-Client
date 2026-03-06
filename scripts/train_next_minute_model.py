@@ -44,7 +44,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import nn, optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -68,8 +68,8 @@ TEST_RATIO = getattr(settings, "BAR_TEST_SPLIT", 0.1)
 USE_CACHE = getattr(settings, "BAR_CACHE_DATASET", True)
 REBUILD_CACHE = getattr(settings, "BAR_REBUILD_CACHE", False)
 CACHE_PATH = settings.MODELS_DIR / "next_minute_dataset.pt"
-# Bump when bar feature set changes (e.g. 5m/10m return, VWAP distance, volume delta) so old caches are invalidated.
-FEATURE_VERSION = 3
+# Bump when bar feature set changes (e.g. 15m return, regime, microstructure) so old caches are invalidated.
+FEATURE_VERSION = 4
 EARLY_STOP_PATIENCE = getattr(settings, "BAR_EARLY_STOP_PATIENCE", 5)
 EARLY_STOP_MIN_DELTA = getattr(settings, "BAR_EARLY_STOP_MIN_DELTA", 0.0)
 EARLY_STOP_METRIC = getattr(settings, "BAR_EARLY_STOP_METRIC", "breakout_10m_accuracy")
@@ -81,13 +81,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 def _direction_predict_with_confidence(
     logits: torch.Tensor,
     confidence_threshold: float,
+    num_classes: int = 3,
 ) -> torch.Tensor:
     """
-    Predict 3-class direction (0=down, 1=sideways, 2=up). If confidence_threshold > 0 and
+    Predict direction. For 3-class (0=down, 1=sideways, 2=up): if confidence_threshold > 0 and
     max(prob) >= threshold and argmax is down or up, predict that; otherwise predict sideways.
-    If threshold <= 0, use raw argmax.
+    For 2-class (0=down, 1=up): always argmax. If threshold <= 0, use raw argmax.
     """
-    if confidence_threshold <= 0:
+    if num_classes == 2 or confidence_threshold <= 0:
         return torch.argmax(logits, dim=1)
     probs = torch.softmax(logits, dim=1)
     max_prob, argmax = torch.max(probs, dim=1)
@@ -135,10 +136,13 @@ def _macro_f1_and_balanced_accuracy(
     pred: np.ndarray,
     true: np.ndarray,
     num_classes: int = 3,
-) -> Tuple[float, float]:
-    """Compute macro-F1 (mean of per-class F1) and balanced accuracy (mean of per-class recall)."""
+) -> Tuple[float, float, List[float], List[float], List[float]]:
+    """Compute macro-F1, balanced accuracy, and per-class precision, recall, F1."""
     macro_f1 = 0.0
     balanced_acc = 0.0
+    precisions: List[float] = []
+    recalls: List[float] = []
+    f1s: List[float] = []
     for c in range(num_classes):
         tp = ((pred == c) & (true == c)).sum()
         pred_c = (pred == c).sum()
@@ -148,9 +152,12 @@ def _macro_f1_and_balanced_accuracy(
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
         macro_f1 += f1
         balanced_acc += recall
+        precisions.append(float(precision))
+        recalls.append(float(recall))
+        f1s.append(float(f1))
     macro_f1 /= num_classes
     balanced_acc /= num_classes
-    return float(macro_f1), float(balanced_acc)
+    return float(macro_f1), float(balanced_acc), precisions, recalls, f1s
 
 
 def _load_bars() -> List[SessionMinuteBar]:
@@ -190,6 +197,9 @@ def _load_cached_sequences(
     expected_normalize_return: Optional[bool] = None,
     expected_normalize_vol: Optional[bool] = None,
     expected_dir5_threshold: Optional[float] = None,
+    expected_dir5_threshold_atr_k: Optional[float] = None,
+    expected_dir5_min_band: Optional[float] = None,
+    expected_dir5_two_class: Optional[bool] = None,
     expected_breakout_atr_k: Optional[float] = None,
     expected_feature_version: Optional[int] = None,
     expected_normalize_inputs_expanding: Optional[bool] = None,
@@ -200,6 +210,8 @@ def _load_cached_sequences(
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[List[Tuple[str, str]]],
     ]
 ]:
     """
@@ -230,6 +242,12 @@ def _load_cached_sequences(
         expected_meta["normalize_vol"] = expected_normalize_vol
     if expected_dir5_threshold is not None:
         expected_meta["dir5_threshold"] = expected_dir5_threshold
+    if expected_dir5_threshold_atr_k is not None:
+        expected_meta["dir5_threshold_atr_k"] = expected_dir5_threshold_atr_k
+    if expected_dir5_min_band is not None:
+        expected_meta["dir5_min_band"] = expected_dir5_min_band
+    if expected_dir5_two_class is not None:
+        expected_meta["dir5_two_class"] = expected_dir5_two_class
     if expected_breakout_atr_k is not None:
         expected_meta["breakout_atr_k"] = expected_breakout_atr_k
     if expected_feature_version is not None:
@@ -243,12 +261,16 @@ def _load_cached_sequences(
     n = data["sequences"].size(0)
     if data["targets_price"].size(0) != n:
         return None
+    session_id_per_sample = data.get("session_id_per_sample")
+    sessions = data.get("sessions")
     return (
         data["sequences"],
         data["targets_price"],
         data["targets_dir5"],
         data["targets_vol10"],
         data["targets_breakout"],
+        session_id_per_sample,
+        sessions,
     )
 
 
@@ -259,6 +281,8 @@ def _save_sequences_cache(
     targets_dir5: torch.Tensor,
     targets_vol10: torch.Tensor,
     targets_breakout: torch.Tensor,
+    session_id_per_sample: torch.Tensor,
+    sessions: List[Tuple[str, str]],
     lookback: int,
     symbols: List[str],
     num_bars: int,
@@ -270,6 +294,9 @@ def _save_sequences_cache(
     normalize_vol: bool = False,
     normalize_inputs_expanding: bool = False,
     dir5_threshold: float = 0.002,
+    dir5_threshold_atr_k: float = 0.0,
+    dir5_min_band: float = 0.0001,
+    dir5_two_class: bool = False,
     breakout_atr_k: float = 1.0,
     feature_version: int = FEATURE_VERSION,
 ) -> None:
@@ -282,6 +309,8 @@ def _save_sequences_cache(
             "targets_dir5": targets_dir5,
             "targets_vol10": targets_vol10,
             "targets_breakout": targets_breakout,
+            "session_id_per_sample": session_id_per_sample,
+            "sessions": sessions,
             "lookback": lookback,
             "symbols": symbols,
             "num_samples": sequences.size(0),
@@ -294,6 +323,9 @@ def _save_sequences_cache(
             "normalize_vol": normalize_vol,
             "normalize_inputs_expanding": normalize_inputs_expanding,
             "dir5_threshold": dir5_threshold,
+            "dir5_threshold_atr_k": dir5_threshold_atr_k,
+            "dir5_min_band": dir5_min_band,
+            "dir5_two_class": dir5_two_class,
             "breakout_atr_k": breakout_atr_k,
             "feature_version": feature_version,
         },
@@ -309,6 +341,9 @@ def _build_sequences(
     normalize_vol_target: bool = False,
     normalize_inputs_expanding: bool = False,
     dir5_threshold: float = 0.002,
+    dir5_threshold_atr_k: float = 0.0,
+    dir5_min_band: float = 0.0001,
+    dir5_two_class: bool = False,
     breakout_atr_k: float = 1.0,
     atr_window: int = 14,
 ) -> Tuple[
@@ -317,6 +352,8 @@ def _build_sequences(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
+    List[Tuple[str, str]],
 ]:
     """
     Build sliding windows of enriched bar features and multi-horizon targets.
@@ -324,9 +361,11 @@ def _build_sequences(
     Returns:
         sequences:        [N, T, F] float32  (F >= 5: OHLCV + derived; optionally per-session normalized)
         targets_price:    [N]       float32  (next-bar 1m return, optionally z-scored per session)
-        targets_dir5:     [N]       int64    (direction next 5m: 0=down,1=sideways,2=up)
+        targets_dir5:     [N]       int64    (direction next 5m: 0=down,1=sideways,2=up or 2-class 0/1)
         targets_vol10:    [N]       float32  (realized vol next 10m; optionally z-scored per session)
         targets_breakout: [N]       float32  (0/1 breakout next 10m, vol-relative)
+        session_id_per_sample: [N] int64 (session index for each sample; for session-based split)
+        sessions: list of (symbol, session_date) in chronological order
     """
     by_key: Dict[Tuple[str, str], List[SessionMinuteBar]] = defaultdict(list)
     for b in bars:
@@ -337,13 +376,15 @@ def _build_sequences(
     targets_dir5: List[int] = []
     targets_vol10: List[float] = []
     targets_breakout: List[float] = []
+    session_ids: List[int] = []
 
     items = sorted(by_key.items(), key=lambda x: x[0][1])
     total_sessions = len(items)
+    sessions_list: List[Tuple[str, str]] = [key for key, _ in items]
     if total_sessions:
         print(f"Building sequences across {total_sessions} sessions...")
 
-    for idx, ((symbol, session_date), group) in enumerate(items, start=1):
+    for session_idx, ((symbol, session_date), group) in enumerate(items):
         if len(group) <= lookback:
             continue
 
@@ -420,7 +461,7 @@ def _build_sequences(
             if normalize_return_target:
                 return_1m = (return_1m - ret_mean) / ret_std
 
-            # 2) Direction next 5m based on 5-bar ahead close
+            # 2) Direction next 5m based on 5-bar ahead close (optional volatility-adjusted band)
             idx_5 = i + 5
             if idx_5 >= n:
                 continue
@@ -430,12 +471,19 @@ def _build_sequences(
                 ret_5 = (c_5 - c_now) / c_now
             else:
                 ret_5 = 0.0
-            if ret_5 > dir5_threshold:
+            if dir5_threshold_atr_k > 0 and c_now > 0 and atr[i] >= 0:
+                atr_pct = float(atr[i]) / c_now
+                band = max(dir5_min_band, dir5_threshold_atr_k * atr_pct)
+            else:
+                band = dir5_threshold
+            if ret_5 > band:
                 dir_class = 2  # up
-            elif ret_5 < -dir5_threshold:
+            elif ret_5 < -band:
                 dir_class = 0  # down
             else:
                 dir_class = 1  # sideways
+            if dir5_two_class and dir_class == 1:
+                continue  # drop sideways for 2-class; only keep down (0) and up (2 -> remap to 1)
 
             # 3) Volatility next 10m: std of 1m returns over [i..i+9] -> prices [i..i+10]
             future_window = closes[i : i + max_ahead + 1]  # length 11
@@ -467,14 +515,16 @@ def _build_sequences(
 
             sequences.append(window)
             targets_price.append(return_1m)
-            targets_dir5.append(dir_class)
+            # For 2-class: 0=down, 1=up (remap original 2 -> 1)
+            targets_dir5.append(1 if dir_class == 2 else 0 if dir5_two_class else dir_class)
             targets_vol10.append(vol10)
             targets_breakout.append(breakout)
+            session_ids.append(session_idx)
 
         # Lightweight progress indicator for sequence-building phase
-        if total_sessions and (idx % max(1, total_sessions // 20) == 0 or idx == total_sessions):
-            pct = idx / total_sessions * 100.0
-            print(f"Sequence build progress: {idx}/{total_sessions} sessions ({pct:.1f}%)", end="\r", flush=True)
+        if total_sessions and (session_idx % max(1, total_sessions // 20) == 0 or session_idx == total_sessions - 1):
+            pct = (session_idx + 1) / total_sessions * 100.0
+            print(f"Sequence build progress: {session_idx + 1}/{total_sessions} sessions ({pct:.1f}%)", end="\r", flush=True)
 
     if total_sessions:
         print()  # move to next line after progress output
@@ -489,6 +539,7 @@ def _build_sequences(
     tgt_dir5_arr = np.asarray(targets_dir5, dtype="int64")
     tgt_vol10_arr = np.asarray(targets_vol10, dtype="float32")
     tgt_brk_arr = np.asarray(targets_breakout, dtype="float32")
+    session_id_arr = np.asarray(session_ids, dtype="int64")
 
     return (
         torch.from_numpy(seq_arr),
@@ -496,6 +547,8 @@ def _build_sequences(
         torch.from_numpy(tgt_dir5_arr),
         torch.from_numpy(tgt_vol10_arr),
         torch.from_numpy(tgt_brk_arr),
+        torch.from_numpy(session_id_arr),
+        sessions_list,
     )
 
 
@@ -567,10 +620,39 @@ def _time_split_indices(n: int, val_ratio: float, test_ratio: float) -> Tuple[ra
     return train_idx, val_idx, test_idx
 
 
+def _session_split_indices(
+    n: int,
+    session_id_per_sample: torch.Tensor,
+    sessions: List[Tuple[str, str]],
+    val_ratio: float,
+    test_ratio: float,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Return (train_idx, val_idx, test_idx) by assigning whole sessions to splits (no leakage)."""
+    num_sessions = len(sessions)
+    if num_sessions == 0:
+        return list(range(n)), [], []
+    # Session order is already chronological (sorted by session_date); split by session index
+    n_train_sess = max(1, int(round((1.0 - val_ratio - test_ratio) * num_sessions)))
+    n_val_sess = max(0, int(round(val_ratio * num_sessions)))
+    n_test_sess = num_sessions - n_train_sess - n_val_sess
+    if n_test_sess < 0:
+        n_test_sess = 0
+        n_val_sess = num_sessions - n_train_sess
+    train_session_ids = set(range(n_train_sess))
+    val_session_ids = set(range(n_train_sess, n_train_sess + n_val_sess))
+    test_session_ids = set(range(n_train_sess + n_val_sess, num_sessions))
+    sid = session_id_per_sample.detach().cpu().numpy()
+    train_idx = [i for i in range(n) if sid[i] in train_session_ids]
+    val_idx = [i for i in range(n) if sid[i] in val_session_ids]
+    test_idx = [i for i in range(n) if sid[i] in test_session_ids]
+    return train_idx, val_idx, test_idx
+
+
 def _evaluate(
     model: nn.Module,
     loader: DataLoader,
     direction_confidence_threshold: float = 0.0,
+    num_dir_classes: int = 3,
 ) -> Dict[str, float]:
     """
     Compute metrics for all tasks on a dataloader:
@@ -578,7 +660,8 @@ def _evaluate(
       - direction_5m_accuracy, direction_5m_macro_f1, direction_5m_balanced_accuracy
       - volatility_10m_rmse (10m realized volatility)
       - breakout_10m_accuracy (10m ATR breakout)
-    Direction predictions use confidence threshold when direction_confidence_threshold > 0.
+    Direction predictions use confidence threshold when direction_confidence_threshold > 0 (3-class only).
+    num_dir_classes: 2 for binary up/down, 3 for down/sideways/up.
     """
     model.eval()
     price_mae_sum = 0.0
@@ -613,7 +696,9 @@ def _evaluate(
 
             # Direction next 5m: use confidence threshold then accumulate for macro-F1
             logits = outputs["dir5_logits"]
-            pred_dir5 = _direction_predict_with_confidence(logits, direction_confidence_threshold)
+            pred_dir5 = _direction_predict_with_confidence(
+                logits, direction_confidence_threshold, num_classes=num_dir_classes
+            )
             dir5_pred_list.append(pred_dir5)
             dir5_true_list.append(tgt_dir5)
 
@@ -631,12 +716,16 @@ def _evaluate(
             brk_total += brk_matches.numel()
 
     if price_n == 0:
+        nc = num_dir_classes
         return {
             "price_mae": float("nan"),
             "price_rmse": float("nan"),
             "direction_5m_accuracy": float("nan"),
             "direction_5m_macro_f1": float("nan"),
             "direction_5m_balanced_accuracy": float("nan"),
+            "direction_5m_precision_per_class": [float("nan")] * nc,
+            "direction_5m_recall_per_class": [float("nan")] * nc,
+            "direction_5m_f1_per_class": [float("nan")] * nc,
             "volatility_10m_rmse": float("nan"),
             "breakout_10m_accuracy": float("nan"),
             "samples": 0,
@@ -651,7 +740,9 @@ def _evaluate(
     all_pred = torch.cat(dir5_pred_list, dim=0).cpu().numpy()
     all_true = torch.cat(dir5_true_list, dim=0).cpu().numpy()
     dir5_acc = float((all_pred == all_true).mean())
-    macro_f1, balanced_acc = _macro_f1_and_balanced_accuracy(all_pred, all_true, num_classes=3)
+    macro_f1, balanced_acc, prec_per_class, rec_per_class, f1_per_class = _macro_f1_and_balanced_accuracy(
+        all_pred, all_true, num_classes=num_dir_classes
+    )
 
     return {
         "price_mae": price_mae,
@@ -659,6 +750,9 @@ def _evaluate(
         "direction_5m_accuracy": dir5_acc,
         "direction_5m_macro_f1": macro_f1,
         "direction_5m_balanced_accuracy": balanced_acc,
+        "direction_5m_precision_per_class": prec_per_class,
+        "direction_5m_recall_per_class": rec_per_class,
+        "direction_5m_f1_per_class": f1_per_class,
         "volatility_10m_rmse": vol10_rmse,
         "breakout_10m_accuracy": brk_acc,
         "samples": price_n,
@@ -680,7 +774,11 @@ def main() -> None:
     normalize_vol = getattr(settings, "BAR_NORMALIZE_VOL_TARGET", False)
     normalize_inputs_expanding = getattr(settings, "BAR_NORMALIZE_INPUTS_EXPANDING", False)
     dir5_threshold = getattr(settings, "BAR_DIR5_THRESHOLD", 0.001)
+    dir5_threshold_atr_k = getattr(settings, "BAR_DIR5_THRESHOLD_ATR_K", 0.0)
+    dir5_min_band = getattr(settings, "BAR_DIR5_MIN_BAND", 0.0001)
+    dir5_two_class = getattr(settings, "BAR_DIR5_TWO_CLASS", False)
     breakout_atr_k = getattr(settings, "BAR_BREAKOUT_ATR_K", 1.0)
+    num_dir_classes = 2 if dir5_two_class else 3
 
     if USE_CACHE and not REBUILD_CACHE and CACHE_PATH.is_file():
         cached = _load_cached_sequences(
@@ -693,15 +791,28 @@ def main() -> None:
             expected_normalize_return=normalize_return,
             expected_normalize_vol=normalize_vol,
             expected_dir5_threshold=dir5_threshold,
+            expected_dir5_threshold_atr_k=dir5_threshold_atr_k,
+            expected_dir5_min_band=dir5_min_band,
+            expected_dir5_two_class=dir5_two_class,
             expected_breakout_atr_k=breakout_atr_k,
             expected_feature_version=FEATURE_VERSION,
             expected_normalize_inputs_expanding=normalize_inputs_expanding,
         )
         if cached is not None:
-            sequences, targets_price, targets_dir5, targets_vol10, targets_breakout = cached
+            (
+                sequences,
+                targets_price,
+                targets_dir5,
+                targets_vol10,
+                targets_breakout,
+                session_id_per_sample,
+                sessions,
+            ) = cached
             n = sequences.size(0)
             print(f"Using cached sequences from {CACHE_PATH} ({n} samples, built from {len(bars)} bars).")
         else:
+            session_id_per_sample = None
+            sessions = None
             if CACHE_PATH.is_file():
                 print("Cache exists but is stale or incompatible (lookback/symbols/bar count). Rebuilding...")
     atr_window = getattr(settings, "BAR_ATR_WINDOW", 14)
@@ -718,6 +829,8 @@ def main() -> None:
             targets_dir5,
             targets_vol10,
             targets_breakout,
+            session_id_per_sample,
+            sessions,
         ) = _build_sequences(
             bars,
             LOOKBACK,
@@ -726,6 +839,9 @@ def main() -> None:
             normalize_vol_target=normalize_vol,
             normalize_inputs_expanding=normalize_inputs_expanding,
             dir5_threshold=dir5_threshold,
+            dir5_threshold_atr_k=dir5_threshold_atr_k,
+            dir5_min_band=dir5_min_band,
+            dir5_two_class=dir5_two_class,
             breakout_atr_k=breakout_atr_k,
             atr_window=atr_window,
         )
@@ -741,6 +857,8 @@ def main() -> None:
                 targets_dir5,
                 targets_vol10,
                 targets_breakout,
+                session_id_per_sample,
+                sessions,
                 lookback=LOOKBACK,
                 symbols=settings.SYMBOLS,
                 num_bars=len(bars),
@@ -752,16 +870,29 @@ def main() -> None:
                 normalize_vol=normalize_vol,
                 normalize_inputs_expanding=normalize_inputs_expanding,
                 dir5_threshold=dir5_threshold,
+                dir5_threshold_atr_k=dir5_threshold_atr_k,
+                dir5_min_band=dir5_min_band,
+                dir5_two_class=dir5_two_class,
                 breakout_atr_k=breakout_atr_k,
                 feature_version=FEATURE_VERSION,
             )
             print(f"Saved dataset cache to {CACHE_PATH}.")
 
-    train_idx, val_idx, test_idx = _time_split_indices(n, VAL_RATIO, TEST_RATIO)
-    print(
-        f"Split sizes -> train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)} "
-        f"(VAL_RATIO={VAL_RATIO}, TEST_RATIO={TEST_RATIO})"
-    )
+    split_by_session = getattr(settings, "BAR_VALIDATION_SPLIT_BY_SESSION", True)
+    if split_by_session and session_id_per_sample is not None and sessions is not None:
+        train_idx, val_idx, test_idx = _session_split_indices(
+            n, session_id_per_sample, sessions, VAL_RATIO, TEST_RATIO
+        )
+        print(
+            f"Split by session -> train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)} "
+            f"(VAL_RATIO={VAL_RATIO}, TEST_RATIO={TEST_RATIO})"
+        )
+    else:
+        train_idx, val_idx, test_idx = _time_split_indices(n, VAL_RATIO, TEST_RATIO)
+        print(
+            f"Split sizes -> train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)} "
+            f"(VAL_RATIO={VAL_RATIO}, TEST_RATIO={TEST_RATIO})"
+        )
 
     train_dataset = NextMinuteBarDataset(
         sequences[train_idx],
@@ -799,22 +930,45 @@ def main() -> None:
         train_dir5_np = train_dir5.numpy()
     else:
         train_dir5_np = np.asarray(train_dir5)
-    dir5_counts = np.bincount(train_dir5_np.astype(int), minlength=3)
+    dir5_counts = np.bincount(train_dir5_np.astype(int), minlength=num_dir_classes)
     dir5_total = int(dir5_counts.sum())
-    print(
-        f"5m direction class distribution (train): down={dir5_counts[0]}, sideways={dir5_counts[1]}, up={dir5_counts[2]} "
-        f"(total={dir5_total})"
-    )
-    # Inverse frequency weights; optionally scale up minority classes (down=0, up=2) to improve direction accuracy
-    dir5_weights = np.ones(3, dtype="float32")
-    for c in range(3):
+    if num_dir_classes == 2:
+        print(
+            f"5m direction class distribution (train): down={dir5_counts[0]}, up={dir5_counts[1]} "
+            f"(total={dir5_total}, 2-class)"
+        )
+    else:
+        print(
+            f"5m direction class distribution (train): down={dir5_counts[0]}, sideways={dir5_counts[1]}, up={dir5_counts[2]} "
+            f"(total={dir5_total})"
+        )
+    # Inverse frequency weights; optionally scale up minority (down=0, up=1 or 2)
+    dir5_weights = np.ones(num_dir_classes, dtype="float32")
+    for c in range(num_dir_classes):
         if dir5_counts[c] > 0:
-            dir5_weights[c] = dir5_total / (3.0 * dir5_counts[c])
+            dir5_weights[c] = dir5_total / (float(num_dir_classes) * dir5_counts[c])
     minority_scale = getattr(settings, "BAR_DIR5_MINORITY_WEIGHT_SCALE", 1.0)
     if minority_scale != 1.0:
         dir5_weights[0] *= minority_scale  # down
-        dir5_weights[2] *= minority_scale  # up
+        dir5_weights[num_dir_classes - 1] *= minority_scale  # up
     dir5_weight_tensor = torch.from_numpy(dir5_weights).to(DEVICE)
+
+    # Optional: oversample minority direction classes in training
+    oversample_minority = getattr(settings, "BAR_DIR5_OVERSAMPLE_MINORITY", False)
+    if oversample_minority:
+        weights_per_class = 1.0 / (dir5_counts.astype(np.float64) + 1e-8)
+        sample_weights = weights_per_class[train_dir5_np.astype(int)]
+        train_sampler = WeightedRandomSampler(
+            torch.from_numpy(sample_weights.astype(np.float32)),
+            num_samples=len(sample_weights),
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler
+        )
+        print("Training with WeightedRandomSampler (oversampling minority direction classes).")
+    else:
+        train_sampler = None
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # Breakout class balance (train) and pos_weight for BCE
     train_brk = targets_breakout[train_idx]
@@ -827,14 +981,16 @@ def main() -> None:
     print(f"10m breakout class balance (train): pos={brk_pos}, neg={brk_neg} (pos_rate={brk_pos / max(1, train_brk_np.size):.3f})")
     brk_pos_weight = torch.tensor([brk_neg / max(1, brk_pos)], dtype=torch.float32, device=DEVICE) if brk_pos > 0 else None
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False) if val_dataset else None
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False) if test_dataset else None
 
     input_size = sequences.size(2)
-    config = NextMinuteModelConfig(input_size=input_size)
+    config = NextMinuteModelConfig(input_size=input_size, num_dir_classes=num_dir_classes)
     if getattr(config, "direction_head_hidden", 0) > 0:
-        print(f"5m direction head: 2-layer MLP (hidden={config.direction_head_hidden}) for better accuracy.")
+        print(
+            f"5m direction head: 2-layer MLP (hidden={config.direction_head_hidden}, "
+            f"num_classes={num_dir_classes}) for better accuracy."
+        )
     model = NextMinuteBarLSTM(config).to(DEVICE)
 
     # Optional: continue from previous training (load saved checkpoint if present)
@@ -991,7 +1147,9 @@ def main() -> None:
             "samples": 0,
         }
         if val_loader is not None:
-            val_metrics = _evaluate(model, val_loader, direction_confidence_threshold)
+            val_metrics = _evaluate(
+                model, val_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes
+            )
 
         print(
             f"Epoch {epoch + 1}/{EPOCHS} "
@@ -1042,7 +1200,9 @@ def main() -> None:
         best_f1 = -1.0
         best_th = 0.0
         for th in thresholds:
-            m = _evaluate(model, val_loader, direction_confidence_threshold=th)
+            m = _evaluate(
+                model, val_loader, direction_confidence_threshold=th, num_dir_classes=num_dir_classes
+            )
             f1 = m.get("direction_5m_macro_f1", -1.0)
             if not math.isnan(f1) and f1 > best_f1:
                 best_f1 = f1
@@ -1051,8 +1211,16 @@ def main() -> None:
         print(f"Tuned confidence threshold on val: {best_th} (macro-F1={best_f1:.4f}).")
 
     print("Evaluating on validation and test sets...")
-    val_summary = _evaluate(model, val_loader, direction_confidence_threshold) if val_loader is not None else None
-    test_summary = _evaluate(model, test_loader, direction_confidence_threshold) if test_loader is not None else None
+    val_summary = (
+        _evaluate(model, val_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes)
+        if val_loader is not None
+        else None
+    )
+    test_summary = (
+        _evaluate(model, test_loader, direction_confidence_threshold, num_dir_classes=num_dir_classes)
+        if test_loader is not None
+        else None
+    )
 
     models_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), ckpt_path)
@@ -1098,6 +1266,14 @@ def main() -> None:
         print(f"    direction_5m_accuracy:       {val_summary.get('direction_5m_accuracy', float('nan')):.4f}")
         print(f"    direction_5m_macro_f1:       {val_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
         print(f"    direction_5m_balanced_acc:   {val_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
+        dir_names = ["down", "up"] if num_dir_classes == 2 else ["down", "sideways", "up"]
+        for name, prec, rec, f1 in zip(
+            dir_names,
+            val_summary.get("direction_5m_precision_per_class", []),
+            val_summary.get("direction_5m_recall_per_class", []),
+            val_summary.get("direction_5m_f1_per_class", []),
+        ):
+            print(f"      {name}: P={prec:.4f} R={rec:.4f} F1={f1:.4f}")
         print(f"    samples:                     {val_summary.get('samples', 0):,}")
     print()
     print("  Test metrics (breakout + volatility primary):")
@@ -1109,6 +1285,14 @@ def main() -> None:
         print(f"    direction_5m_accuracy:       {test_summary.get('direction_5m_accuracy', float('nan')):.4f}")
         print(f"    direction_5m_macro_f1:       {test_summary.get('direction_5m_macro_f1', float('nan')):.4f}")
         print(f"    direction_5m_balanced_acc:   {test_summary.get('direction_5m_balanced_accuracy', float('nan')):.4f}")
+        dir_names = ["down", "up"] if num_dir_classes == 2 else ["down", "sideways", "up"]
+        for name, prec, rec, f1 in zip(
+            dir_names,
+            test_summary.get("direction_5m_precision_per_class", []),
+            test_summary.get("direction_5m_recall_per_class", []),
+            test_summary.get("direction_5m_f1_per_class", []),
+        ):
+            print(f"      {name}: P={prec:.4f} R={rec:.4f} F1={f1:.4f}")
         print(f"    samples:                     {test_summary.get('samples', 0):,}")
     print("=" * 60)
 

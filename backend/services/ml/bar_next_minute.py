@@ -71,9 +71,11 @@ class NextMinuteModelConfig:
     input_size: int  # number of per-bar features (e.g. OHLCV -> 5)
     hidden_size: int = settings.LSTM_HIDDEN_SIZE
     num_layers: int = settings.NUM_LSTM_LAYERS
-    dropout: float = 0.1
-    # 5m direction head: 0 = single Linear(hidden, 3); >0 = MLP hidden size (e.g. 128) for better direction accuracy.
+    dropout: float = getattr(settings, "BAR_DROPOUT", 0.1)
+    # 5m direction head: 0 = single Linear(hidden, num_dir_classes); >0 = MLP hidden size (e.g. 128).
     direction_head_hidden: int = getattr(settings, "BAR_DIR5_HEAD_HIDDEN", 0)
+    # 2 = binary up/down, 3 = down/sideways/up
+    num_dir_classes: int = 2 if getattr(settings, "BAR_DIR5_TWO_CLASS", False) else 3
 
 
 class NextMinuteBarLSTM(nn.Module):
@@ -106,16 +108,17 @@ class NextMinuteBarLSTM(nn.Module):
         # 1) Next-bar return regression (1m return, not raw price)
         self.price_head = nn.Linear(config.hidden_size, 1)
 
-        # 2) Direction next 5m (3-way classification: 0=down,1=sideways,2=up)
+        # 2) Direction next 5m (num_dir_classes: 2 = up/down, 3 = down/sideways/up)
+        num_dir = getattr(config, "num_dir_classes", 3)
         if getattr(config, "direction_head_hidden", 0) > 0:
             self.dir5_head = nn.Sequential(
                 nn.Linear(config.hidden_size, config.direction_head_hidden),
                 nn.ReLU(),
                 nn.Dropout(config.dropout),
-                nn.Linear(config.direction_head_hidden, 3),
+                nn.Linear(config.direction_head_hidden, num_dir),
             )
         else:
-            self.dir5_head = nn.Linear(config.hidden_size, 3)
+            self.dir5_head = nn.Linear(config.hidden_size, num_dir)
 
         # 3) Volatility next 10m (regression)
         self.vol10_head = nn.Linear(config.hidden_size, 1)
@@ -131,7 +134,7 @@ class NextMinuteBarLSTM(nn.Module):
         Returns:
             Dict of predictions:
               - price: [B]        next-bar 1m return (or z-scored return)
-              - dir5_logits: [B,3] logits for direction next 5m
+              - dir5_logits: [B, num_dir_classes] logits for direction next 5m
               - vol10: [B]        volatility next 10m
               - breakout: [B]     logits for breakout next 10m (apply sigmoid for probability)
         """

@@ -108,6 +108,56 @@ class Settings(BaseSettings):
     BAR_WF_TEST_DAYS: int = int(os.getenv("BAR_WF_TEST_DAYS", "90"))  # e.g. 3 months
     BAR_WF_SLIDE_DAYS: int = int(os.getenv("BAR_WF_SLIDE_DAYS", "90"))  # slide by this many days each fold
     BAR_WF_VAL_RATIO: float = float(os.getenv("BAR_WF_VAL_RATIO", "0.1"))  # val = last 10% of train sessions per fold
+
+    # ---------------------------------------------------------------------
+    # Event-driven 1-hour direction models (continuation / reversal)
+    # ---------------------------------------------------------------------
+    EVENT_LOOKBACK: int = int(os.getenv("EVENT_LOOKBACK", "60"))
+    EVENT_BATCH_SIZE: int = int(os.getenv("EVENT_BATCH_SIZE", "256"))
+    EVENT_LR: float = float(os.getenv("EVENT_LR", "1e-4"))
+    EVENT_EPOCHS: int = int(os.getenv("EVENT_EPOCHS", "15"))
+    EVENT_EARLY_STOP_METRIC: str = os.getenv("EVENT_EARLY_STOP_METRIC", "f1")
+    EVENT_EARLY_STOP_PATIENCE: int = int(os.getenv("EVENT_EARLY_STOP_PATIENCE", "5"))
+    EVENT_WEIGHT_DECAY: float = float(os.getenv("EVENT_WEIGHT_DECAY", "1e-5"))
+    EVENT_GRAD_CLIP_NORM: float = float(os.getenv("EVENT_GRAD_CLIP_NORM", "0.0"))
+    EVENT_DROPOUT: float = float(os.getenv("EVENT_DROPOUT", "0.1"))
+
+    # Dataset caching
+    EVENT_REBUILD_CACHE: bool = os.getenv("EVENT_REBUILD_CACHE", "True").lower() == "true"
+
+    # Split ratios (session-based)
+    EVENT_VAL_RATIO: float = float(os.getenv("EVENT_VAL_RATIO", "0.1"))
+    EVENT_TEST_RATIO: float = float(os.getenv("EVENT_TEST_RATIO", "0.1"))
+
+    # Significant-move triggers (enable/disable)
+    EVENT_ENABLE_PDH_PDL: bool = os.getenv("EVENT_ENABLE_PDH_PDL", "True").lower() == "true"
+    EVENT_ENABLE_ORB: bool = os.getenv("EVENT_ENABLE_ORB", "True").lower() == "true"
+    EVENT_ENABLE_ATR_EXPANSION: bool = os.getenv("EVENT_ENABLE_ATR_EXPANSION", "True").lower() == "true"
+    EVENT_ENABLE_IMPULSE_VOLUME: bool = os.getenv("EVENT_ENABLE_IMPULSE_VOLUME", "True").lower() == "true"
+    EVENT_ENABLE_BOS: bool = os.getenv("EVENT_ENABLE_BOS", "True").lower() == "true"
+
+    # Trigger parameters
+    EVENT_ORB_MINUTES: int = int(os.getenv("EVENT_ORB_MINUTES", "15"))
+    EVENT_BOS_LOOKBACK: int = int(os.getenv("EVENT_BOS_LOOKBACK", "30"))
+    EVENT_ATR_EXPANSION_K: float = float(os.getenv("EVENT_ATR_EXPANSION_K", "1.0"))
+    EVENT_RANGE_ATR_K: float = float(os.getenv("EVENT_RANGE_ATR_K", "1.5"))
+    EVENT_IMPULSE_RANGE_ATR_K: float = float(os.getenv("EVENT_IMPULSE_RANGE_ATR_K", "1.5"))
+    EVENT_IMPULSE_VOL_Z: float = float(os.getenv("EVENT_IMPULSE_VOL_Z", "2.0"))
+
+    # Labeling band (avoid tiny 1-hour moves; makes targets less noisy)
+    EVENT_LABEL_BAND_ATR_K: float = float(os.getenv("EVENT_LABEL_BAND_ATR_K", "0.8"))
+    EVENT_LABEL_MIN_BAND: float = float(os.getenv("EVENT_LABEL_MIN_BAND", "0.0006"))
+
+    # London session range (for fib scaling features). Times in session TZ (default America/New_York).
+    EVENT_LONDON_START: str = os.getenv("EVENT_LONDON_START", "03:00")
+    EVENT_LONDON_END: str = os.getenv("EVENT_LONDON_END", "05:00")
+
+    # Optional walk-forward for event models (rolling train/test windows)
+    EVENT_WALK_FORWARD: bool = os.getenv("EVENT_WALK_FORWARD", "False").lower() == "true"
+    EVENT_WF_TRAIN_DAYS: int = int(os.getenv("EVENT_WF_TRAIN_DAYS", "365"))
+    EVENT_WF_TEST_DAYS: int = int(os.getenv("EVENT_WF_TEST_DAYS", "90"))
+    EVENT_WF_SLIDE_DAYS: int = int(os.getenv("EVENT_WF_SLIDE_DAYS", "90"))
+    EVENT_WF_VAL_RATIO: float = float(os.getenv("EVENT_WF_VAL_RATIO", "0.1"))
     # 5m direction head: 0 = single linear, >0 = hidden size for 2-layer MLP (e.g. 128).
     BAR_DIR5_HEAD_HIDDEN: int = int(os.getenv("BAR_DIR5_HEAD_HIDDEN", "128"))
     # Label smoothing for direction CrossEntropy (e.g. 0.1); can help 3-class accuracy.

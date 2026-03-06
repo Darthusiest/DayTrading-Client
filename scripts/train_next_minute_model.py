@@ -60,7 +60,7 @@ from backend.services.ml.bar_features import build_session_feature_matrix  # noq
 
 
 LOOKBACK = settings.BAR_LOOKBACK
-BATCH_SIZE = getattr(settings, "BAR_BATCH_SIZE", 256)
+BATCH_SIZE = getattr(settings, "BAR_BATCH_SIZE", 128)
 EPOCHS = getattr(settings, "BAR_NUM_EPOCHS", 10)
 LEARNING_RATE = getattr(settings, "BAR_LEARNING_RATE", settings.LEARNING_RATE)
 VAL_RATIO = getattr(settings, "BAR_VAL_SPLIT", 0.1)

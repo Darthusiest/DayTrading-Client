@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     BAR_EARLY_STOP_METRIC: str = os.getenv("BAR_EARLY_STOP_METRIC", "direction_5m_accuracy")
     # Lookback window (bars). 15–30 recommended for next-minute; 120–240 for direction-focused runs.
     BAR_LOOKBACK: int = int(os.getenv("BAR_LOOKBACK", "30"))
+    # Batch size for next-minute LSTM. Smaller (e.g. 128) = more gradient updates per epoch.
+    BAR_BATCH_SIZE: int = int(os.getenv("BAR_BATCH_SIZE", "128"))
     # dir5 (5m direction): threshold for up/down. Sideways if |ret_5m| < threshold. Smaller = fewer sideways (rarer).
     # 0.0003 = 0.03% (only very small 5m returns count as sideways).
     BAR_DIR5_THRESHOLD: float = float(os.getenv("BAR_DIR5_THRESHOLD", "0.0003"))

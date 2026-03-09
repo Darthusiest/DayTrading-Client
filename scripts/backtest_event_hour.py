@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
@@ -73,6 +74,10 @@ def run_backtest(
     prefix: str = "event_hour_backtest",
     batch_size: int = 512,
     risk: RiskConfig | None = None,
+    min_confidence: float = 0.0,
+    min_action_margin: float = 0.0,
+    min_continuation_prob: float = 0.0,
+    min_reversal_prob: float = 0.0,
 ) -> dict[str, object]:
     cache_path = settings.MODELS_DIR / "event_hour_dataset.pt"
     if not cache_path.is_file():
@@ -81,6 +86,7 @@ def run_backtest(
     data = torch.load(cache_path, map_location="cpu")
     sequences = data["sequences"].float()
     event_type = data["event_type"].long()
+    event_dir = data.get("event_dir")
     targets_cont = data["targets_cont"].float().numpy()
     targets_rev = data["targets_rev"].float().numpy()
     forward_returns = data.get("forward_return_60m")
@@ -89,6 +95,11 @@ def run_backtest(
     else:
         # Fallback for legacy caches that only contain binary labels.
         realized_returns = np.where(targets_cont >= 0.5, 0.0025, -0.0025).astype(np.float32)
+    if event_dir is None:
+        # Legacy fallback: odd ids are up events, even ids are down events.
+        event_dir_np = np.asarray([(int(et.item()) % 2 == 1) for et in event_type], dtype=np.int64)
+    else:
+        event_dir_np = event_dir.long().numpy()
 
     input_size = int(sequences.size(2))
     cont_model = _load_model("event_hour_continuation", input_size=input_size)
@@ -108,20 +119,42 @@ def run_backtest(
     rev_probs = _predict_probs(rev_model, sequences, event_type, rev_temp, batch_size)
 
     action = np.full(cont_probs.shape[0], "none", dtype=object)
+    reason_counts: Counter[str] = Counter()
     for i in range(action.size):
-        c_hit = cont_probs[i] >= cont_threshold
-        r_hit = rev_probs[i] >= rev_threshold
+        if event_dir_np[i] not in (0, 1):
+            reason_counts["invalid_event_dir"] += 1
+            continue
+        confidence = float(max(cont_probs[i], rev_probs[i]))
+        if confidence < min_confidence:
+            reason_counts["below_confidence"] += 1
+            continue
+        c_hit = (cont_probs[i] >= cont_threshold) and (cont_probs[i] >= min_continuation_prob)
+        r_hit = (rev_probs[i] >= rev_threshold) and (rev_probs[i] >= min_reversal_prob)
+        if not c_hit and not r_hit:
+            reason_counts["below_model_threshold"] += 1
+            continue
+        margin = float(abs(cont_probs[i] - rev_probs[i]))
+        if margin < min_action_margin:
+            reason_counts["below_margin"] += 1
+            continue
         if c_hit and (not r_hit or cont_probs[i] >= rev_probs[i]):
             action[i] = "continuation"
         elif r_hit:
             action[i] = "reversal"
+        else:
+            reason_counts["unresolved_action"] += 1
 
     ts0 = datetime(2020, 1, 1)
     signals: List[Signal] = []
     for i, a in enumerate(action):
         if a == "none":
             continue
-        direction = SignalDirection.LONG if a == "continuation" else SignalDirection.SHORT
+        # event_dir uses 1=up, 0=down; continuation follows event direction, reversal opposes it.
+        if a == "continuation":
+            direction = SignalDirection.LONG if event_dir_np[i] == 1 else SignalDirection.SHORT
+        else:
+            direction = SignalDirection.SHORT if event_dir_np[i] == 1 else SignalDirection.LONG
+        action_margin = float(abs(cont_probs[i] - rev_probs[i]))
         confidence = float(max(cont_probs[i], rev_probs[i]))
         signals.append(
             Signal(
@@ -133,8 +166,11 @@ def run_backtest(
                 horizon_minutes=60,
                 metadata={
                     "event_type": int(event_type[i].item()),
+                    "event_dir": int(event_dir_np[i]),
                     "continuation_prob": float(cont_probs[i]),
                     "reversal_prob": float(rev_probs[i]),
+                    "action": str(a),
+                    "action_margin": action_margin,
                 },
             )
         )
@@ -182,6 +218,12 @@ def run_backtest(
         "samples": int(action.size),
         "trades": trades,
         "trade_rate": float(trades / max(1, int(action.size))),
+        "signals_filtered": int((action == "none").sum()),
+        "filter_reason_counts": dict(reason_counts),
+        "min_confidence": float(min_confidence),
+        "min_action_margin": float(min_action_margin),
+        "min_continuation_prob": float(min_continuation_prob),
+        "min_reversal_prob": float(min_reversal_prob),
         "continuation_threshold": cont_threshold,
         "reversal_threshold": rev_threshold,
         "continuation_temperature": cont_temp,
@@ -257,6 +299,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size for inference")
     parser.add_argument("--risk-per-trade", type=float, default=0.01, help="Risk fraction of capital per trade")
     parser.add_argument("--min-confidence", type=float, default=0.0, help="Minimum signal confidence required")
+    parser.add_argument("--min-action-margin", type=float, default=0.0, help="Require abs(continuation_prob - reversal_prob) >= this")
+    parser.add_argument("--min-continuation-prob", type=float, default=0.0, help="Extra continuation probability floor")
+    parser.add_argument("--min-reversal-prob", type=float, default=0.0, help="Extra reversal probability floor")
     parser.add_argument("--fee-per-trade", type=float, default=0.10, help="Flat fee cost per trade")
     parser.add_argument("--slippage-bps", type=float, default=1.0, help="Slippage in basis points")
     args = parser.parse_args()
@@ -269,6 +314,10 @@ def main() -> None:
             fee_per_trade=args.fee_per_trade,
             slippage_bps=args.slippage_bps,
         ),
+        min_confidence=args.min_confidence,
+        min_action_margin=args.min_action_margin,
+        min_continuation_prob=args.min_continuation_prob,
+        min_reversal_prob=args.min_reversal_prob,
     )
     summary = result["summary"]
     print("Saved backtest summary:", result["summary_path"])

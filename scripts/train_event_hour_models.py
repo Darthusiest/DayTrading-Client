@@ -534,6 +534,7 @@ def _build_event_dataset(
     impulse_vol_z = float(getattr(settings, "EVENT_IMPULSE_VOL_Z", 2.0))
     label_band_k = float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.35))
     label_min_band = float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0002))
+    max_abs_ret_60m = float(getattr(settings, "EVENT_MAX_ABS_RET_60M", 0.20))
 
     # Continuation filter settings
     cont_require_orb_bos = bool(getattr(settings, "EVENT_CONT_REQUIRE_ORB_AND_BOS", True))
@@ -649,7 +650,13 @@ def _build_event_dataset(
             opens = all_feat[:, 0].astype("float32")
             atr = _compute_atr(highs, lows, closes, atr_window)
             ret_1m = np.zeros(n, dtype="float32")
-            ret_1m[1:] = np.where(closes[:-1] > 0, (closes[1:] - closes[:-1]) / closes[:-1], 0.0)
+            if n > 1:
+                np.divide(
+                    closes[1:] - closes[:-1],
+                    closes[:-1],
+                    out=ret_1m[1:],
+                    where=closes[:-1] > 0,
+                )
             bar_range = highs - lows
             range_over_atr = bar_range / (atr + 1e-8)
             vol = all_feat[:, 4].astype("float32")
@@ -676,7 +683,13 @@ def _build_event_dataset(
                             other_lows = other_lows[idxs2]
                     other_atr = _compute_atr(other_highs, other_lows, other_closes, atr_window)
                     other_ret_1m = np.zeros(n, dtype="float32")
-                    other_ret_1m[1:] = np.where(other_closes[:-1] > 0, (other_closes[1:] - other_closes[:-1]) / other_closes[:-1], 0.0)
+                    if n > 1:
+                        np.divide(
+                            other_closes[1:] - other_closes[:-1],
+                            other_closes[:-1],
+                            out=other_ret_1m[1:],
+                            where=other_closes[:-1] > 0,
+                        )
 
                     spread_ret_1m = ret_1m - other_ret_1m
                     # SMT divergence: HH/LL break mismatch over smt_lookback window
@@ -757,6 +770,8 @@ def _build_event_dataset(
                 # Compute 60m return
                 c1 = float(closes[i + horizon_minutes])
                 ret_60 = (c1 - c0) / c0 if c0 > 0 else 0.0
+                if abs(ret_60) > max_abs_ret_60m:
+                    continue
 
                 # Determine event(s) at i
                 events: List[Tuple[int, int]] = []  # (event_type_id, event_dir +1/-1)
@@ -923,6 +938,7 @@ def _build_event_dataset(
             "smt_lookback": int(smt_lookback),
             "label_band_atr_k": float(label_band_k),
             "label_min_band": float(label_min_band),
+            "max_abs_ret_60m": float(max_abs_ret_60m),
             "cont_require_orb_bos": bool(cont_require_orb_bos),
             "cont_max_minutes": int(cont_max_minutes),
             "cont_require_no_smt": bool(cont_require_no_smt),
@@ -1231,6 +1247,9 @@ def main() -> None:
         if float(meta.get("label_min_band", -1.0)) != float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0002)):
             print("Event dataset cache min band mismatch; rebuilding.")
             rebuild = True
+        if float(meta.get("max_abs_ret_60m", -1.0)) != float(getattr(settings, "EVENT_MAX_ABS_RET_60M", 0.20)):
+            print("Event dataset cache max_abs_ret_60m mismatch; rebuilding.")
+            rebuild = True
         if bool(meta.get("cont_require_orb_bos", True)) != bool(getattr(settings, "EVENT_CONT_REQUIRE_ORB_AND_BOS", True)):
             print("Event dataset cache continuation ORB+BOS setting mismatch; rebuilding.")
             rebuild = True
@@ -1366,14 +1385,16 @@ def main() -> None:
             print("Walk-forward: no folds completed. Exiting.")
             return
 
-        def _best_fold(model_key: str) -> int:
+        selection_metric = str(getattr(settings, "EVENT_EARLY_STOP_METRIC", "f1"))
+
+        def _best_fold(model_key: str, metric_key: str) -> int:
             best_i = 0
             best_v = -1.0
             for i, r in enumerate(fold_rows):
                 m = r.get(model_key, {})
                 if isinstance(m, dict):
-                    ts = m.get("test", {}) if isinstance(m.get("test", {}), dict) else {}
-                    v = ts.get("f1", -1.0)
+                    vs = m.get("val", {}) if isinstance(m.get("val", {}), dict) else {}
+                    v = vs.get(metric_key, -1.0)
                     try:
                         v = float(v)
                     except Exception:
@@ -1383,8 +1404,8 @@ def main() -> None:
                         best_i = i
             return best_i
 
-        best_cont_i = _best_fold("cont")
-        best_rev_i = _best_fold("rev")
+        best_cont_i = _best_fold("cont", selection_metric)
+        best_rev_i = _best_fold("rev", selection_metric)
 
         # Save final best models to canonical paths in data/models/
         for key, best_i, final_name in [
@@ -1403,6 +1424,8 @@ def main() -> None:
             # Write final metrics as best fold + wf summary
             final_metrics = {
                 "walk_forward": True,
+                "selection_split": "val",
+                "selection_metric": selection_metric,
                 "best_fold": int(fold_rows[best_i]["fold"]),
                 "best_fold_window": {
                     "train_start": fold_rows[best_i]["train_start"],
@@ -1417,6 +1440,7 @@ def main() -> None:
                         "train_end": r["train_end"],
                         "test_start": r["test_start"],
                         "test_end": r["test_end"],
+                        "val_metric": (r.get(key, {}).get("val", {}) or {}).get(selection_metric) if isinstance(r.get(key, {}), dict) else None,
                         "test_f1": (r.get(key, {}).get("test", {}) or {}).get("f1") if isinstance(r.get(key, {}), dict) else None,
                         "test_accuracy": (r.get(key, {}).get("test", {}) or {}).get("accuracy") if isinstance(r.get(key, {}), dict) else None,
                         "test_pos_rate": (r.get(key, {}).get("test", {}) or {}).get("pos_rate") if isinstance(r.get(key, {}), dict) else None,

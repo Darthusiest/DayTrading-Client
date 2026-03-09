@@ -213,6 +213,8 @@ def _load_cached_sequences(
     expected_breakout_atr_k: Optional[float] = None,
     expected_feature_version: Optional[int] = None,
     expected_normalize_inputs_expanding: Optional[bool] = None,
+    expected_max_abs_ret_1m: Optional[float] = None,
+    expected_max_abs_ret_5m: Optional[float] = None,
 ) -> Optional[
     Tuple[
         torch.Tensor,
@@ -264,6 +266,10 @@ def _load_cached_sequences(
         expected_meta["feature_version"] = expected_feature_version
     if expected_normalize_inputs_expanding is not None:
         expected_meta["normalize_inputs_expanding"] = expected_normalize_inputs_expanding
+    if expected_max_abs_ret_1m is not None:
+        expected_meta["max_abs_ret_1m"] = expected_max_abs_ret_1m
+    if expected_max_abs_ret_5m is not None:
+        expected_meta["max_abs_ret_5m"] = expected_max_abs_ret_5m
     if not _cache_metadata_matches(data, expected_meta):
         return None
     if num_bars_expected is not None and data.get("num_bars") != num_bars_expected:
@@ -309,6 +315,8 @@ def _save_sequences_cache(
     dir5_two_class: bool = False,
     breakout_atr_k: float = 1.0,
     feature_version: int = FEATURE_VERSION,
+    max_abs_ret_1m: float = 0.10,
+    max_abs_ret_5m: float = 0.20,
 ) -> None:
     """Save built sequences and metadata to a .pt file for future runs."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,6 +346,8 @@ def _save_sequences_cache(
             "dir5_two_class": dir5_two_class,
             "breakout_atr_k": breakout_atr_k,
             "feature_version": feature_version,
+            "max_abs_ret_1m": max_abs_ret_1m,
+            "max_abs_ret_5m": max_abs_ret_5m,
         },
         cache_path,
     )
@@ -356,6 +366,8 @@ def _build_sequences(
     dir5_two_class: bool = False,
     breakout_atr_k: float = 1.0,
     atr_window: int = 14,
+    max_abs_ret_1m: float = 0.10,
+    max_abs_ret_5m: float = 0.20,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -460,6 +472,9 @@ def _build_sequences(
         for i in range(lookback, n - max_ahead):
             # History window for input sequence
             window = all_feat[i - lookback : i]
+            # Skip windows containing non-finite values from noisy upstream bars/features.
+            if not np.all(np.isfinite(window)):
+                continue
 
             # 1) Next-bar return target (1m forward return from close at i-1 to close at i)
             prev_close = closes[i - 1]
@@ -468,6 +483,8 @@ def _build_sequences(
                 return_1m = (curr_close - prev_close) / prev_close
             else:
                 return_1m = 0.0
+            if abs(float(session_returns_1m[i])) > max_abs_ret_1m:
+                continue
             if normalize_return_target:
                 return_1m = (return_1m - ret_mean) / ret_std
 
@@ -494,6 +511,8 @@ def _build_sequences(
                 dir_class = 1  # sideways
             if dir5_two_class and dir_class == 1:
                 continue  # drop sideways for 2-class; only keep down (0) and up (2 -> remap to 1)
+            if abs(float(ret_5)) > max_abs_ret_5m:
+                continue
 
             # 3) Volatility next 10m: std of 1m returns over [i..i+9] -> prices [i..i+10]
             future_window = closes[i : i + max_ahead + 1]  # length 11
@@ -1142,6 +1161,8 @@ def main() -> None:
     dir5_min_band = getattr(settings, "BAR_DIR5_MIN_BAND", 0.0001)
     dir5_two_class = getattr(settings, "BAR_DIR5_TWO_CLASS", False)
     breakout_atr_k = getattr(settings, "BAR_BREAKOUT_ATR_K", 1.0)
+    max_abs_ret_1m = getattr(settings, "BAR_MAX_ABS_RET_1M", 0.10)
+    max_abs_ret_5m = getattr(settings, "BAR_MAX_ABS_RET_5M", 0.20)
     num_dir_classes = 2 if dir5_two_class else 3
 
     if USE_CACHE and not REBUILD_CACHE and CACHE_PATH.is_file():
@@ -1161,6 +1182,8 @@ def main() -> None:
             expected_breakout_atr_k=breakout_atr_k,
             expected_feature_version=FEATURE_VERSION,
             expected_normalize_inputs_expanding=normalize_inputs_expanding,
+            expected_max_abs_ret_1m=max_abs_ret_1m,
+            expected_max_abs_ret_5m=max_abs_ret_5m,
         )
         if cached is not None:
             (
@@ -1208,6 +1231,8 @@ def main() -> None:
             dir5_two_class=dir5_two_class,
             breakout_atr_k=breakout_atr_k,
             atr_window=atr_window,
+            max_abs_ret_1m=max_abs_ret_1m,
+            max_abs_ret_5m=max_abs_ret_5m,
         )
         n = sequences.size(0)
         print(f"Built {n} sequences.")
@@ -1239,6 +1264,8 @@ def main() -> None:
                 dir5_two_class=dir5_two_class,
                 breakout_atr_k=breakout_atr_k,
                 feature_version=FEATURE_VERSION,
+                max_abs_ret_1m=max_abs_ret_1m,
+                max_abs_ret_5m=max_abs_ret_5m,
             )
             print(f"Saved dataset cache to {CACHE_PATH}.")
 

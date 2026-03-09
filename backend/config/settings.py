@@ -184,6 +184,8 @@ class Settings(BaseSettings):
     EVENT_WF_TEST_DAYS: int = int(os.getenv("EVENT_WF_TEST_DAYS", "90"))
     EVENT_WF_SLIDE_DAYS: int = int(os.getenv("EVENT_WF_SLIDE_DAYS", "90"))
     EVENT_WF_VAL_RATIO: float = float(os.getenv("EVENT_WF_VAL_RATIO", "0.1"))
+    # Cleaning: ignore unrealistic 60m label moves (likely bad ticks/data glitches)
+    EVENT_MAX_ABS_RET_60M: float = float(os.getenv("EVENT_MAX_ABS_RET_60M", "0.20"))
     # 5m direction head: 0 = single linear, >0 = hidden size for 2-layer MLP (e.g. 128).
     BAR_DIR5_HEAD_HIDDEN: int = int(os.getenv("BAR_DIR5_HEAD_HIDDEN", "128"))
     # Label smoothing for direction CrossEntropy (e.g. 0.1); can help 3-class accuracy.
@@ -225,6 +227,9 @@ class Settings(BaseSettings):
     BAR_LR_SCHEDULER: str = os.getenv("BAR_LR_SCHEDULER", "none")  # none, cosine, cosine_warmup, step
     BAR_LR_WARMUP_EPOCHS: int = int(os.getenv("BAR_LR_WARMUP_EPOCHS", "1"))
     BAR_LR_MIN: float = float(os.getenv("BAR_LR_MIN", "1e-6"))
+    # Cleaning: drop samples with extreme returns that usually indicate noisy input data
+    BAR_MAX_ABS_RET_1M: float = float(os.getenv("BAR_MAX_ABS_RET_1M", "0.10"))
+    BAR_MAX_ABS_RET_5M: float = float(os.getenv("BAR_MAX_ABS_RET_5M", "0.20"))
     IMAGE_SIZE: tuple[int, int] = (224, 224)
     VALIDATION_SPLIT: float = 0.2  # Fraction for validation (time-based split)
     TEST_SPLIT: float = 0.1        # Fraction for test set (time-based split)

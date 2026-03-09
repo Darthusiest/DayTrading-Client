@@ -363,6 +363,23 @@ def process_training_data_from_bars_only(db: Session) -> dict:
             if not bars or len(bars) < 2:
                 skipped += 1
                 continue
+            # Filter sessions with obviously invalid OHLC values to reduce noisy inputs.
+            invalid_ohlc = any(
+                (
+                    not np.isfinite(float(b.open_price))
+                    or not np.isfinite(float(b.high_price))
+                    or not np.isfinite(float(b.low_price))
+                    or not np.isfinite(float(b.close_price))
+                    or float(b.open_price) <= 0.0
+                    or float(b.high_price) <= 0.0
+                    or float(b.low_price) <= 0.0
+                    or float(b.close_price) <= 0.0
+                )
+                for b in bars
+            )
+            if invalid_ohlc:
+                skipped += 1
+                continue
 
             first_open = float(bars[0].open_price)
             last_close = float(bars[-1].close_price)

@@ -22,16 +22,18 @@ def _make_png_bytes(width=10, height=10):
 class TestPredictPost:
     def test_valid_upload_200(self, client, tmp_path, monkeypatch):
         monkeypatch.setattr("backend.api.routes.predict.settings.RAW_DATA_DIR", tmp_path)
-        with patch("backend.api.routes.predict.predictor") as m_pred:
-            with patch("backend.api.routes.predict.feature_extractor") as m_feat:
-                m_pred.model_loaded = True
-                m_pred.predict.return_value = {
-                    "predicted_price": 21000.0,
-                    "probability_hit": 0.75,
-                    "model_confidence": 0.75,
-                    "learning_score": 75.0,
-                }
-                m_feat.extract_features.return_value = {"hour": 9, "minute": 30}
+        m_pred = MagicMock()
+        m_feat = MagicMock()
+        m_pred.model_loaded = True
+        m_pred.predict.return_value = {
+            "predicted_price": 21000.0,
+            "probability_hit": 0.75,
+            "model_confidence": 0.75,
+            "learning_score": 75.0,
+        }
+        m_feat.extract_features.return_value = {"hour": 9, "minute": 30}
+        with patch("backend.api.routes.predict._get_predictor", return_value=m_pred):
+            with patch("backend.api.routes.predict._get_feature_extractor", return_value=m_feat):
                 png = _make_png_bytes()
                 r = client.post(
                     f"{PREFIX}/predict",
@@ -65,16 +67,18 @@ class TestPredictPost:
 
     def test_with_expected_price_saved_in_db(self, client, db_session, tmp_path, monkeypatch):
         monkeypatch.setattr("backend.api.routes.predict.settings.RAW_DATA_DIR", tmp_path)
-        with patch("backend.api.routes.predict.predictor") as m_pred:
-            with patch("backend.api.routes.predict.feature_extractor") as m_feat:
-                m_pred.model_loaded = True
-                m_pred.predict.return_value = {
-                    "predicted_price": 21050.0,
-                    "probability_hit": 0.8,
-                    "model_confidence": 0.8,
-                    "learning_score": 80.0,
-                }
-                m_feat.extract_features.return_value = {}
+        m_pred = MagicMock()
+        m_feat = MagicMock()
+        m_pred.model_loaded = True
+        m_pred.predict.return_value = {
+            "predicted_price": 21050.0,
+            "probability_hit": 0.8,
+            "model_confidence": 0.8,
+            "learning_score": 80.0,
+        }
+        m_feat.extract_features.return_value = {}
+        with patch("backend.api.routes.predict._get_predictor", return_value=m_pred):
+            with patch("backend.api.routes.predict._get_feature_extractor", return_value=m_feat):
                 png = _make_png_bytes()
                 r = client.post(
                     f"{PREFIX}/predict",
@@ -89,16 +93,18 @@ class TestPredictPost:
 
     def test_without_expected_price_null_in_db(self, client, db_session, tmp_path, monkeypatch):
         monkeypatch.setattr("backend.api.routes.predict.settings.RAW_DATA_DIR", tmp_path)
-        with patch("backend.api.routes.predict.predictor") as m_pred:
-            with patch("backend.api.routes.predict.feature_extractor") as m_feat:
-                m_pred.model_loaded = True
-                m_pred.predict.return_value = {
-                    "predicted_price": 21000.0,
-                    "probability_hit": 0.7,
-                    "model_confidence": 0.7,
-                    "learning_score": 70.0,
-                }
-                m_feat.extract_features.return_value = {}
+        m_pred = MagicMock()
+        m_feat = MagicMock()
+        m_pred.model_loaded = True
+        m_pred.predict.return_value = {
+            "predicted_price": 21000.0,
+            "probability_hit": 0.7,
+            "model_confidence": 0.7,
+            "learning_score": 70.0,
+        }
+        m_feat.extract_features.return_value = {}
+        with patch("backend.api.routes.predict._get_predictor", return_value=m_pred):
+            with patch("backend.api.routes.predict._get_feature_extractor", return_value=m_feat):
                 png = _make_png_bytes()
                 r = client.post(
                     f"{PREFIX}/predict",

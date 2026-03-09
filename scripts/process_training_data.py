@@ -6,14 +6,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.database.db import SessionLocal
-from backend.services.data_processing.training_data_pipeline import process_training_data_from_snapshots
+from backend.services.pipeline.orchestrator import build_datasets
 
 
 def main():
     """Process snapshots into training samples."""
     db = SessionLocal()
     try:
-        result = process_training_data_from_snapshots(db)
+        result = build_datasets(db, mode="snapshots")
         print(f"Created: {result['created']}, Skipped: {result['skipped']}")
         if result["errors"]:
             for err in result["errors"]:

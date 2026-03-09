@@ -567,6 +567,7 @@ def _build_event_dataset(
     seqs: List[np.ndarray] = []
     y_cont: List[float] = []
     y_rev: List[float] = []
+    y_forward_return_60m: List[float] = []
     cont_eligible_list: List[int] = []
     event_dir_list: List[int] = []
     event_type_list: List[int] = []
@@ -880,6 +881,7 @@ def _build_event_dataset(
                     # Training will further filter by eligibility when building the continuation dataset.
                     y_cont.append(cont if cont_ok else 0.0)
                     y_rev.append(rev)
+                    y_forward_return_60m.append(float(ret_60))
                     cont_eligible_list.append(1 if cont_eligible_final else 0)
                     event_dir_list.append(1 if edir > 0 else 0)  # 1=up,0=down
                     event_type_list.append(int(etype))
@@ -894,6 +896,7 @@ def _build_event_dataset(
     sequences = torch.from_numpy(np.stack(seqs).astype("float32"))
     t_cont = torch.from_numpy(np.asarray(y_cont, dtype="float32"))
     t_rev = torch.from_numpy(np.asarray(y_rev, dtype="float32"))
+    t_ret60 = torch.from_numpy(np.asarray(y_forward_return_60m, dtype="float32"))
     cont_eligible = torch.from_numpy(np.asarray(cont_eligible_list, dtype="int64"))
     event_dir = torch.from_numpy(np.asarray(event_dir_list, dtype="int64"))
     event_type = torch.from_numpy(np.asarray(event_type_list, dtype="int64"))
@@ -904,6 +907,7 @@ def _build_event_dataset(
         "sequences": sequences,
         "targets_cont": t_cont,
         "targets_rev": t_rev,
+        "forward_return_60m": t_ret60,
         "cont_eligible": cont_eligible,
         "event_dir": event_dir,
         "event_type": event_type,
@@ -1206,6 +1210,7 @@ def main() -> None:
         sequences = data["sequences"]
         targets_cont = data["targets_cont"]
         targets_rev = data["targets_rev"]
+        forward_return_60m = data.get("forward_return_60m")
         cont_eligible = data.get("cont_eligible")
         event_type = data["event_type"]
         event_dir = data["event_dir"]
@@ -1241,6 +1246,9 @@ def main() -> None:
         if not meta.get("session_phase", False):
             print("Event dataset cache missing session_phase; rebuilding.")
             rebuild = True
+        if forward_return_60m is None:
+            print("Event dataset cache missing forward_return_60m; rebuilding.")
+            rebuild = True
         print(f"Using cached event dataset: {cache_path} (N={sequences.size(0)})")
     if not cache_path.is_file() or rebuild:
         print(f"Building event dataset (lookback={lookback})...")
@@ -1248,6 +1256,7 @@ def main() -> None:
         sequences = built["sequences"]
         targets_cont = built["targets_cont"]
         targets_rev = built["targets_rev"]
+        forward_return_60m = built["forward_return_60m"]
         cont_eligible = built.get("cont_eligible")
         event_type = built["event_type"]
         event_dir = built["event_dir"]
@@ -1260,6 +1269,7 @@ def main() -> None:
                 "sequences": sequences,
                 "targets_cont": targets_cont,
                 "targets_rev": targets_rev,
+                "forward_return_60m": forward_return_60m,
                 "cont_eligible": cont_eligible,
                 "event_type": event_type,
                 "event_dir": event_dir,

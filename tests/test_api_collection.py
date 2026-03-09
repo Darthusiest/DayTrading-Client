@@ -8,7 +8,7 @@ PREFIX = "/api/v1"
 
 class TestCollectionRun:
     def test_post_run_default_capture_screenshots_true(self, client):
-        with patch("backend.api.routes.collection.run_collection") as m_run:
+        with patch("backend.api.routes.collection.process_session") as m_run:
             m_run.return_value = {"collected": 2, "failed": 0, "snapshot_type": "before", "errors": []}
             r = client.post(f"{PREFIX}/collection/run")
         assert r.status_code == 200
@@ -17,7 +17,7 @@ class TestCollectionRun:
         assert call_kw.get("capture_screenshots", True) is True
 
     def test_post_run_capture_screenshots_false(self, client):
-        with patch("backend.api.routes.collection.run_collection") as m_run:
+        with patch("backend.api.routes.collection.process_session") as m_run:
             m_run.return_value = {"collected": 0, "failed": 0, "snapshot_type": "none", "errors": []}
             r = client.post(f"{PREFIX}/collection/run?capture_screenshots=false")
         assert r.status_code == 200
@@ -42,7 +42,7 @@ class TestCaptureNow:
 
 class TestIngestDatabento:
     def test_post_no_params(self, client):
-        with patch("backend.api.routes.collection.run_ingestion") as m_ingest:
+        with patch("backend.api.routes.collection.ingest_market_data") as m_ingest:
             m_ingest.return_value = {"files_processed": 0, "bars_inserted": 0, "errors": ["No files"]}
             r = client.post(f"{PREFIX}/collection/ingest-databento")
         assert r.status_code == 200
@@ -52,7 +52,7 @@ class TestIngestDatabento:
         assert kwargs.get("dry_run") is False
 
     def test_post_with_path_and_dry_run(self, client):
-        with patch("backend.api.routes.collection.run_ingestion") as m_ingest:
+        with patch("backend.api.routes.collection.ingest_market_data") as m_ingest:
             m_ingest.return_value = {"files_processed": 1, "bars_inserted": 0, "errors": []}
             r = client.post(f"{PREFIX}/collection/ingest-databento?path=/tmp/foo&dry_run=true")
         assert r.status_code == 200
@@ -64,15 +64,12 @@ class TestIngestDatabento:
 
 class TestProcessTrainingData:
     def test_post_aggregates_results(self, client):
-        with patch("backend.api.routes.collection.process_training_data_from_snapshots") as m_snap:
-            with patch("backend.api.routes.collection.process_training_data_from_session_candles") as m_sess:
-                m_snap.return_value = {"created": 5, "skipped": 0, "errors": []}
-                m_sess.return_value = {"created": 3, "skipped": 1, "errors": []}
-                r = client.post(f"{PREFIX}/collection/process-training-data")
+        with patch("backend.api.routes.collection.build_datasets") as m_build:
+            m_build.return_value = {"created": 5, "skipped": 1, "errors": []}
+            r = client.post(f"{PREFIX}/collection/process-training-data")
         assert r.status_code == 200
         data = r.json()
-        assert data["created"] == 8
+        assert data["created"] == 5
         assert data["skipped"] == 1
-        assert "before_after" in data
-        assert "session_candles" in data
+        assert "bars_only" in data
         assert len(data["errors"]) == 0

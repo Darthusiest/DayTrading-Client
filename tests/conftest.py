@@ -45,8 +45,12 @@ def db_session(db_engine):
 @pytest.fixture
 def client(db_session):
     """FastAPI TestClient with get_db overridden to use the test db_session."""
+    from backend.config.settings import settings
     from backend.api.main import app
     from backend.database.db import get_db
+
+    # Keep tests open by default; specific auth behavior can be tested separately.
+    settings.API_KEY = ""
 
     def override_get_db():
         yield db_session

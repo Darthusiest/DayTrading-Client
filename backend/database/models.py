@@ -158,3 +158,20 @@ class UserNote(Base):
     prediction_id = Column(Integer, ForeignKey("predictions.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class JobRun(Base):
+    """Persisted background/sync job status for training/backtests and ops tasks."""
+
+    __tablename__ = "job_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(String(64), nullable=False, unique=True, index=True)
+    job_type = Column(String(50), nullable=False, index=True)  # training, backtest, ingest, etc.
+    status = Column(String(20), nullable=False, index=True)  # pending, running, completed, failed, skipped
+    requested_by = Column(String(100), nullable=True)
+    error = Column(Text, nullable=True)
+    details = Column(JSON, nullable=True)
+    started_at = Column(DateTime, nullable=True, index=True)
+    finished_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

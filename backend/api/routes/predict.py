@@ -9,10 +9,17 @@ from backend.database.models import Prediction
 from backend.services.ml.inference.predictor import Predictor
 from backend.services.data_processing.feature_extractor import FeatureExtractor
 from backend.config.settings import settings
+from backend.services.ml.model_registry import get_or_create_object
 
 router = APIRouter(prefix="/predict", tags=["prediction"])
-predictor = Predictor()
-feature_extractor = FeatureExtractor()
+
+
+def _get_predictor() -> Predictor:
+    return get_or_create_object("predictor", Predictor)
+
+
+def _get_feature_extractor() -> FeatureExtractor:
+    return get_or_create_object("feature_extractor", FeatureExtractor)
 
 
 @router.post("")
@@ -43,6 +50,7 @@ async def predict_price(
     """
     try:
         # Load model if not already loaded
+        predictor = _get_predictor()
         if not predictor.model_loaded:
             predictor.load_model(db=db)
         
@@ -57,6 +65,7 @@ async def predict_price(
             f.write(content)
         
         # Extract features
+        feature_extractor = _get_feature_extractor()
         features = feature_extractor.extract_features(
             filepath,
             datetime.now(),

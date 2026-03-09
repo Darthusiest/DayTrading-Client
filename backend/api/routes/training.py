@@ -1,7 +1,7 @@
 """Training API endpoints."""
 import logging
-from pathlib import Path
-from typing import Optional
+from datetime import datetime
+from typing import Any
 
 import torch
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
@@ -9,19 +9,23 @@ from sqlalchemy.orm import Session
 from torch.utils.data import DataLoader
 
 from backend.config.settings import settings
-from backend.database.db import get_db
-from backend.database.models import TrainingSample, ModelCheckpoint
+from backend.database.db import SessionLocal, get_db
+from backend.database.models import JobRun, TrainingSample, ModelCheckpoint
 from backend.services.data_processing.image_preprocessor import ImagePreprocessor
 from backend.services.ml.models.price_predictor import PricePredictor, price_predictor_kwargs_from_settings
 from backend.services.ml.training.trainer import Trainer, PriceDataset
+from backend.api.deps.security import require_api_key
+from backend.services.ops.jobs import create_job, get_job, update_job
 
 router = APIRouter(prefix="/train", tags=["training"])
 logger = logging.getLogger(__name__)
 MIN_TRAIN_SAMPLES = 2  # Lowered for early-stage testing; increase when you have more data
 
 
-def train_model_task(db: Session):
+def train_model_task(job_id: str):
     """Background task for training the model."""
+    db = SessionLocal()
+    update_job(db, job_id, status="running", started_at=datetime.utcnow())
     try:
         # Get training samples (time-ordered)
         samples = db.query(TrainingSample).filter(
@@ -31,6 +35,7 @@ def train_model_task(db: Session):
 
         if len(samples) < MIN_TRAIN_SAMPLES:
             logger.warning(f"Insufficient training samples: {len(samples)}")
+            update_job(db, job_id, status="skipped", finished_at=datetime.utcnow())
             return
 
         # Time-based split: train / validation / test
@@ -108,16 +113,27 @@ def train_model_task(db: Session):
         db.commit()
 
         logger.info(f"Training completed. Best val loss: {history['best_val_loss']}. Plot: {history.get('plot_path')}")
+        update_job(
+            db,
+            job_id,
+            status="completed",
+            finished_at=datetime.utcnow(),
+            details={"best_val_loss": history.get("best_val_loss"), "plot_path": history.get("plot_path")},
+        )
 
     except Exception as e:
         logger.error(f"Training failed: {e}")
         db.rollback()
+        update_job(db, job_id, status="failed", error=str(e), finished_at=datetime.utcnow())
+    finally:
+        db.close()
 
 
 @router.post("")
 def trigger_training(
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
 ):
     """Trigger model training on available data."""
     # Check if there's enough data
@@ -133,12 +149,20 @@ def trigger_training(
         )
     
     # Start training in background
-    background_tasks.add_task(train_model_task, db)
+    job = create_job(
+        db,
+        job_type="training",
+        status="pending",
+        details={"training_samples": sample_count},
+    )
+    job_id = job.job_id
+    background_tasks.add_task(train_model_task, job_id)
     
     return {
         "status": "training_started",
         "message": "Model training started in background",
-        "training_samples": sample_count
+        "training_samples": sample_count,
+        "job_id": job_id,
     }
 
 
@@ -177,3 +201,20 @@ def get_training_status(db: Session = Depends(get_db)):
     except Exception as e:
         logger.exception("get_training_status failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/jobs/{job_id}")
+def get_training_job(job_id: str, db: Session = Depends(get_db)):
+    job = get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Training job not found: {job_id}")
+    return {
+        "job_id": job.job_id,
+        "job_type": job.job_type,
+        "status": job.status,
+        "error": job.error,
+        "details": job.details or {},
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+    }

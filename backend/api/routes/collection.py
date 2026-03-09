@@ -7,10 +7,8 @@ from backend.database.db import get_db
 from backend.config.settings import settings
 from backend.services.data_collection.collector import run_collection, capture_snapshot_now, run_session_candle_capture
 from backend.services.data_collection.scheduler import get_scheduler
-from backend.services.data_processing.training_data_pipeline import (
-    process_training_data_from_bars_only,
-)
-from backend.services.data_collection.databento_ingestion import run_ingestion
+from backend.services.pipeline.orchestrator import build_datasets, ingest_market_data, process_session
+from backend.api.deps.security import require_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -21,15 +19,13 @@ router = APIRouter(prefix="/collection", tags=["collection"])
 def run_collection_now(
     capture_screenshots: bool = True,
     db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
 ):
     """
     Run data collection once now (before or after snapshot based on current time).
     Optionally disable screenshot capture.
     """
-    result = run_collection(
-        db,
-        capture_screenshots=capture_screenshots,
-    )
+    result = process_session(db, capture_screenshots=capture_screenshots)
     return result
 
 
@@ -38,6 +34,7 @@ def capture_chart_now(
     symbol: str = "MNQ1!",
     interval: int = 15,
     db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
 ):
     """
     Fetch a screenshot of the current TradingView chart for the selected symbol and
@@ -67,6 +64,7 @@ def capture_chart_now(
 def run_session_candles_now(
     session_date: str | None = None,
     db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
 ):
     """
     Run session candle capture from first bar after session start to session end (e.g. 9:31–16:00 ET) at 1m, 5m, 15m, 1h for all symbols.
@@ -80,17 +78,21 @@ def ingest_databento_now(
     path: str | None = None,
     dry_run: bool = False,
     db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
 ):
     """
     Ingest Databento OHLCV-1m batch files from data/databento/raw/ (or optional path) into session_minute_bars.
     Optional query: path=<file or dir> to restrict to a single file or directory; dry_run=true to decode only.
     """
     path_override = Path(path) if path else None
-    return run_ingestion(db, path_override=path_override, dry_run=dry_run)
+    return ingest_market_data(db, path_override=path_override, dry_run=dry_run)
 
 
 @router.post("/process-training-data")
-def process_training_data_now(db: Session = Depends(get_db)):
+def process_training_data_now(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
+):
     """
     Build training samples **only** from bar-only (Databento SessionMinuteBar) data.
 
@@ -98,7 +100,7 @@ def process_training_data_now(db: Session = Depends(get_db)):
     one `TrainingSample` per (session_date, symbol) using aggregated OHLCV bars so
     the model trains purely on numerical market data.
     """
-    result_bars = process_training_data_from_bars_only(db)
+    result_bars = build_datasets(db, mode="bars_only")
     return {
         "bars_only": result_bars,
         "created": result_bars["created"],

@@ -8,10 +8,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 from backend.config.settings import settings
 from backend.database.db import SessionLocal
-from backend.services.data_collection.collector import run_collection, run_session_candle_capture
-from backend.services.data_processing.training_data_pipeline import (
-    process_training_data_from_bars_only,
-)
+from backend.services.data_collection.collector import run_session_candle_capture
+from backend.services.pipeline.orchestrator import build_datasets, process_session
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +28,10 @@ def _scheduled_collection_job(snapshot_type: Optional[str] = None) -> None:
     logger.info("Scheduled data collection started (snapshot_type=%s)", snapshot_type)
     db = SessionLocal()
     try:
-        result = run_collection(
+        result = process_session(
             db,
-            snapshot_type_override=snapshot_type,
-            capture_screenshots=getattr(
-                settings, "COLLECTION_CAPTURE_SCREENSHOTS", True
-            ),
+            snapshot_type=snapshot_type,
+            capture_screenshots=getattr(settings, "COLLECTION_CAPTURE_SCREENSHOTS", True),
         )
         logger.info(
             "Scheduled collection finished: collected=%s failed=%s type=%s",
@@ -78,7 +74,7 @@ def _scheduled_process_training_data_job() -> None:
     logger.info("Scheduled bar-only process_training_data started")
     db = SessionLocal()
     try:
-        result_bars = process_training_data_from_bars_only(db)
+        result_bars = build_datasets(db, mode="bars_only")
         logger.info(
             "Bar-only process_training_data finished: bars_only_created=%s skipped=%s",
             result_bars["created"],

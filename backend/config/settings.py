@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     APP_NAME: str = "Day Trading AI Agent"
     VERSION: str = "1.0.0"
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
+    RUN_MODE: str = os.getenv("RUN_MODE", "DEV").upper()  # DEV, BACKTEST_ONLY, LIVE_PAPER
+    API_KEY: str = os.getenv("API_KEY", "")
     
     # Database (default SQLite so app runs without PostgreSQL; set DATABASE_URL for Postgres)
     DATABASE_URL: str = os.getenv(
@@ -250,9 +252,24 @@ class Settings(BaseSettings):
         case_sensitive = True
         extra = "ignore"  # Ignore unknown env vars (e.g. legacy POLYGON_* after removal)
 
+    @computed_field
+    @property
+    def REQUIRE_API_KEY(self) -> bool:
+        return bool(self.API_KEY.strip())
+
 
 # Create data directories if they don't exist
 settings = Settings()
+if settings.RUN_MODE == "DEV":
+    settings.ENABLE_SCHEDULED_COLLECTION = False
+    settings.ENABLE_SESSION_CANDLE_CAPTURE = False
+elif settings.RUN_MODE == "BACKTEST_ONLY":
+    settings.ENABLE_SCHEDULED_COLLECTION = False
+    settings.ENABLE_SESSION_CANDLE_CAPTURE = False
+    settings.COLLECTION_CAPTURE_SCREENSHOTS = False
+elif settings.RUN_MODE == "LIVE_PAPER":
+    # Keep explicit for readability and to make this mode discoverable.
+    settings.ENABLE_SCHEDULED_COLLECTION = True
 settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 settings.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)

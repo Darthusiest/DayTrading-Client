@@ -18,6 +18,8 @@ alembic==1.12.1
 
 # ML & training (next-minute LSTM, price predictor, curves)
 torch>=2.6.0
+optuna>=3.0.0
+scipy>=1.10.0
 torchvision>=0.21.0
 numpy>=1.26.0,<2
 matplotlib>=3.7.0

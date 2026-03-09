@@ -162,6 +162,32 @@ class Settings(BaseSettings):
     # Labeling band (avoid tiny 1-hour moves; makes targets less noisy). Lower = more positives.
     EVENT_LABEL_BAND_ATR_K: float = float(os.getenv("EVENT_LABEL_BAND_ATR_K", "0.35"))
     EVENT_LABEL_MIN_BAND: float = float(os.getenv("EVENT_LABEL_MIN_BAND", "0.0002"))
+    # Exclude event spike from label: compute ret from close[i+skip] to close[i+skip+horizon]
+    EVENT_LABEL_SKIP_FIRST_MINUTES: int = int(os.getenv("EVENT_LABEL_SKIP_FIRST_MINUTES", "5"))
+    # Skip event at bar i if any event fired within last N minutes (avoid overlapping labels)
+    EVENT_MIN_GAP_FROM_PREV_EVENT: int = int(os.getenv("EVENT_MIN_GAP_FROM_PREV_EVENT", "15"))
+    # Early stop: require improvement > delta to reset patience
+    EVENT_EARLY_STOP_MIN_DELTA: float = float(os.getenv("EVENT_EARLY_STOP_MIN_DELTA", "0.0"))
+    # Regime / session features for event model
+    EVENT_ENABLE_REGIME_FEATURES: bool = os.getenv("EVENT_ENABLE_REGIME_FEATURES", "True").lower() == "true"
+    EVENT_ENABLE_EVENT_TYPE_FEATURES: bool = os.getenv("EVENT_ENABLE_EVENT_TYPE_FEATURES", "True").lower() == "true"
+    # Direction + magnitude: only label cont/rev if |ret_60| > max(band, k * ATR/close)
+    EVENT_LABEL_MIN_MOVE_ATR_K: float = float(os.getenv("EVENT_LABEL_MIN_MOVE_ATR_K", "0.0"))  # 0 = use band only
+    # Label horizon (45, 60, 90 minutes)
+    EVENT_LABEL_HORIZON_MINUTES: int = int(os.getenv("EVENT_LABEL_HORIZON_MINUTES", "60"))
+    # Near-miss non-events: add bars with similar vol profile but no event as negatives
+    EVENT_ADD_NEAR_MISS_SAMPLES: bool = os.getenv("EVENT_ADD_NEAR_MISS_SAMPLES", "False").lower() == "true"
+    EVENT_NEAR_MISS_MAX_PER_SESSION: int = int(os.getenv("EVENT_NEAR_MISS_MAX_PER_SESSION", "20"))
+    # Down-sample easy negatives: drop with prob (1-ratio) when |ret_60| < 0.5*band
+    EVENT_DOWNSAMPLE_EASY_NEG_RATIO: float = float(os.getenv("EVENT_DOWNSAMPLE_EASY_NEG_RATIO", "1.0"))
+    # Cost-aware: weight loss by 1 + |ret_60|/atr_pct (penalize wrong predictions on large moves)
+    EVENT_LOSS_WEIGHT_BY_MAGNITUDE: bool = os.getenv("EVENT_LOSS_WEIGHT_BY_MAGNITUDE", "False").lower() == "true"
+    # Use validation PnL proxy as early-stop metric (EVENT_EARLY_STOP_METRIC=val_pnl_proxy)
+    EVENT_VAL_PNL_PROXY: bool = os.getenv("EVENT_VAL_PNL_PROXY", "False").lower() == "true"
+    # Calibration: temperature (default) or platt
+    EVENT_CALIBRATION_METHOD: str = os.getenv("EVENT_CALIBRATION_METHOD", "temperature")
+    # Train separate models by vol regime (low/mid/high); inference picks by current regime
+    EVENT_TRAIN_BY_REGIME: bool = os.getenv("EVENT_TRAIN_BY_REGIME", "False").lower() == "true"
 
     # Continuation setup filter (to reduce noise): require ORB+BOS same direction and no SMT divergence.
     EVENT_CONT_REQUIRE_ORB_AND_BOS: bool = os.getenv("EVENT_CONT_REQUIRE_ORB_AND_BOS", "True").lower() == "true"

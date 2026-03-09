@@ -53,19 +53,26 @@ def _predict_probs(
     model: EventHourLSTM,
     sequences: torch.Tensor,
     event_types: torch.Tensor,
-    temperature: float,
+    calibration: dict,
     batch_size: int,
 ) -> np.ndarray:
     ds = TensorDataset(sequences, event_types)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
     out: List[np.ndarray] = []
-    t = max(1e-6, float(temperature))
+    method = str(calibration.get("method", "temperature"))
     with torch.no_grad():
         for seq, et in loader:
             seq = seq.to(DEVICE)
             et = et.to(DEVICE)
-            logits = model(seq, event_type=et) / t
-            probs = torch.sigmoid(logits).detach().cpu().numpy()
+            logits = model(seq, event_type=et)
+            if method.lower() == "platt":
+                a = float(calibration.get("A", 1.0))
+                b = float(calibration.get("B", 0.0))
+                scaled = a * logits + b
+            else:
+                t = max(1e-6, float(calibration.get("temperature", 1.0)))
+                scaled = logits / t
+            probs = torch.sigmoid(scaled).detach().cpu().numpy()
             out.append(probs)
     return np.concatenate(out, axis=0) if out else np.asarray([], dtype=np.float32)
 
@@ -112,11 +119,11 @@ def run_backtest(
 
     cont_threshold = float(cont_metrics.get("best_threshold", 0.5))
     rev_threshold = float(rev_metrics.get("best_threshold", 0.5))
-    cont_temp = float(cont_cal.get("temperature", 1.0))
-    rev_temp = float(rev_cal.get("temperature", 1.0))
+    cont_cal = cont_cal or {"method": "temperature", "temperature": 1.0}
+    rev_cal = rev_cal or {"method": "temperature", "temperature": 1.0}
 
-    cont_probs = _predict_probs(cont_model, sequences, event_type, cont_temp, batch_size)
-    rev_probs = _predict_probs(rev_model, sequences, event_type, rev_temp, batch_size)
+    cont_probs = _predict_probs(cont_model, sequences, event_type, cont_cal, batch_size)
+    rev_probs = _predict_probs(rev_model, sequences, event_type, rev_cal, batch_size)
 
     action = np.full(cont_probs.shape[0], "none", dtype=object)
     reason_counts: Counter[str] = Counter()
@@ -226,8 +233,8 @@ def run_backtest(
         "min_reversal_prob": float(min_reversal_prob),
         "continuation_threshold": cont_threshold,
         "reversal_threshold": rev_threshold,
-        "continuation_temperature": cont_temp,
-        "reversal_temperature": rev_temp,
+        "continuation_calibration": cont_cal,
+        "reversal_calibration": rev_cal,
         "hit_rate": float(stats["hit_rate"]),
         "avg_pnl": float(stats["avg_pnl"]),
         "total_pnl": float(stats["total_pnl"]),
@@ -265,22 +272,68 @@ def run_backtest(
             indent=2,
         )
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+    # Compute drawdown and chart data
+    drawdown = np.zeros_like(equity)
     if trades:
-        ax[0].plot(np.arange(1, trades + 1), equity, color="steelblue", linewidth=1.5)
-    ax[0].set_title("Event-hour strategy equity curve")
-    ax[0].set_xlabel("Trade #")
-    ax[0].set_ylabel("Cumulative PnL (unit)")
-    ax[0].grid(True, alpha=0.3)
+        peak = np.maximum.accumulate(equity)
+        drawdown = peak - equity
+    chart_data = {
+        "trade_count": int(trades),
+        "equity_curve": equity.tolist(),
+        "drawdown": drawdown.tolist(),
+        "trade_pnl": trade_pnl.tolist(),
+        "action_counts": {"continuation": int((action == "continuation").sum()), "reversal": int((action == "reversal").sum())},
+        "by_event_group": {g: {k: float(v) if isinstance(v, (int, float)) else v for k, v in d.items()} for g, d in per_group.items()},
+    }
+    chart_data_path = settings.MODELS_DIR / f"{prefix}_chart_data.json"
+    with chart_data_path.open("w") as f:
+        json.dump(chart_data, f, indent=2)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    ax0, ax1, ax2, ax3 = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
+
+    if trades:
+        ax0.plot(np.arange(1, trades + 1), equity, color="steelblue", linewidth=1.5)
+    ax0.set_title("Equity curve")
+    ax0.set_xlabel("Trade #")
+    ax0.set_ylabel("Cumulative PnL (unit)")
+    ax0.grid(True, alpha=0.3)
+
+    if trades:
+        ax1.fill_between(np.arange(1, trades + 1), 0, -drawdown, color="coral", alpha=0.6)
+        ax1.plot(np.arange(1, trades + 1), -drawdown, color="darkred", linewidth=1)
+    ax1.set_title("Drawdown")
+    ax1.set_xlabel("Trade #")
+    ax1.set_ylabel("Drawdown (unit)")
+    ax1.grid(True, alpha=0.3)
 
     labels = ["continuation", "reversal"]
-    counts = [int((action == "continuation").sum()), int((action == "reversal").sum())]
-    ax[1].bar(labels, counts, color=["#4e79a7", "#f28e2b"], edgecolor="black", linewidth=0.5)
-    ax[1].set_title("Trade counts by action")
-    ax[1].set_ylabel("Trades")
-    ax[1].grid(True, axis="y", alpha=0.3)
-    plt.tight_layout()
+    counts = [chart_data["action_counts"]["continuation"], chart_data["action_counts"]["reversal"]]
+    ax2.bar(labels, counts, color=["#4e79a7", "#f28e2b"], edgecolor="black", linewidth=0.5)
+    ax2.set_title("Trade counts by action")
+    ax2.set_ylabel("Trades")
+    ax2.grid(True, axis="y", alpha=0.3)
 
+    if per_group:
+        grp_names = list(per_group.keys())
+        grp_trades = [int(per_group[g]["trades"]) for g in grp_names]
+        grp_pnl = [per_group[g]["total_pnl"] for g in grp_names]
+        grp_hr = [per_group[g]["hit_rate"] * 100 for g in grp_names]
+        x = np.arange(len(grp_names))
+        bars = ax3.bar(x - 0.2, grp_pnl, 0.35, label="Total PnL", color="#4e79a7")
+        ax3_twin = ax3.twinx()
+        ax3_twin.bar(x + 0.2, grp_hr, 0.35, label="Hit rate %", color="#f28e2b", alpha=0.7)
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(grp_names)
+        ax3.set_ylabel("Total PnL (unit)")
+        ax3_twin.set_ylabel("Hit rate %")
+        ax3.set_title("PnL and hit rate by event group")
+        ax3.axhline(0, color="gray", linestyle="--", linewidth=0.5)
+        ax3.grid(True, axis="y", alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, "No event groups", ha="center", va="center", transform=ax3.transAxes)
+
+    plt.tight_layout()
     out_png = settings.MODELS_DIR / f"{prefix}_curves.png"
     plt.savefig(out_png, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -290,6 +343,7 @@ def run_backtest(
         "summary_path": str(out_json),
         "trades_path": str(out_trades),
         "curves_path": str(out_png),
+        "chart_data_path": str(chart_data_path),
     }
 
 
@@ -323,6 +377,7 @@ def main() -> None:
     print("Saved backtest summary:", result["summary_path"])
     print("Saved backtest trades:", result["trades_path"])
     print("Saved backtest curves:", result["curves_path"])
+    print("Saved chart data:", result["chart_data_path"])
     print("Trades:", summary["trades"], "Hit-rate:", f"{summary['hit_rate']:.4f}", "Total PnL:", f"{summary['total_pnl']:.2f}")
 
 

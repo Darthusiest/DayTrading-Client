@@ -72,6 +72,32 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
         if window.size >= 2:
             rolling_vol[i] = float(window.std(ddof=1))
 
+    # Rolling 30m/60m realized vol (std of 1m returns); bucket into tertiles (0, 0.5, 1)
+    realized_vol_30m = np.zeros(n_bars, dtype="float32")
+    realized_vol_60m = np.zeros(n_bars, dtype="float32")
+    for i in range(n_bars):
+        start_30 = max(0, i - 30 + 1)
+        start_60 = max(0, i - 60 + 1)
+        w30 = returns[start_30 : i + 1]
+        w60 = returns[start_60 : i + 1]
+        if w30.size >= 2:
+            realized_vol_30m[i] = float(w30.std(ddof=1))
+        if w60.size >= 2:
+            realized_vol_60m[i] = float(w60.std(ddof=1))
+    # Tertile buckets: 0=low, 0.5=mid, 1=high (per-session distribution)
+    vol_30_tertile = np.full(n_bars, 0.5, dtype="float32")
+    vol_60_tertile = np.full(n_bars, 0.5, dtype="float32")
+    if n_bars >= 3 and np.any(realized_vol_30m > 0):
+        p33 = np.nanpercentile(realized_vol_30m[realized_vol_30m > 0], 33.33)
+        p66 = np.nanpercentile(realized_vol_30m[realized_vol_30m > 0], 66.66)
+        vol_30_tertile[realized_vol_30m <= p33] = 0.0
+        vol_30_tertile[realized_vol_30m >= p66] = 1.0
+    if n_bars >= 3 and np.any(realized_vol_60m > 0):
+        p33 = np.nanpercentile(realized_vol_60m[realized_vol_60m > 0], 33.33)
+        p66 = np.nanpercentile(realized_vol_60m[realized_vol_60m > 0], 66.66)
+        vol_60_tertile[realized_vol_60m <= p33] = 0.0
+        vol_60_tertile[realized_vol_60m >= p66] = 1.0
+
     # VWAP (cumulative within session)
     vwap = np.zeros(n_bars, dtype="float32")
     pv = closes * vols
@@ -156,6 +182,8 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
     returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
     log_returns = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0)
     rolling_vol = np.nan_to_num(rolling_vol, nan=0.0, posinf=0.0, neginf=0.0)
+    vol_30_tertile = np.nan_to_num(vol_30_tertile, nan=0.5, posinf=1.0, neginf=0.0)
+    vol_60_tertile = np.nan_to_num(vol_60_tertile, nan=0.5, posinf=1.0, neginf=0.0)
     vwap = np.nan_to_num(vwap, nan=0.0, posinf=0.0, neginf=0.0)
     rsi = np.nan_to_num(rsi, nan=50.0, posinf=100.0, neginf=0.0)
     macd = np.nan_to_num(macd, nan=0.0, posinf=0.0, neginf=0.0)
@@ -170,6 +198,8 @@ def _price_and_volatility_features(closes: np.ndarray, vols: np.ndarray) -> Tupl
         returns,
         log_returns,
         rolling_vol,
+        vol_30_tertile,
+        vol_60_tertile,
         vwap,
         rsi,
         macd,
@@ -365,6 +395,8 @@ def build_session_feature_matrix(
         returns,
         log_returns,
         rolling_vol,
+        vol_30_tertile,
+        vol_60_tertile,
         vwap,
         rsi,
         macd,
@@ -413,6 +445,8 @@ def build_session_feature_matrix(
             return_10m,
             return_15m,
             rolling_vol,
+            vol_30_tertile,
+            vol_60_tertile,
             vwap_distance,
             volume_delta,
             vwap,

@@ -39,17 +39,15 @@ def _load_model(model_name: str, input_size: int) -> EventHourLSTM:
         )
 
 
-def _load_calibration(model_name: str) -> float:
+def _load_calibration(model_name: str) -> dict:
     cal_path = settings.MODELS_DIR / f"{model_name}_calibration.json"
-    temperature = 1.0
     try:
         data = load_json_artifact(cal_path, default={})
-        temperature = float(data.get("temperature", 1.0))
-        if temperature <= 0:
-            temperature = 1.0
+        if not data:
+            return {"method": "temperature", "temperature": 1.0}
+        return data
     except Exception:
-        temperature = 1.0
-    return temperature
+        return {"method": "temperature", "temperature": 1.0}
 
 
 def _load_threshold(model_name: str) -> float:
@@ -65,14 +63,20 @@ def _load_threshold(model_name: str) -> float:
 
 def _predict_one(model_name: str, sequence: torch.Tensor, event_type: Optional[torch.Tensor]) -> dict[str, float]:
     model = _load_model(model_name, input_size=int(sequence.size(-1)))
-    temperature = _load_calibration(model_name)
+    cal = _load_calibration(model_name)
+    method = str(cal.get("method", "temperature"))
     with torch.no_grad():
         logits = model(sequence, event_type=event_type)
-        scaled_logits = logits / max(1e-6, temperature)
-        prob = torch.sigmoid(scaled_logits).item()
+        if method.lower() == "platt":
+            a, b = float(cal.get("A", 1.0)), float(cal.get("B", 0.0))
+            scaled = a * logits + b
+        else:
+            t = max(1e-6, float(cal.get("temperature", 1.0)))
+            scaled = logits / t
+        prob = torch.sigmoid(scaled).item()
     return {
         "logit": float(logits.item()),
-        "temperature": float(temperature),
+        "calibration": cal,
         "probability": float(prob),
         "threshold": float(_load_threshold(model_name)),
     }

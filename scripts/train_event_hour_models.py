@@ -48,7 +48,7 @@ from backend.services.ml.event_hour import EventHourDataset, EventHourLSTM, Even
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Bump when event input/labeling changes to avoid stale caches.
-EVENT_FEATURE_VERSION = 3
+EVENT_FEATURE_VERSION = 6
 
 
 def _nan_to_none(obj):
@@ -71,7 +71,9 @@ class _BinaryFocalLoss(nn.Module):
         self.alpha_pos = self.pos_weight / (1.0 + self.pos_weight)
         self.alpha_neg = 1.0 - self.alpha_pos
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, logits: torch.Tensor, targets: torch.Tensor, reduction: str = "mean"
+    ) -> torch.Tensor:
         probs = torch.sigmoid(logits)
         eps = 1e-7
         p = probs.clamp(eps, 1.0 - eps)
@@ -81,7 +83,8 @@ class _BinaryFocalLoss(nn.Module):
         focal_weight = (1.0 - pt) ** self.gamma
         bce = -torch.where(targets >= 0.5, log_p, log_1mp)
         alpha = torch.where(targets >= 0.5, self.alpha_pos, self.alpha_neg)
-        return (alpha * focal_weight * bce).mean()
+        out = alpha * focal_weight * bce
+        return out.mean() if reduction == "mean" else out
 
 
 def _parse_hm(s: str) -> Tuple[int, int]:
@@ -305,11 +308,16 @@ def _compute_binary_metrics(probs: np.ndarray, y: np.ndarray, threshold: float =
     rec = tp / max(1, tp + fn)
     f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
     pos_rate = float(y.mean()) if total else float("nan")
+    # Brier score: mean((p - y)^2); lower is better
+    probs_f = probs.astype(np.float64)
+    y_f = y.astype(np.float64)
+    brier = float(np.mean((probs_f - y_f) ** 2)) if total else float("nan")
     return {
         "accuracy": float(acc),
         "precision": float(prec),
         "recall": float(rec),
         "f1": float(f1),
+        "brier": float(brier),
         "tp": float(tp),
         "tn": float(tn),
         "fp": float(fp),
@@ -364,13 +372,32 @@ def _predict_probs_targets_event_type(
     return probs, y, event_type, float(loss_sum / max(1, n))
 
 
-def _evaluate(model: nn.Module, loader: DataLoader, threshold: float = 0.5) -> Dict[str, float]:
+def _compute_val_pnl_proxy(
+    probs: np.ndarray, y: np.ndarray, ret_60: np.ndarray, threshold: float = 0.5
+) -> float:
+    """Proxy PnL: sum over samples with pred>=threshold of sign(pred)*sign(actual)*|ret_60|."""
+    if probs.size == 0 or ret_60.size != probs.size:
+        return float("nan")
+    pred_sign = np.where(probs >= threshold, 1.0, -1.0)
+    actual_sign = np.where(y >= 0.5, 1.0, -1.0)
+    mask = probs >= threshold
+    return float(np.sum(pred_sign[mask] * actual_sign[mask] * np.abs(ret_60[mask])))
+
+
+def _evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    threshold: float = 0.5,
+    forward_return_60m: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
     probs, y, avg_loss = _predict_probs_and_targets(model, loader)
     if y.size == 0:
         return {"loss": float("nan"), "accuracy": float("nan"), "f1": float("nan"), "samples": 0.0}
     m = _compute_binary_metrics(probs, y, threshold=threshold)
     m["loss"] = float(avg_loss)
     m["threshold"] = float(threshold)
+    if forward_return_60m is not None and forward_return_60m.size == probs.size:
+        m["val_pnl_proxy"] = _compute_val_pnl_proxy(probs, y, forward_return_60m, threshold)
     return m
 
 
@@ -469,7 +496,7 @@ def _calibrate_temperature(logits: np.ndarray, y: np.ndarray) -> float:
     y_ = y.astype(np.float64)
     best_t = 1.0
     best_nll = float("inf")
-    for t in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]:
+    for t in [0.3, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]:
         p = 1.0 / (1.0 + np.exp(-logits.astype(np.float64) / t))
         p = np.clip(p, 1e-7, 1.0 - 1e-7)
         nll = -np.mean(y_ * np.log(p) + (1.0 - y_) * np.log(1.0 - p))
@@ -477,6 +504,73 @@ def _calibrate_temperature(logits: np.ndarray, y: np.ndarray) -> float:
             best_nll = nll
             best_t = t
     return float(best_t)
+
+
+def _calibrate_platt(logits: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """Fit Platt scaling: P(y=1) = sigmoid(A*logit + B). Returns (A, B)."""
+    if logits.size == 0:
+        return 1.0, 0.0
+    try:
+        from scipy.optimize import minimize
+    except ImportError:
+        return 1.0, 0.0
+    logits_f = logits.astype(np.float64).ravel()
+    y_f = y.astype(np.float64).ravel()
+
+    def nll(params: np.ndarray) -> float:
+        a, b = params[0], params[1]
+        p = 1.0 / (1.0 + np.exp(-(a * logits_f + b)))
+        p = np.clip(p, 1e-7, 1.0 - 1e-7)
+        return float(-np.mean(y_f * np.log(p) + (1.0 - y_f) * np.log(1.0 - p)))
+
+    res = minimize(nll, [1.0, 0.0], method="L-BFGS-B", bounds=[(0.01, 10.0), (-5.0, 5.0)])
+    if res.success:
+        return float(res.x[0]), float(res.x[1])
+    return 1.0, 0.0
+
+
+def _plot_per_event_performance(
+    per_event_test: Dict[str, Dict[str, float]],
+    save_path: Path,
+    chart_data_path: Path,
+) -> None:
+    """Plot per-event-type test F1, precision, recall; save chart data JSON."""
+    if not per_event_test:
+        return
+    groups = list(per_event_test.keys())
+    f1 = [per_event_test[g].get("f1", 0.0) for g in groups]
+    precision = [per_event_test[g].get("precision", 0.0) for g in groups]
+    recall = [per_event_test[g].get("recall", 0.0) for g in groups]
+    samples = [per_event_test[g].get("samples", 0.0) for g in groups]
+
+    chart_data = {
+        "groups": groups,
+        "f1": f1,
+        "precision": precision,
+        "recall": recall,
+        "samples": samples,
+    }
+    chart_data_path.parent.mkdir(parents=True, exist_ok=True)
+    with chart_data_path.open("w") as f:
+        json.dump(chart_data, f, indent=2)
+
+    x = np.arange(len(groups))
+    width = 0.25
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    ax.bar(x - width, f1, width, label="F1", color="#4e79a7")
+    ax.bar(x, precision, width, label="Precision", color="#f28e2b")
+    ax.bar(x + width, recall, width, label="Recall", color="#59a14f")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{g}\n(n={int(s)})" for g, s in zip(groups, samples)], fontsize=9)
+    ax.set_ylabel("Score")
+    ax.set_ylim(0, 1.05)
+    ax.set_title("Test performance by event type")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close()
 
 
 def _plot_curves(history: List[Dict[str, float]], save_path: Path, title: str) -> None:
@@ -487,6 +581,22 @@ def _plot_curves(history: List[Dict[str, float]], save_path: Path, title: str) -
     val_loss = [h.get("val_loss", float("nan")) for h in history]
     val_acc = [h.get("val_accuracy", float("nan")) for h in history]
     val_f1 = [h.get("val_f1", float("nan")) for h in history]
+
+    # Save chart data for re-plotting or external use
+    chart_data_path = save_path.with_suffix(".chart_data.json")
+    chart_data_path.parent.mkdir(parents=True, exist_ok=True)
+    with chart_data_path.open("w") as f:
+        json.dump(
+            {
+                "epochs": epochs,
+                "train_loss": train_loss,
+                "val_loss": [_nan_to_none(v) for v in val_loss],
+                "val_accuracy": [_nan_to_none(v) for v in val_acc],
+                "val_f1": [_nan_to_none(v) for v in val_f1],
+            },
+            f,
+            indent=2,
+        )
 
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     fig.suptitle(title, fontsize=12, fontweight="bold")
@@ -535,6 +645,12 @@ def _build_event_dataset(
     label_band_k = float(getattr(settings, "EVENT_LABEL_BAND_ATR_K", 0.35))
     label_min_band = float(getattr(settings, "EVENT_LABEL_MIN_BAND", 0.0002))
     max_abs_ret_60m = float(getattr(settings, "EVENT_MAX_ABS_RET_60M", 0.20))
+    label_skip_minutes = int(getattr(settings, "EVENT_LABEL_SKIP_FIRST_MINUTES", 5))
+    min_gap_from_prev = int(getattr(settings, "EVENT_MIN_GAP_FROM_PREV_EVENT", 15))
+    label_min_move_atr_k = float(getattr(settings, "EVENT_LABEL_MIN_MOVE_ATR_K", 0.0))
+    add_near_miss = bool(getattr(settings, "EVENT_ADD_NEAR_MISS_SAMPLES", False))
+    near_miss_max = int(getattr(settings, "EVENT_NEAR_MISS_MAX_PER_SESSION", 20))
+    downsample_ratio = float(getattr(settings, "EVENT_DOWNSAMPLE_EASY_NEG_RATIO", 1.0))
 
     # Continuation filter settings
     cont_require_orb_bos = bool(getattr(settings, "EVENT_CONT_REQUIRE_ORB_AND_BOS", True))
@@ -569,6 +685,7 @@ def _build_event_dataset(
     y_cont: List[float] = []
     y_rev: List[float] = []
     y_forward_return_60m: List[float] = []
+    atr_pct_list: List[float] = []
     cont_eligible_list: List[int] = []
     event_dir_list: List[int] = []
     event_type_list: List[int] = []
@@ -759,17 +876,24 @@ def _build_event_dataset(
             fired = set()  # per-session dedupe keys
             pdh_idx_first: Optional[int] = None
             pdl_idx_first: Optional[int] = None
+            last_bar_any_event: int = -999
+            no_event_bars: List[int] = []
 
             prev_high, prev_low = prev_day_range.get(symbol, (float("nan"), float("nan")))
-            for i in range(lookback - 1, n - horizon_minutes - 1):
-                # Label band (vol-adjusted)
+            # Label window excludes event spike: ret from close[i+skip] to close[i+skip+horizon]
+            i_max = n - horizon_minutes - label_skip_minutes - 1
+            for i in range(lookback - 1, i_max + 1):
+                # Label band (vol-adjusted); magnitude threshold when EVENT_LABEL_MIN_MOVE_ATR_K > 0
                 c0 = float(closes[i]) if closes[i] > 0 else 0.0
                 atr_pct_i = float(atr[i]) / c0 if c0 > 0 else 0.0
                 band = max(label_min_band, label_band_k * atr_pct_i)
+                if label_min_move_atr_k > 0:
+                    band = max(band, label_min_move_atr_k * atr_pct_i)
 
-                # Compute 60m return
-                c1 = float(closes[i + horizon_minutes])
-                ret_60 = (c1 - c0) / c0 if c0 > 0 else 0.0
+                # Compute 60m return (exclude event spike: start at i+label_skip_minutes)
+                c_start = float(closes[i + label_skip_minutes])
+                c_end = float(closes[i + label_skip_minutes + horizon_minutes])
+                ret_60 = (c_end - c_start) / c_start if c_start > 0 else 0.0
                 if abs(ret_60) > max_abs_ret_60m:
                     continue
 
@@ -836,6 +960,10 @@ def _build_event_dataset(
                         fired.add("BOS_DN")
 
                 if not events:
+                    no_event_bars.append(i)
+                    continue
+                # Skip if another event fired within min_gap minutes (avoid overlapping labels)
+                if min_gap_from_prev > 0 and (i - last_bar_any_event) < min_gap_from_prev:
                     continue
 
                 # Event-specific features at bar i (bars since ORB/BOS/PDH-PDL, normalized by 60)
@@ -846,23 +974,27 @@ def _build_event_dataset(
                 bs_bos_dn = min(1.0, (i - bos_dn_idx_first) / norm_bars) if bos_dn_idx_first is not None and i >= bos_dn_idx_first else 0.0
                 bs_pdh = min(1.0, (i - pdh_idx_first) / norm_bars) if pdh_idx_first is not None and i >= pdh_idx_first else 0.0
                 bs_pdl = min(1.0, (i - pdl_idx_first) / norm_bars) if pdl_idx_first is not None and i >= pdl_idx_first else 0.0
-                event_feat_row = np.array(
-                    [bs_orb_up, bs_orb_dn, (bs_bos_up + bs_bos_dn) / 2.0, max(bs_pdh, bs_pdl)],
-                    dtype="float32",
-                )
-                event_feat_window = np.tile(event_feat_row, (lookback, 1))
+                enable_event_type_feat = bool(getattr(settings, "EVENT_ENABLE_EVENT_TYPE_FEATURES", True))
 
                 # For each event at i, create one sample. (Dedup rules above keep this small.)
-                window = all_feat_aug[i - lookback + 1 : i + 1]
-                if window.shape[0] != lookback:
-                    continue
-                window = np.concatenate([window, event_feat_window], axis=1).astype("float32")
+                base_event_feat = [bs_orb_up, bs_orb_dn, (bs_bos_up + bs_bos_dn) / 2.0, max(bs_pdh, bs_pdl)]
 
                 sign = 0
                 if abs(ret_60) > band:
                     sign = +1 if ret_60 > 0 else -1
 
                 for etype, edir in events:
+                    # Event-type encoding: normalized etype (0.1-1.0) when enabled; 0 when disabled (keep dim fixed)
+                    event_feat_row = list(base_event_feat)
+                    event_feat_row.append(float(etype) / 10.0 if enable_event_type_feat else 0.0)
+                    event_feat_arr = np.array(event_feat_row, dtype="float32")
+                    event_feat_window = np.tile(event_feat_arr, (lookback, 1))
+
+                    window = all_feat_aug[i - lookback + 1 : i + 1]
+                    if window.shape[0] != lookback:
+                        continue
+                    window = np.concatenate([window, event_feat_window], axis=1).astype("float32")
+
                     cont = 1.0 if (sign != 0 and sign == edir) else 0.0
                     rev = 1.0 if (sign != 0 and sign == -edir) else 0.0
                     # Continuation setup filter: require ORB+BOS same direction occurred within window
@@ -891,17 +1023,66 @@ def _build_event_dataset(
                         grp = EVENT_TYPE_TO_GROUP.get(etype, "OTHER")
                         cont_event_type_ok = grp in cont_allowed
                     cont_eligible_final = cont_ok and cont_event_type_ok
+                    # Down-sample easy negatives: |ret_60| < 0.5*band, cont=0, rev=0
+                    is_easy_neg = (cont == 0.0 and rev == 0.0 and abs(ret_60) < 0.5 * band)
+                    if is_easy_neg and downsample_ratio < 1.0 and np.random.random() >= downsample_ratio:
+                        continue
                     seqs.append(window.astype("float32"))
                     # If setup not eligible, drop the continuation label to 0 by construction.
                     # Training will further filter by eligibility when building the continuation dataset.
                     y_cont.append(cont if cont_ok else 0.0)
                     y_rev.append(rev)
                     y_forward_return_60m.append(float(ret_60))
+                    atr_pct_list.append(float(atr_pct_i))
                     cont_eligible_list.append(1 if cont_eligible_final else 0)
                     event_dir_list.append(1 if edir > 0 else 0)  # 1=up,0=down
                     event_type_list.append(int(etype))
                     session_id_list.append(int(session_idx))
                     symbol_id_list.append(int(sym_to_id.get(symbol, 0)))
+                last_bar_any_event = i
+
+            # Near-miss non-events: bars with similar vol profile but no event, as explicit negatives
+            if add_near_miss and near_miss_max > 0 and len(no_event_bars) > 0:
+                # Top 30% by range_over_atr and vol_z (i.e. above 70th percentile)
+                roa = range_over_atr
+                vz = np.nan_to_num(vol_z, nan=0.0, posinf=0.0, neginf=-10.0)
+                p70_roa = float(np.nanpercentile(roa, 70)) if roa.size > 0 else 0.0
+                p70_vz = float(np.nanpercentile(vz, 70)) if vz.size > 0 else 0.0
+                added = 0
+                for i in no_event_bars:
+                    if added >= near_miss_max:
+                        break
+                    if i < lookback - 1 or i + label_skip_minutes + horizon_minutes >= n:
+                        continue
+                    if roa[i] < p70_roa or vz[i] < p70_vz:
+                        continue
+                    c_start = float(closes[i + label_skip_minutes])
+                    c_end = float(closes[i + label_skip_minutes + horizon_minutes])
+                    ret_60 = (c_end - c_start) / c_start if c_start > 0 else 0.0
+                    if abs(ret_60) > max_abs_ret_60m:
+                        continue
+                    band_nm = max(label_min_band, label_band_k * (float(atr[i]) / closes[i] if closes[i] > 0 else 0))
+                    if abs(ret_60) > band_nm:
+                        continue  # only add when |ret_60| <= band (no clear direction)
+                    # Neutral event-type features for near-miss
+                    event_feat_nm = np.array([0.0, 0.0, 0.0, 0.0, 0.0 if enable_event_type_feat else 0.0], dtype="float32")
+                    event_feat_window_nm = np.tile(event_feat_nm, (lookback, 1))
+                    window_nm = all_feat_aug[i - lookback + 1 : i + 1]
+                    if window_nm.shape[0] != lookback:
+                        continue
+                    window_nm = np.concatenate([window_nm, event_feat_window_nm], axis=1).astype("float32")
+                    atr_pct_nm = float(atr[i]) / closes[i] if closes[i] > 0 else 1e-4
+                    seqs.append(window_nm)
+                    y_cont.append(0.0)
+                    y_rev.append(0.0)
+                    y_forward_return_60m.append(float(ret_60))
+                    atr_pct_list.append(atr_pct_nm)
+                    cont_eligible_list.append(0)
+                    event_dir_list.append(0)
+                    event_type_list.append(0)
+                    session_id_list.append(int(session_idx))
+                    symbol_id_list.append(int(sym_to_id.get(symbol, 0)))
+                    added += 1
 
             prev_day_range[symbol] = (float(highs.max()), float(lows.min()))
 
@@ -912,6 +1093,7 @@ def _build_event_dataset(
     t_cont = torch.from_numpy(np.asarray(y_cont, dtype="float32"))
     t_rev = torch.from_numpy(np.asarray(y_rev, dtype="float32"))
     t_ret60 = torch.from_numpy(np.asarray(y_forward_return_60m, dtype="float32"))
+    t_atr_pct = torch.from_numpy(np.asarray(atr_pct_list, dtype="float32"))
     cont_eligible = torch.from_numpy(np.asarray(cont_eligible_list, dtype="int64"))
     event_dir = torch.from_numpy(np.asarray(event_dir_list, dtype="int64"))
     event_type = torch.from_numpy(np.asarray(event_type_list, dtype="int64"))
@@ -923,6 +1105,7 @@ def _build_event_dataset(
         "targets_cont": t_cont,
         "targets_rev": t_rev,
         "forward_return_60m": t_ret60,
+        "atr_pct": t_atr_pct,
         "cont_eligible": cont_eligible,
         "event_dir": event_dir,
         "event_type": event_type,
@@ -939,11 +1122,18 @@ def _build_event_dataset(
             "label_band_atr_k": float(label_band_k),
             "label_min_band": float(label_min_band),
             "max_abs_ret_60m": float(max_abs_ret_60m),
+            "label_skip_minutes": int(label_skip_minutes),
+            "min_gap_from_prev_event": int(min_gap_from_prev),
             "cont_require_orb_bos": bool(cont_require_orb_bos),
             "cont_max_minutes": int(cont_max_minutes),
             "cont_require_no_smt": bool(cont_require_no_smt),
             "event_cont_types": cont_event_types_str,
             "session_phase": True,
+            "enable_event_type_features": bool(enable_event_type_feat),
+            "label_min_move_atr_k": float(label_min_move_atr_k),
+            "add_near_miss": bool(add_near_miss),
+            "near_miss_max": int(near_miss_max),
+            "downsample_ratio": float(downsample_ratio),
         },
     }
 
@@ -982,40 +1172,43 @@ def _train_one(
     val_idx: List[int],
     test_idx: List[int],
     out_dir: Path,
+    forward_return_60m: Optional[torch.Tensor] = None,
+    atr_pct: Optional[torch.Tensor] = None,
 ) -> Tuple[dict, dict]:
     batch_size = int(getattr(settings, "EVENT_BATCH_SIZE", 256))
     lr = float(getattr(settings, "EVENT_LR", 3e-4))
     epochs = int(getattr(settings, "EVENT_EPOCHS", 25))
     patience = int(getattr(settings, "EVENT_EARLY_STOP_PATIENCE", 8))
 
-    train_ds = EventHourDataset(
-        sequences[train_idx],
-        targets[train_idx],
-        event_type[train_idx],
-        event_dir[train_idx],
-        session_id[train_idx],
-        symbol_id[train_idx],
+    # Sample weights for cost-aware loss: 1 + |ret_60|/atr_pct (clamp atr_pct to avoid div by zero)
+    sample_weight = None
+    if bool(getattr(settings, "EVENT_LOSS_WEIGHT_BY_MAGNITUDE", False)) and forward_return_60m is not None and atr_pct is not None:
+        ret = forward_return_60m.detach().cpu().numpy()
+        ap = atr_pct.detach().cpu().numpy()
+        ap_safe = np.maximum(ap, 1e-6)
+        w = 1.0 + np.abs(ret) / ap_safe
+        sample_weight = torch.from_numpy(w.astype("float32"))
+
+    def _make_ds(seq, tgt, et, ed, sid, symid, idx):
+        sw_sub = sample_weight[idx] if sample_weight is not None else None
+        return EventHourDataset(seq, tgt, et, ed, sid, symid, sample_weight=sw_sub)
+
+    train_ds = _make_ds(
+        sequences[train_idx], targets[train_idx], event_type[train_idx], event_dir[train_idx],
+        session_id[train_idx], symbol_id[train_idx], train_idx,
     )
     val_ds = (
-        EventHourDataset(
-            sequences[val_idx],
-            targets[val_idx],
-            event_type[val_idx],
-            event_dir[val_idx],
-            session_id[val_idx],
-            symbol_id[val_idx],
+        _make_ds(
+            sequences[val_idx], targets[val_idx], event_type[val_idx], event_dir[val_idx],
+            session_id[val_idx], symbol_id[val_idx], val_idx,
         )
         if val_idx
         else None
     )
     test_ds = (
-        EventHourDataset(
-            sequences[test_idx],
-            targets[test_idx],
-            event_type[test_idx],
-            event_dir[test_idx],
-            session_id[test_idx],
-            symbol_id[test_idx],
+        _make_ds(
+            sequences[test_idx], targets[test_idx], event_type[test_idx], event_dir[test_idx],
+            session_id[test_idx], symbol_id[test_idx], test_idx,
         )
         if test_idx
         else None
@@ -1078,9 +1271,20 @@ def _train_one(
             t = batch["target"].to(DEVICE)
             et = batch.get("event_type")
             et = et.to(DEVICE) if et is not None else None
+            sw = batch.get("sample_weight")
+            sw = sw.to(DEVICE) if sw is not None else None
             optimizer.zero_grad()
             logits = model(x, event_type=et)
-            loss = criterion(logits, t)
+            if sw is not None and use_focal:
+                loss_per = criterion(logits, t, reduction="none")
+                loss = (loss_per * sw).mean()
+            elif sw is not None and not use_focal:
+                loss_per = nn.functional.binary_cross_entropy_with_logits(
+                    logits, t, reduction="none"
+                )
+                loss = (loss_per * sw).mean()
+            else:
+                loss = criterion(logits, t)
             loss.backward()
             clip = float(getattr(settings, "EVENT_GRAD_CLIP_NORM", 0.0))
             if clip > 0:
@@ -1090,13 +1294,20 @@ def _train_one(
             n_seen += int(t.numel())
         train_loss = loss_sum / max(1, n_seen)
 
+        ret_val = (
+            forward_return_60m[val_idx].detach().cpu().numpy()
+            if forward_return_60m is not None and val_idx
+            else None
+        )
         val_metrics = (
-            _evaluate(model, val_loader, threshold=0.5)
+            _evaluate(model, val_loader, threshold=0.5, forward_return_60m=ret_val)
             if val_loader is not None
             else {"f1": float("nan"), "accuracy": float("nan"), "loss": float("nan")}
         )
-        val_score = float(val_metrics.get(getattr(settings, "EVENT_EARLY_STOP_METRIC", "f1"), float("nan")))
-        if not math.isnan(val_score) and val_score > best_val:
+        stop_metric = str(getattr(settings, "EVENT_EARLY_STOP_METRIC", "f1"))
+        val_score = float(val_metrics.get(stop_metric, float("nan")))
+        min_delta = float(getattr(settings, "EVENT_EARLY_STOP_MIN_DELTA", 0.0))
+        if not math.isnan(val_score) and val_score > best_val + min_delta:
             best_val = val_score
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             no_improve = 0
@@ -1128,13 +1339,15 @@ def _train_one(
 
     # Threshold tuning on validation to maximize F1 (for this model)
     best_threshold = 0.5
-    val_at_0_5 = _evaluate(model, val_loader, threshold=0.5) if val_loader is not None else None
-    test_at_0_5 = _evaluate(model, test_loader, threshold=0.5) if test_loader is not None else None
+    ret_val = forward_return_60m[val_idx].detach().cpu().numpy() if forward_return_60m is not None and val_idx else None
+    ret_test = forward_return_60m[test_idx].detach().cpu().numpy() if forward_return_60m is not None and test_idx else None
+    val_at_0_5 = _evaluate(model, val_loader, threshold=0.5, forward_return_60m=ret_val) if val_loader is not None else None
+    test_at_0_5 = _evaluate(model, test_loader, threshold=0.5, forward_return_60m=ret_test) if test_loader is not None else None
     if val_loader is not None:
         probs_v, y_v, _ = _predict_probs_and_targets(model, val_loader)
         best_threshold, _ = _tune_threshold_for_f1(probs_v, y_v)
-    val_summary = _evaluate(model, val_loader, threshold=best_threshold) if val_loader is not None else None
-    test_summary = _evaluate(model, test_loader, threshold=best_threshold) if test_loader is not None else None
+    val_summary = _evaluate(model, val_loader, threshold=best_threshold, forward_return_60m=ret_val) if val_loader is not None else None
+    test_summary = _evaluate(model, test_loader, threshold=best_threshold, forward_return_60m=ret_test) if test_loader is not None else None
 
     # Per-event-type metrics (val and test)
     per_event_val: Dict[str, Dict[str, float]] = {}
@@ -1152,12 +1365,17 @@ def _train_one(
                 probs_t, y_t, et_t, threshold=best_threshold
             )
 
-    # Temperature calibration on validation logits
+    # Calibration on validation logits: temperature or Platt scaling
+    calibration_method = str(getattr(settings, "EVENT_CALIBRATION_METHOD", "temperature"))
     temperature = 1.0
+    platt_a, platt_b = 1.0, 0.0
     if val_loader is not None:
         logits_v, y_cal, _ = _predict_logits_targets_event_type(model, val_loader)
         if logits_v.size > 0 and y_cal.size > 0:
-            temperature = _calibrate_temperature(logits_v, y_cal)
+            if calibration_method.lower() == "platt":
+                platt_a, platt_b = _calibrate_platt(logits_v, y_cal)
+            else:
+                temperature = _calibrate_temperature(logits_v, y_cal)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / f"{model_name}.pt"
@@ -1165,17 +1383,18 @@ def _train_one(
     curves_path = out_dir / f"{model_name}_curves.png"
     _plot_curves(history, curves_path, title=f"{model_name} — training curves")
 
-    # Save calibration JSON for inference (API usage: apply sigmoid(logits / temperature) for calibrated probs)
+    # Save calibration JSON for inference
     calibration_path = out_dir / f"{model_name}_calibration.json"
+    cal_data = {"method": calibration_method}
+    if calibration_method.lower() == "platt":
+        cal_data["A"] = float(platt_a)
+        cal_data["B"] = float(platt_b)
+        cal_data["usage"] = "At inference: probs = 1 / (1 + exp(-(A*logits + B)))"
+    else:
+        cal_data["temperature"] = float(temperature)
+        cal_data["usage"] = "At inference: probs = 1 / (1 + exp(-logits / temperature))"
     with calibration_path.open("w") as f:
-        json.dump(
-            {
-                "temperature": float(temperature),
-                "usage": "At inference: probs = 1 / (1 + exp(-logits / temperature))",
-            },
-            f,
-            indent=2,
-        )
+        json.dump(cal_data, f, indent=2)
 
     metrics = {
         "model_name": model_name,
@@ -1187,6 +1406,7 @@ def _train_one(
         "threshold_tuned": True,
         "best_threshold": float(best_threshold),
         "temperature": float(temperature),
+        "calibration_method": calibration_method,
         "val_at_0_5": val_at_0_5,
         "test_at_0_5": test_at_0_5,
         "val": val_summary,
@@ -1200,6 +1420,13 @@ def _train_one(
     metrics_path = out_dir / f"{model_name}_metrics.json"
     with metrics_path.open("w") as f:
         json.dump(_nan_to_none(metrics), f, indent=2)
+
+    # Per-event-type performance chart and chart data
+    if per_event_test:
+        perf_path = out_dir / f"{model_name}_performance.png"
+        chart_data_path = out_dir / f"{model_name}_chart_data.json"
+        _plot_per_event_performance(per_event_test, perf_path, chart_data_path)
+
     return metrics, {
         "ckpt": str(ckpt_path),
         "curves": str(curves_path),
@@ -1227,6 +1454,7 @@ def main() -> None:
         targets_cont = data["targets_cont"]
         targets_rev = data["targets_rev"]
         forward_return_60m = data.get("forward_return_60m")
+        atr_pct = data.get("atr_pct")
         cont_eligible = data.get("cont_eligible")
         event_type = data["event_type"]
         event_dir = data["event_dir"]
@@ -1262,20 +1490,50 @@ def main() -> None:
         if meta.get("event_cont_types", "") != str(getattr(settings, "EVENT_CONT_EVENT_TYPES", "ORB_BOS,PDH_PDL")):
             print("Event dataset cache event_cont_types mismatch; rebuilding.")
             rebuild = True
+        if int(meta.get("label_skip_minutes", -1)) != int(getattr(settings, "EVENT_LABEL_SKIP_FIRST_MINUTES", 5)):
+            print("Event dataset cache label_skip_minutes mismatch; rebuilding.")
+            rebuild = True
+        if int(meta.get("min_gap_from_prev_event", -1)) != int(getattr(settings, "EVENT_MIN_GAP_FROM_PREV_EVENT", 15)):
+            print("Event dataset cache min_gap_from_prev_event mismatch; rebuilding.")
+            rebuild = True
+        if bool(meta.get("enable_event_type_features", True)) != bool(getattr(settings, "EVENT_ENABLE_EVENT_TYPE_FEATURES", True)):
+            print("Event dataset cache event_type_features mismatch; rebuilding.")
+            rebuild = True
+        if int(meta.get("horizon_minutes", -1)) != int(getattr(settings, "EVENT_LABEL_HORIZON_MINUTES", 60)):
+            print("Event dataset cache horizon_minutes mismatch; rebuilding.")
+            rebuild = True
+        if float(meta.get("label_min_move_atr_k", -1.0)) != float(getattr(settings, "EVENT_LABEL_MIN_MOVE_ATR_K", 0.0)):
+            print("Event dataset cache label_min_move_atr_k mismatch; rebuilding.")
+            rebuild = True
+        if bool(meta.get("add_near_miss", False)) != bool(getattr(settings, "EVENT_ADD_NEAR_MISS_SAMPLES", False)):
+            print("Event dataset cache add_near_miss mismatch; rebuilding.")
+            rebuild = True
+        if int(meta.get("near_miss_max", -1)) != int(getattr(settings, "EVENT_NEAR_MISS_MAX_PER_SESSION", 20)):
+            print("Event dataset cache near_miss_max mismatch; rebuilding.")
+            rebuild = True
+        if float(meta.get("downsample_ratio", -1.0)) != float(getattr(settings, "EVENT_DOWNSAMPLE_EASY_NEG_RATIO", 1.0)):
+            print("Event dataset cache downsample_ratio mismatch; rebuilding.")
+            rebuild = True
         if not meta.get("session_phase", False):
             print("Event dataset cache missing session_phase; rebuilding.")
             rebuild = True
         if forward_return_60m is None:
             print("Event dataset cache missing forward_return_60m; rebuilding.")
             rebuild = True
+        if atr_pct is None:
+            atr_pct = torch.ones(sequences.size(0), dtype=torch.float32) * 1e-4  # fallback for old caches
         print(f"Using cached event dataset: {cache_path} (N={sequences.size(0)})")
     if not cache_path.is_file() or rebuild:
         print(f"Building event dataset (lookback={lookback})...")
-        built = _build_event_dataset(bars, lookback=lookback, horizon_minutes=60)
+        horizon = int(getattr(settings, "EVENT_LABEL_HORIZON_MINUTES", 60))
+        built = _build_event_dataset(bars, lookback=lookback, horizon_minutes=horizon)
         sequences = built["sequences"]
         targets_cont = built["targets_cont"]
         targets_rev = built["targets_rev"]
         forward_return_60m = built["forward_return_60m"]
+        atr_pct = built.get("atr_pct")
+        if atr_pct is None:
+            atr_pct = torch.ones(sequences.size(0), dtype=torch.float32) * 1e-4
         cont_eligible = built.get("cont_eligible")
         event_type = built["event_type"]
         event_dir = built["event_dir"]
@@ -1289,6 +1547,7 @@ def main() -> None:
                 "targets_cont": targets_cont,
                 "targets_rev": targets_rev,
                 "forward_return_60m": forward_return_60m,
+                "atr_pct": atr_pct,
                 "cont_eligible": cont_eligible,
                 "event_type": event_type,
                 "event_dir": event_dir,
@@ -1355,6 +1614,8 @@ def main() -> None:
                 [i for i in val_idx if int(cont_eligible[i].item()) == 1],
                 [i for i in test_idx if int(cont_eligible[i].item()) == 1],
                 fold_out,
+                forward_return_60m=forward_return_60m,
+                atr_pct=atr_pct,
             )
             rev_metrics, rev_paths = _train_one(
                 f"event_hour_reversal_fold_{fold_idx}",
@@ -1368,6 +1629,8 @@ def main() -> None:
                 val_idx,
                 test_idx,
                 fold_out,
+                forward_return_60m=forward_return_60m,
+                atr_pct=atr_pct,
             )
             fold_rows.append(
                 {
@@ -1502,6 +1765,8 @@ def main() -> None:
         cont_val_idx,
         cont_test_idx,
         out_dir,
+        forward_return_60m=forward_return_60m,
+        atr_pct=atr_pct,
     )
     print()
     print("=" * 60)
@@ -1519,6 +1784,8 @@ def main() -> None:
         val_idx,
         test_idx,
         out_dir,
+        forward_return_60m=forward_return_60m,
+        atr_pct=atr_pct,
     )
 
     summary = {

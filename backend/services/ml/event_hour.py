@@ -37,6 +37,7 @@ class EventHourDataset(Dataset):
         event_dir: torch.Tensor | None = None,
         session_id: torch.Tensor | None = None,
         symbol_id: torch.Tensor | None = None,
+        sample_weight: torch.Tensor | None = None,
     ) -> None:
         if sequences.ndim != 3:
             raise ValueError(f"sequences must be [N, T, F], got shape={sequences.shape}")
@@ -50,6 +51,7 @@ class EventHourDataset(Dataset):
             ("event_dir", event_dir),
             ("session_id", session_id),
             ("symbol_id", symbol_id),
+            ("sample_weight", sample_weight),
         ]:
             if t is None:
                 continue
@@ -64,6 +66,7 @@ class EventHourDataset(Dataset):
         self.event_dir = event_dir
         self.session_id = session_id
         self.symbol_id = symbol_id
+        self.sample_weight = sample_weight
 
     def __len__(self) -> int:
         return self.sequences.size(0)
@@ -81,6 +84,8 @@ class EventHourDataset(Dataset):
             out["session_id"] = self.session_id[idx]
         if self.symbol_id is not None:
             out["symbol_id"] = self.symbol_id[idx]
+        if self.sample_weight is not None:
+            out["sample_weight"] = self.sample_weight[idx]
         return out
 
 

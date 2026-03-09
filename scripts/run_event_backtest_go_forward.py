@@ -33,9 +33,9 @@ DEFAULT_ARGS = [
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
-    backtest_script = repo_root / "scripts" / "backtest_event_hour.py"
 
-    cmd = [sys.executable, str(backtest_script), *DEFAULT_ARGS, *sys.argv[1:]]
+    # Use module execution so repo-root imports like `backend.*` resolve.
+    cmd = [sys.executable, "-m", "scripts.backtest_event_hour", *DEFAULT_ARGS, *sys.argv[1:]]
     print("Running:", " ".join(cmd))
     return subprocess.call(cmd, cwd=repo_root)
 

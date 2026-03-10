@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     
     # ML Model Configuration
     MODEL_NAME: str = "price_predictor"
-    NUM_FEATURES: int = 18  # Time + price + session bars + chart patterns (match trainer _extract_feature_vector)
+    NUM_FEATURES: int = 21  # Time + price + session bars + London session + chart patterns (match trainer/inference)
     NUM_LSTM_LAYERS: int = int(os.getenv("NUM_LSTM_LAYERS", "2"))
     LSTM_HIDDEN_SIZE: int = int(os.getenv("LSTM_HIDDEN_SIZE", "128"))
     # Comma-separated in .env (e.g. 256,256,128); parsed to list in MLP_HIDDENS

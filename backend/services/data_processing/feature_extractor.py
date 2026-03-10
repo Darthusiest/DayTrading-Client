@@ -18,7 +18,7 @@ class FeatureExtractor:
     
     def __init__(self):
         self.timezone = pytz.timezone(settings.TIMEZONE)
-        # Cache for session-level bar features: (session_date, symbol) -> features dict
+        # Cache for session-level bar features (including London stats): (session_date, symbol) -> features dict
         self._session_bar_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
     
     def extract_features(
@@ -133,6 +133,10 @@ class FeatureExtractor:
             "session_range_pct": 0.0,
             "session_volatility": 0.0,
             "session_num_bars": 0,
+            # London session summary (pre–NY session, configurable window)
+            "london_has_session": False,
+            "london_return_pct": 0.0,
+            "london_range_pct": 0.0,
         }
         try:
             bars = (
@@ -148,22 +152,56 @@ class FeatureExtractor:
                 self._session_bar_cache[cache_key] = features
                 return features
             features["session_num_bars"] = len(bars)
-            first_open = float(bars[0].open_price)
-            last_close = float(bars[-1].close_price)
-            session_high = max(float(b.high_price) for b in bars)
-            session_low = min(float(b.low_price) for b in bars)
+
+            # RTH session summary (use configured SESSION_START/END window))
+            # SessionMinuteBar times are stored naive in session timezone.
+            start_h, start_m = _parse_session_time(settings.SESSION_START_TIME)
+            end_h, end_m = _parse_session_time(settings.SESSION_END_TIME)
+            def _in_session(b):
+                h, m = b.bar_time.hour, b.bar_time.minute
+                return (h, m) >= (start_h, start_m) and (h, m) <= (end_h, end_m)
+
+            rth_bars = [b for b in bars if _in_session(b)]
+            core = rth_bars if len(rth_bars) >= 2 else bars
+
+            first_open = float(core[0].open_price)
+            last_close = float(core[-1].close_price)
+            session_high = max(float(b.high_price) for b in core)
+            session_low = min(float(b.low_price) for b in core)
             if first_open > 0:
                 features["session_return_pct"] = (last_close - first_open) / first_open * 100
                 features["session_range_pct"] = (session_high - session_low) / first_open * 100
             # Minute-to-minute return std as volatility proxy
             returns = []
-            for i in range(1, len(bars)):
-                prev_c = float(bars[i - 1].close_price)
-                curr_c = float(bars[i].close_price)
+            for i in range(1, len(core)):
+                prev_c = float(core[i - 1].close_price)
+                curr_c = float(core[i].close_price)
                 if prev_c > 0:
                     returns.append((curr_c - prev_c) / prev_c)
             if returns:
                 features["session_volatility"] = float(np.std(returns))
+
+            # London session summary: optional pre–NY window using EVENT_LONDON_START/END (in session TZ).
+            london_start = getattr(settings, "EVENT_LONDON_START", "03:00")
+            london_end = getattr(settings, "EVENT_LONDON_END", "05:00")
+            l_start_h, l_start_m = _parse_session_time(london_start)
+            l_end_h, l_end_m = _parse_session_time(london_end)
+
+            def _in_london(b):
+                h, m = b.bar_time.hour, b.bar_time.minute
+                return (h, m) >= (l_start_h, l_start_m) and (h, m) <= (l_end_h, l_end_m)
+
+            london_bars = [b for b in bars if _in_london(b)]
+            if len(london_bars) >= 2:
+                features["london_has_session"] = True
+                l_open = float(london_bars[0].open_price)
+                l_close = float(london_bars[-1].close_price)
+                l_high = max(float(b.high_price) for b in london_bars)
+                l_low = min(float(b.low_price) for b in london_bars)
+                if l_open > 0:
+                    features["london_return_pct"] = (l_close - l_open) / l_open * 100
+                    features["london_range_pct"] = (l_high - l_low) / l_open * 100
+
             self._session_bar_cache[cache_key] = features
         except Exception as e:
             logger.debug("Could not extract session bar features for %s %s: %s", symbol, session_date, e)

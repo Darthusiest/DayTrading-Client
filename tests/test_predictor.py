@@ -138,13 +138,13 @@ class TestPredict:
 
 class TestExtractFeatureVector:
     def test_vector_length_matches_num_features(self, predictor, monkeypatch):
-        monkeypatch.setattr("backend.services.ml.inference.predictor.settings.NUM_FEATURES", 18)
+    monkeypatch.setattr("backend.services.ml.inference.predictor.settings.NUM_FEATURES", 21)
         features = {"hour": 10, "minute": 30, "day_of_week": 1}
         vec = predictor._extract_feature_vector(features)
         assert len(vec) == 18
 
     def test_stable_order(self, predictor, monkeypatch):
-        monkeypatch.setattr("backend.services.ml.inference.predictor.settings.NUM_FEATURES", 18)
+    monkeypatch.setattr("backend.services.ml.inference.predictor.settings.NUM_FEATURES", 21)
         features = {"hour": 9, "minute": 31, "day_of_week": 0, "price_change_pct": 0.5,
                     "price_range_pct": 0.2, "session_return_pct": 0.1, "session_range_pct": 0.15,
                     "session_volatility": 0.01, "session_num_bars": 50, "trend_direction": "up",
@@ -154,7 +154,7 @@ class TestExtractFeatureVector:
         assert vec1 == vec2
 
     def test_missing_keys_use_defaults(self, predictor, monkeypatch):
-        monkeypatch.setattr("backend.services.ml.inference.predictor.settings.NUM_FEATURES", 18)
+    monkeypatch.setattr("backend.services.ml.inference.predictor.settings.NUM_FEATURES", 21)
         vec = predictor._extract_feature_vector({})
         assert len(vec) == 18
         assert vec[0] == 0.0

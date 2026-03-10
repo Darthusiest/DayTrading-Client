@@ -175,6 +175,11 @@ class Predictor:
         feature_list.append(features.get("session_range_pct", 0.0) / 100.0)
         feature_list.append(min(1.0, features.get("session_volatility", 0.0)))
         feature_list.append(min(1.0, features.get("session_num_bars", 0) / 100.0))
+
+        # London session features (pre–NY session window)
+        feature_list.append(features.get("london_return_pct", 0.0) / 100.0)
+        feature_list.append(features.get("london_range_pct", 0.0) / 100.0)
+        feature_list.append(1.0 if features.get("london_has_session") else 0.0)
         
         # Chart pattern features
         trend = features.get("trend_direction", "unknown")

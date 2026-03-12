@@ -13,6 +13,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _parse_session_time(time_str: str) -> tuple[int, int]:
+    """Parse 'HH:MM' into (hour, minute)."""
+    parts = time_str.strip().split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid session time format: {time_str}")
+    return int(parts[0].strip()), int(parts[1].strip())
+
+
 class FeatureExtractor:
     """Extract features from chart screenshots and market data."""
     

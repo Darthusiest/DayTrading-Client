@@ -160,12 +160,19 @@ def _wf_split_indices(
     test_session_ids: Set[int],
     val_ratio: float,
 ) -> Tuple[List[int], List[int], List[int]]:
-    """Return train_idx, val_idx, test_idx for one WF fold. Val = last val_ratio of train sessions."""
+    """
+    Return train_idx, val_idx, test_idx for one WF fold.
+    Val = last val_ratio of train sessions. Optional embargo: drop last
+    EVENT_EMBARGO_SESSIONS train sessions (adjacent to val) from train.
+    """
     sid = session_id_per_sample.detach().cpu().numpy()
     ordered_train = sorted(train_session_ids)
     n_val_sess = max(0, int(round(val_ratio * len(ordered_train))))
     val_sids = set(ordered_train[-n_val_sess:]) if n_val_sess else set()
-    train_only_sids = set(ordered_train[: len(ordered_train) - n_val_sess]) if n_val_sess else set(ordered_train)
+    n_train_only = len(ordered_train) - n_val_sess
+    embargo = int(getattr(settings, "EVENT_EMBARGO_SESSIONS", 0))
+    n_train_after_embargo = max(0, n_train_only - embargo)
+    train_only_sids = set(ordered_train[:n_train_after_embargo]) if n_train_only > 0 else set()
     train_idx = [i for i in range(n) if sid[i] in train_only_sids]
     val_idx = [i for i in range(n) if sid[i] in val_sids]
     test_idx = [i for i in range(n) if sid[i] in test_session_ids]
@@ -625,7 +632,11 @@ def _build_event_dataset(
     lookback: int,
     horizon_minutes: int = 60,
 ) -> Dict[str, torch.Tensor | List[Tuple[str, str]] | Dict]:
-    """Build event windows and labels for continuation + reversal."""
+    """
+    Build event windows and labels for continuation + reversal.
+    Look-ahead discipline: features use only bars up to and including the event bar;
+    labels are forward returns over the next horizon_minutes (no future data in features).
+    """
     # Group by session_date then symbol, so we can compute cross-market (SMT) features.
     by_date: Dict[str, Dict[str, List[SessionMinuteBar]]] = defaultdict(lambda: defaultdict(list))
     for b in bars:
@@ -1144,6 +1155,11 @@ def _session_split(
     val_ratio: float,
     test_ratio: float,
 ) -> Tuple[List[int], List[int], List[int]]:
+    """
+    Split by session (chronological). Train/val/test do not overlap.
+    Optional embargo: drop the last EVENT_EMBARGO_SESSIONS sessions from train
+    so there is a gap between train end and val start (bias control).
+    """
     sid = session_id.detach().cpu().numpy()
     n_train_sess = max(1, int(round((1.0 - val_ratio - test_ratio) * num_sessions)))
     n_val_sess = max(0, int(round(val_ratio * num_sessions)))
@@ -1151,7 +1167,9 @@ def _session_split(
     if n_test_sess < 0:
         n_test_sess = 0
         n_val_sess = num_sessions - n_train_sess
-    train_sids = set(range(n_train_sess))
+    embargo = int(getattr(settings, "EVENT_EMBARGO_SESSIONS", 0))
+    n_train_after_embargo = max(0, n_train_sess - embargo)
+    train_sids = set(range(n_train_after_embargo))
     val_sids = set(range(n_train_sess, n_train_sess + n_val_sess))
     test_sids = set(range(n_train_sess + n_val_sess, num_sessions))
     train_idx = [i for i in range(sid.size) if sid[i] in train_sids]

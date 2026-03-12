@@ -43,6 +43,12 @@ Each trade has: `entry_time`, `exit_time`, `direction`, `confidence`, `net_pnl`,
 
 ---
 
+## Execution (backtest semantics)
+
+The backtest assumes **entry at signal time** (event bar close) and **exit at signal time + horizon** (e.g. 60 minutes). Each trade is a single round-trip; fees and slippage are applied **once per round-trip**. No intra-bar execution or 1-bar delay is modeled; a “next bar” execution option can be added later for more conservative fills.
+
+---
+
 ## Trying different thresholds
 
 Single run with custom thresholds (from repo root):
@@ -90,6 +96,14 @@ python -m scripts.sweep_event_hour_thresholds \
 ```
 
 Output: `data/models/event_hour_threshold_sweep.csv` (or `--out-csv`) and a “Top 10 by total_pnl” table in the terminal.
+
+Use `--metric sharpe` or `--metric profit_factor` to rank the top-10 table by that metric. Feature ablation: `python -m scripts.ablate_event_hour_features --model event_hour_reversal` (zeros out London, vol_regime, session_phase, event_type, SMT and reports F1 delta).
+
+---
+
+## Cross-validation (time-based)
+
+Event-hour training uses **strict time/session splits**. Walk-forward mode (`EVENT_WALK_FORWARD=True`) uses non-overlapping calendar windows: `EVENT_WF_TRAIN_DAYS`, `EVENT_WF_TEST_DAYS`, `EVENT_WF_SLIDE_DAYS` define each fold. No fold’s train set overlaps another fold’s test set. See `_wf_fold_sessions` and `_wf_split_indices` in `scripts/train_event_hour_models.py`.
 
 ---
 

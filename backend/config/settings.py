@@ -210,6 +210,8 @@ class Settings(BaseSettings):
     EVENT_WF_TEST_DAYS: int = int(os.getenv("EVENT_WF_TEST_DAYS", "90"))
     EVENT_WF_SLIDE_DAYS: int = int(os.getenv("EVENT_WF_SLIDE_DAYS", "90"))
     EVENT_WF_VAL_RATIO: float = float(os.getenv("EVENT_WF_VAL_RATIO", "0.1"))
+    # Purging/embargo: drop last E sessions from train when adjacent to val/test (bias control)
+    EVENT_EMBARGO_SESSIONS: int = int(os.getenv("EVENT_EMBARGO_SESSIONS", "0"))
     # Cleaning: ignore unrealistic 60m label moves (likely bad ticks/data glitches)
     EVENT_MAX_ABS_RET_60M: float = float(os.getenv("EVENT_MAX_ABS_RET_60M", "0.20"))
     # 5m direction head: 0 = single linear, >0 = hidden size for 2-layer MLP (e.g. 128).

@@ -1,4 +1,11 @@
-"""Backtest event-hour continuation/reversal models on cached event dataset."""
+"""
+Backtest event-hour continuation/reversal models on cached event dataset.
+
+Look-ahead discipline: (1) Event features use only bars up to the event bar.
+(2) Labels are forward returns after the event (e.g. 60m). (3) Backtest uses
+realized forward return as outcome (entry at signal time, exit at signal + horizon).
+No feature uses data from after signal time.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +27,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from backend.config.settings import settings
 from backend.services.ml.event_hour import EventHourLSTM, EventHourModelConfig
 from backend.services.ml.model_registry import load_json_artifact, load_torch_model
+from backend.services.trading.backtest_stats import (
+    bootstrap_pnl_pvalue,
+    drawdown_distribution,
+    stats_by_regime,
+)
 from backend.services.trading.strategy import RiskConfig, Signal, SignalDirection, run_signal_backtest
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -85,6 +97,12 @@ def run_backtest(
     min_action_margin: float = 0.0,
     min_continuation_prob: float = 0.0,
     min_reversal_prob: float = 0.0,
+    trades_per_year: float | None = None,
+    sizing_method: str = "fixed",
+    kelly_fraction: float = 0.5,
+    signal_mode: str = "default",
+    ev_threshold: float = 0.0,
+    validation_stats_path: str | None = None,
 ) -> dict[str, object]:
     cache_path = settings.MODELS_DIR / "event_hour_dataset.pt"
     if not cache_path.is_file():
@@ -108,6 +126,12 @@ def run_backtest(
     else:
         event_dir_np = event_dir.long().numpy()
 
+    atr_pct = data.get("atr_pct")
+    if atr_pct is not None:
+        atr_pct = atr_pct.float().numpy()
+    else:
+        atr_pct = None
+
     input_size = int(sequences.size(2))
     cont_model = _load_model("event_hour_continuation", input_size=input_size)
     rev_model = _load_model("event_hour_reversal", input_size=input_size)
@@ -125,11 +149,35 @@ def run_backtest(
     cont_probs = _predict_probs(cont_model, sequences, event_type, cont_cal, batch_size)
     rev_probs = _predict_probs(rev_model, sequences, event_type, rev_cal, batch_size)
 
+    ev_stats: dict | None = None
+    if signal_mode == "ev" and validation_stats_path:
+        p = Path(validation_stats_path)
+        if not p.is_absolute():
+            p = settings.MODELS_DIR / validation_stats_path
+        if p.exists():
+            with p.open() as f:
+                ev_stats = json.load(f)
+            ev_stats = {k: float(v) for k, v in ev_stats.items() if k in ("p_win", "avg_win", "avg_loss")}
+        if not ev_stats or set(ev_stats.keys()) != {"p_win", "avg_win", "avg_loss"}:
+            ev_stats = None
+
     action = np.full(cont_probs.shape[0], "none", dtype=object)
     reason_counts: Counter[str] = Counter()
     for i in range(action.size):
         if event_dir_np[i] not in (0, 1):
             reason_counts["invalid_event_dir"] += 1
+            continue
+        if signal_mode == "combined":
+            direction_score = float(cont_probs[i] - rev_probs[i])
+            conviction = abs(direction_score)
+            confidence = conviction
+            if confidence < min_confidence:
+                reason_counts["below_confidence"] += 1
+                continue
+            if conviction < min_action_margin:
+                reason_counts["below_margin"] += 1
+                continue
+            action[i] = "continuation" if direction_score >= 0 else "reversal"
             continue
         confidence = float(max(cont_probs[i], rev_probs[i]))
         if confidence < min_confidence:
@@ -150,6 +198,14 @@ def run_backtest(
             action[i] = "reversal"
         else:
             reason_counts["unresolved_action"] += 1
+        if signal_mode == "ev" and ev_stats and action[i] != "none":
+            p_win = ev_stats["p_win"]
+            avg_win = ev_stats["avg_win"]
+            avg_loss = ev_stats["avg_loss"]
+            ev = p_win * avg_win - (1.0 - p_win) * avg_loss
+            if ev <= ev_threshold:
+                action[i] = "none"
+                reason_counts["ev_below_threshold"] = reason_counts.get("ev_below_threshold", 0) + 1
 
     ts0 = datetime(2020, 1, 1)
     signals: List[Signal] = []
@@ -162,7 +218,7 @@ def run_backtest(
         else:
             direction = SignalDirection.SHORT if event_dir_np[i] == 1 else SignalDirection.LONG
         action_margin = float(abs(cont_probs[i] - rev_probs[i]))
-        confidence = float(max(cont_probs[i], rev_probs[i]))
+        confidence = float(abs(cont_probs[i] - rev_probs[i])) if signal_mode == "combined" else float(max(cont_probs[i], rev_probs[i]))
         signals.append(
             Signal(
                 timestamp=ts0 + timedelta(minutes=i),
@@ -184,7 +240,19 @@ def run_backtest(
 
     traded_mask = action != "none"
     traded_returns = realized_returns[traded_mask]
-    bt = run_signal_backtest(signals, traded_returns, risk=risk or RiskConfig())
+    risk_config = risk or RiskConfig()
+    risk_config.sizing_method = sizing_method
+    risk_config.kelly_fraction = kelly_fraction
+    vol_at_signal_arr = None
+    if atr_pct is not None and traded_mask.any():
+        vol_at_signal_arr = atr_pct[traded_mask]
+    bt = run_signal_backtest(
+        signals,
+        traded_returns,
+        risk=risk_config,
+        trades_per_year=trades_per_year,
+        vol_at_signal=vol_at_signal_arr,
+    )
     trade_objs = bt["trades"]
     stats = bt["stats"]
     equity = np.asarray(bt["equity_curve"], dtype=np.float32)
@@ -220,6 +288,29 @@ def run_backtest(
             "total_pnl": float(gpnl.sum()),
         }
 
+    # Robustness: bootstrap p-value, drawdown distribution, regime stats (P4)
+    bootstrap_pvalue: float = 0.5
+    drawdown_95pct: float = 0.0
+    regime_stats: Dict[str, Dict[str, float]] = {}
+    if trades >= 2:
+        bootstrap_pvalue = bootstrap_pnl_pvalue(trade_pnl, n_bootstrap=500, seed=42)
+        dd_dist = drawdown_distribution(
+            trade_pnl,
+            initial_capital=float(risk_config.initial_capital),
+            n_shuffle=500,
+            seed=42,
+        )
+        drawdown_95pct = float(np.percentile(dd_dist, 95))
+        if atr_pct is not None and traded_mask.any():
+            ap = atr_pct[traded_mask]
+            p33, p66 = np.percentile(ap, 33), np.percentile(ap, 66)
+            regime_label = np.zeros(ap.size, dtype=np.int32)
+            regime_label[ap <= p33] = 0
+            regime_label[(ap > p33) & (ap < p66)] = 1
+            regime_label[ap >= p66] = 2
+            regime_stats = stats_by_regime(trade_pnl, win, regime_label, trades_per_year=1260.0)
+            regime_stats = {"low_vol": regime_stats.get("0", {}), "mid_vol": regime_stats.get("1", {}), "high_vol": regime_stats.get("2", {})}
+
     summary = {
         "dataset_path": str(cache_path),
         "samples": int(action.size),
@@ -240,10 +331,33 @@ def run_backtest(
         "total_pnl": float(stats["total_pnl"]),
         "max_drawdown": float(stats["max_drawdown"]),
         "ending_capital": float(stats["ending_capital"]),
+        "sharpe": float(stats.get("sharpe", 0.0)),
+        "sortino": float(stats.get("sortino", 0.0)),
+        "calmar": float(stats.get("calmar", 0.0)),
+        "profit_factor": float(stats.get("profit_factor", 0.0)),
         "continuation_trades": int((action == "continuation").sum()),
         "reversal_trades": int((action == "reversal").sum()),
         "by_event_group": per_group,
+        "bootstrap_pnl_pvalue": bootstrap_pvalue,
+        "drawdown_95pct": drawdown_95pct,
+        "stats_by_regime": regime_stats,
+        "signal_mode": signal_mode,
     }
+    if signal_mode == "ev":
+        summary["ev_threshold"] = ev_threshold
+
+    # OOS by period: last 25% of trades as "recent" out-of-sample
+    if trades >= 4:
+        last_q = trades // 4
+        last_q_pnl = trade_pnl[-last_q:]
+        last_q_win = win[-last_q:]
+        summary["last_quarter_trades"] = last_q
+        summary["last_quarter_pnl"] = float(last_q_pnl.sum())
+        summary["last_quarter_hit_rate"] = float(last_q_win.mean())
+    else:
+        summary["last_quarter_trades"] = 0
+        summary["last_quarter_pnl"] = 0.0
+        summary["last_quarter_hit_rate"] = 0.0
 
     out_json = settings.MODELS_DIR / f"{prefix}_summary.json"
     with out_json.open("w") as f:
@@ -284,6 +398,9 @@ def run_backtest(
         "trade_pnl": trade_pnl.tolist(),
         "action_counts": {"continuation": int((action == "continuation").sum()), "reversal": int((action == "reversal").sum())},
         "by_event_group": {g: {k: float(v) if isinstance(v, (int, float)) else v for k, v in d.items()} for g, d in per_group.items()},
+        "bootstrap_pnl_pvalue": bootstrap_pvalue,
+        "drawdown_95pct": drawdown_95pct,
+        "stats_by_regime": regime_stats,
     }
     chart_data_path = settings.MODELS_DIR / f"{prefix}_chart_data.json"
     with chart_data_path.open("w") as f:
@@ -358,6 +475,16 @@ def main() -> None:
     parser.add_argument("--min-reversal-prob", type=float, default=0.0, help="Extra reversal probability floor")
     parser.add_argument("--fee-per-trade", type=float, default=0.10, help="Flat fee cost per trade")
     parser.add_argument("--slippage-bps", type=float, default=1.0, help="Slippage in basis points")
+    parser.add_argument("--spread-bps", type=float, default=0.0, help="Half-spread cost in bps per round-trip")
+    parser.add_argument("--impact-coef", type=float, default=0.0, help="Market-impact slippage coefficient (sqrt(notional/adv))")
+    parser.add_argument("--adv", type=float, default=0.0, help="Average daily volume/notional for impact (0 => notional-only)")
+    parser.add_argument("--vol-slippage-coef", type=float, default=0.0, help="Slippage scaling by vol_at_signal (e.g. ATR%): slip_bps += coef * vol")
+    parser.add_argument("--trades-per-year", type=float, default=None, help="Trades per year for annualization (default: 252*5)")
+    parser.add_argument("--sizing-method", type=str, default="fixed", choices=["fixed", "vol_target", "kelly", "confidence_scaled"], help="Position sizing method")
+    parser.add_argument("--kelly-fraction", type=float, default=0.5, help="Cap for fractional Kelly when sizing_method=kelly")
+    parser.add_argument("--signal-mode", type=str, default="default", choices=["default", "ev", "combined"], help="Signal mode: default, ev (expected value filter), or combined (cont-rev score)")
+    parser.add_argument("--ev-threshold", type=float, default=0.0, help="Min expected value when signal_mode=ev")
+    parser.add_argument("--validation-stats-path", type=str, default="", help="JSON path with p_win, avg_win, avg_loss for EV filter (relative to data/models or absolute)")
     args = parser.parse_args()
     result = run_backtest(
         prefix=args.prefix,
@@ -367,11 +494,21 @@ def main() -> None:
             min_confidence=args.min_confidence,
             fee_per_trade=args.fee_per_trade,
             slippage_bps=args.slippage_bps,
+            spread_bps=args.spread_bps,
+            impact_coef=args.impact_coef,
+            adv=args.adv,
+            vol_slippage_coef=args.vol_slippage_coef,
         ),
         min_confidence=args.min_confidence,
         min_action_margin=args.min_action_margin,
         min_continuation_prob=args.min_continuation_prob,
         min_reversal_prob=args.min_reversal_prob,
+        trades_per_year=args.trades_per_year,
+        sizing_method=args.sizing_method,
+        kelly_fraction=args.kelly_fraction,
+        signal_mode=args.signal_mode,
+        ev_threshold=args.ev_threshold,
+        validation_stats_path=args.validation_stats_path or None,
     )
     summary = result["summary"]
     print("Saved backtest summary:", result["summary_path"])
@@ -379,6 +516,7 @@ def main() -> None:
     print("Saved backtest curves:", result["curves_path"])
     print("Saved chart data:", result["chart_data_path"])
     print("Trades:", summary["trades"], "Hit-rate:", f"{summary['hit_rate']:.4f}", "Total PnL:", f"{summary['total_pnl']:.2f}")
+    print("Sharpe:", f"{summary.get('sharpe', 0):.4f}", "Sortino:", f"{summary.get('sortino', 0):.4f}", "Calmar:", f"{summary.get('calmar', 0):.4f}", "Profit factor:", f"{summary.get('profit_factor', 0):.4f}")
 
 
 if __name__ == "__main__":

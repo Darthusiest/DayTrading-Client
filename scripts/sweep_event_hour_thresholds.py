@@ -54,6 +54,13 @@ def main() -> int:
         default="",
         help="Output CSV path (default: data/models/event_hour_threshold_sweep.csv)",
     )
+    parser.add_argument(
+        "--metric",
+        type=str,
+        default="total_pnl",
+        choices=["total_pnl", "sharpe", "hit_rate", "profit_factor"],
+        help="Metric to rank by for top-10 table (total_pnl, sharpe, hit_rate, profit_factor)",
+    )
     args = parser.parse_args()
 
     def parse_floats(s: str) -> list[float]:
@@ -95,6 +102,11 @@ def main() -> int:
                             "total_pnl": round(s["total_pnl"], 2),
                             "max_drawdown": round(s["max_drawdown"], 2),
                             "ending_capital": round(s["ending_capital"], 2),
+                            "sharpe": round(s.get("sharpe", 0), 4),
+                            "sortino": round(s.get("sortino", 0), 4),
+                            "calmar": round(s.get("calmar", 0), 4),
+                            "profit_factor": round(s.get("profit_factor", 0), 4),
+                            "bootstrap_pvalue": round(s.get("bootstrap_pnl_pvalue", 0.5), 4),
                         })
                     except Exception as e:
                         print(f"  Error: {e}")
@@ -108,6 +120,11 @@ def main() -> int:
                             "total_pnl": float("nan"),
                             "max_drawdown": float("nan"),
                             "ending_capital": float("nan"),
+                            "sharpe": float("nan"),
+                            "sortino": float("nan"),
+                            "calmar": float("nan"),
+                            "profit_factor": float("nan"),
+                            "bootstrap_pvalue": float("nan"),
                         })
 
     if not rows:
@@ -123,13 +140,17 @@ def main() -> int:
         w.writerows(rows)
     print(f"Wrote {len(rows)} rows to {out_path}")
 
-    # Print table: sort by total_pnl descending
-    by_pnl = sorted([r for r in rows if r["trades"] >= 0], key=lambda r: r["total_pnl"], reverse=True)
-    print("\nTop 10 by total_pnl:")
-    print(f"{'min_conf':<8} {'min_cont':<8} {'min_rev':<8} {'margin':<8} {'trades':<8} {'hit_rate':<8} {'total_pnl':<12}")
-    print("-" * 64)
-    for r in by_pnl[:10]:
-        print(f"{r['min_confidence']:<8} {r['min_continuation_prob']:<8} {r['min_reversal_prob']:<8} {r['min_action_margin']:<8} {r['trades']:<8} {r['hit_rate']:<8} {r['total_pnl']:<12}")
+    # Print table: sort by selected metric (higher is better for all)
+    valid = [r for r in rows if r["trades"] >= 0]
+    metric = args.metric
+    by_metric = sorted(valid, key=lambda r: r.get(metric, 0) if not (isinstance(r.get(metric), float) and (r.get(metric) != r.get(metric))) else -1e9, reverse=True)
+    print(f"\nTop 10 by {metric}:")
+    print(f"{'min_conf':<8} {'min_cont':<8} {'min_rev':<8} {'margin':<8} {'trades':<8} {'hit_rate':<8} {'total_pnl':<12} {'sharpe':<8} {'pf':<8}")
+    print("-" * 88)
+    for r in by_metric[:10]:
+        sharpe = r.get("sharpe", 0)
+        pf = r.get("profit_factor", 0)
+        print(f"{r['min_confidence']:<8} {r['min_continuation_prob']:<8} {r['min_reversal_prob']:<8} {r['min_action_margin']:<8} {r['trades']:<8} {r['hit_rate']:<8} {r['total_pnl']:<12} {sharpe:<8.4f} {pf:<8.4f}")
 
     return 0
 
